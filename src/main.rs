@@ -63,6 +63,8 @@ enum Command {
     },
     /// Show indexed-file, duplicate, and recycle-bin counts.
     Status { database: PathBuf },
+    /// Print files currently available in the application recycle bin.
+    TrashList { database: PathBuf },
 }
 
 #[derive(Debug)]
@@ -99,6 +101,7 @@ fn run() -> Result<(), String> {
             operation_id,
         } => restore(&database, operation_id),
         Command::Status { database } => status(&database),
+        Command::TrashList { database } => trash_list(&database),
     }
 }
 
@@ -525,6 +528,29 @@ fn status(database: &Path) -> Result<(), String> {
     println!(
         "Indexed files: {files}\nDuplicate copies: {duplicates}\nIn recycle bin: {operations}"
     );
+    Ok(())
+}
+
+fn trash_list(database: &Path) -> Result<(), String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    let mut statement = connection
+        .prepare("SELECT id,source_path,trash_path,created_at FROM operations WHERE state='trashed' ORDER BY created_at DESC")
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        let (id, source, trashed, created_at) = row.map_err(|e| e.to_string())?;
+        println!("[{id}] {created_at}\t{source}\t{trashed}");
+    }
     Ok(())
 }
 
