@@ -6,6 +6,7 @@ use std::{
     },
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
@@ -217,6 +218,36 @@ fn trash(database: String, file_id: i64) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn trash_approved(database: String, file_ids: Vec<i64>) -> Result<String, String> {
+    let mut moved = 0;
+    for file_id in file_ids {
+        filelens::trash(&PathBuf::from(&database), file_id)?;
+        moved += 1;
+    }
+    Ok(format!("已将 {moved} 个确认副本移入应用回收站。"))
+}
+
+#[tauri::command]
+fn image_thumbnail(path: String) -> Result<Option<String>, String> {
+    let reader = match image::ImageReader::open(path) {
+        Ok(reader) => reader,
+        Err(_) => return Ok(None),
+    };
+    let image = match reader.decode() {
+        Ok(image) => image.thumbnail(320, 240),
+        Err(_) => return Ok(None),
+    };
+    let mut output = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut output, image::ImageFormat::Png)
+        .map_err(|error| error.to_string())?;
+    Ok(Some(format!(
+        "data:image/png;base64,{}",
+        STANDARD.encode(output.into_inner())
+    )))
+}
+
+#[tauri::command]
 fn restore(database: String, operation_id: i64) -> Result<String, String> {
     filelens::restore(&PathBuf::from(database), operation_id).map(|_| "文件已恢复至原位置。".into())
 }
@@ -308,6 +339,8 @@ fn main() {
             approve,
             unapprove,
             trash,
+            trash_approved,
+            image_thumbnail,
             restore,
             trash_list
         ])
