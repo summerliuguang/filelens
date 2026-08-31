@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
 
-type Page = "overview" | "sources" | "review" | "similar" | "trash" | "settings";
+type Page = "overview" | "sources" | "review" | "similar" | "documents" | "detectors" | "trash" | "settings";
 type GroupFile = {
   id: number;
   path: string;
@@ -30,12 +30,16 @@ type ScanState = {
   message: string;
 };
 type SimilarPhoto = { first_path: string; second_path: string; distance: number };
+type SimilarDocument = { first_path: string; second_path: string; distance: number };
+type DetectorStatus = { name: string; available: boolean; detail: string };
 
 const nav: { id: Page; icon: string; label: string; caption: string }[] = [
   { id: "overview", icon: "◌", label: "概览", caption: "ARCHIVE HEALTH" },
   { id: "sources", icon: "⌁", label: "扫描来源", caption: "SCAN SOURCES" },
   { id: "review", icon: "⊞", label: "重复审核", caption: "REVIEW QUEUE" },
   { id: "similar", icon: "◒", label: "相似照片", caption: "SIMILAR PHOTOS" },
+  { id: "documents", icon: "≡", label: "相似文档", caption: "SIMILAR DOCUMENTS" },
+  { id: "detectors", icon: "◉", label: "检测能力", caption: "DETECTORS" },
   { id: "trash", icon: "↶", label: "应用回收站", caption: "RECOVERY" },
   { id: "settings", icon: "⚙", label: "项目设置", caption: "PROJECT SETTINGS" },
 ];
@@ -51,6 +55,8 @@ function App() {
   const [groups, setGroups] = useState<Group[]>([]);
   const [trashItems, setTrashItems] = useState<TrashItem[]>([]);
   const [similarPhotos, setSimilarPhotos] = useState<SimilarPhoto[]>([]);
+  const [similarDocuments, setSimilarDocuments] = useState<SimilarDocument[]>([]);
+  const [detectors, setDetectors] = useState<DetectorStatus[]>([]);
   const [message, setMessage] = useState("请先在项目设置中创建或打开项目。");
   const [busy, setBusy] = useState(false);
   const [scanState, setScanState] = useState<ScanState>({
@@ -108,16 +114,20 @@ function App() {
   async function refresh() {
     if (!database) return;
     await execute(async () => {
-      const [nextStatus, nextGroups, nextTrash, nextSimilarPhotos] = await Promise.all([
+      const [nextStatus, nextGroups, nextTrash, nextSimilarPhotos, nextDocuments, nextDetectors] = await Promise.all([
         invoke<Status>("status", { database }),
         invoke<Group[]>("groups", { database }),
         invoke<TrashItem[]>("trash_list", { database }),
         invoke<SimilarPhoto[]>("similar_photos", { database }),
+        invoke<SimilarDocument[]>("similar_documents", { database }),
+        invoke<DetectorStatus[]>("detector_status"),
       ]);
       setStatus(nextStatus);
       setGroups(nextGroups);
       setTrashItems(nextTrash);
       setSimilarPhotos(nextSimilarPhotos);
+      setSimilarDocuments(nextDocuments);
+      setDetectors(nextDetectors);
       return `索引已更新：${nextGroups.length} 个精确重复组待审核。`;
     });
   }
@@ -254,6 +264,8 @@ function App() {
           />
         )}
         {page === "similar" && <SimilarPhotos photos={similarPhotos} />}
+        {page === "documents" && <SimilarDocuments documents={similarDocuments} />}
+        {page === "detectors" && <Detectors detectors={detectors} />}
         {page === "trash" && (
           <Trash
             database={database}
@@ -635,6 +647,14 @@ function SimilarPhotos({ photos }: { photos: SimilarPhoto[] }) {
       )}
     </section>
   );
+}
+
+function SimilarDocuments({ documents }: { documents: SimilarDocument[] }) {
+  return <section className="panel review-page"><div className="section-head"><div><h2>相似文档</h2><p>文本近似仅供人工查看，不能作为自动处理依据。</p></div><span className="pill">{documents.length} 对</span></div>{documents.length === 0 ? <Empty icon="≡" text="没有高置信度相似文档" detail="扫描 TXT、Markdown、CSV、JSON、XML 或 HTML 后会显示候选。" /> : <div className="similar-list">{documents.map((document, index) => <article className="similar-pair" key={`${document.first_path}-${document.second_path}`}><div><b>候选 {index + 1}</b><span>{document.first_path}</span><span>{document.second_path}</span></div><small>SimHash 差异 {document.distance}/64</small></article>)}</div>}</section>;
+}
+
+function Detectors({ detectors }: { detectors: DetectorStatus[] }) {
+  return <section className="panel review-page"><div className="section-head"><div><h2>检测能力</h2><p>所有处理均在本地进行。未启用的能力不会以低质量算法替代。</p></div></div><div className="source-list">{detectors.map(detector => <article className="source" key={detector.name}><span className="source-icon">{detector.available ? "✓" : "·"}</span><div><b>{detector.name}</b><small>{detector.detail}</small></div><span className={detector.available ? "approved" : "protected"}>{detector.available ? "已启用" : "待接入"}</span></article>)}</div></section>;
 }
 
 function Trash({

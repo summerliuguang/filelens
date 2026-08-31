@@ -145,6 +145,13 @@ pub fn init(database: &Path, trash: &Path) -> Result<(), String> {
            FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
          );
          CREATE INDEX IF NOT EXISTS photo_fingerprints_parts ON photo_fingerprints(part_a, part_b, part_c, part_d, part_e);
+         CREATE TABLE IF NOT EXISTS document_fingerprints (
+           file_id INTEGER PRIMARY KEY,
+           simhash INTEGER NOT NULL,
+           token_count INTEGER NOT NULL,
+           FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS document_fingerprints_hash ON document_fingerprints(simhash);
          CREATE TABLE IF NOT EXISTS operations (
            id INTEGER PRIMARY KEY,
            file_id INTEGER NOT NULL,
@@ -359,6 +366,7 @@ fn index_file(
         )
         .map_err(|e| e.to_string())?;
     save_photo_fingerprint(connection, &path_text, path)?;
+    save_document_fingerprint(connection, &path_text, path)?;
     Ok(outcome)
 }
 
@@ -434,6 +442,57 @@ fn fingerprint_parts(hash: u64) -> [i64; 5] {
         ((hash >> 12) & 0x1fff) as i64,
         (hash & 0x0fff) as i64,
     ]
+}
+
+fn save_document_fingerprint(
+    connection: &Connection,
+    path_text: &str,
+    path: &Path,
+) -> Result<(), String> {
+    let file_id: i64 = connection
+        .query_row(
+            "SELECT id FROM files WHERE path=?1",
+            params![path_text],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let Some((hash, count)) = document_simhash(path) else {
+        return Ok(());
+    };
+    connection.execute("INSERT INTO document_fingerprints(file_id,simhash,token_count) VALUES(?1,?2,?3) ON CONFLICT(file_id) DO UPDATE SET simhash=excluded.simhash,token_count=excluded.token_count", params![file_id, hash as i64, count]).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn document_simhash(path: &Path) -> Option<(u64, i64)> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    if !["txt", "md", "csv", "json", "xml", "html", "htm"].contains(&extension.as_str()) {
+        return None;
+    }
+    let text = fs::read_to_string(path).ok()?;
+    let tokens: Vec<_> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| word.len() > 2)
+        .map(str::to_ascii_lowercase)
+        .collect();
+    if tokens.len() < 20 {
+        return None;
+    }
+    let mut bits = [0_i32; 64];
+    for token in &tokens {
+        let hash = blake3::hash(token.as_bytes());
+        for (index, byte) in hash.as_bytes()[..8].iter().enumerate() {
+            for bit in 0..8 {
+                bits[index * 8 + bit] += if byte & (1 << bit) != 0 { 1 } else { -1 };
+            }
+        }
+    }
+    let mut hash = 0_u64;
+    for (bit, weight) in bits.iter().enumerate() {
+        if *weight > 0 {
+            hash |= 1 << bit;
+        }
+    }
+    Some((hash, tokens.len() as i64))
 }
 
 fn groups(database: &Path) -> Result<(), String> {

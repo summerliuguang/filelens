@@ -37,6 +37,18 @@ struct SimilarPhoto {
     distance: u32,
 }
 #[derive(Serialize)]
+struct SimilarDocument {
+    first_path: String,
+    second_path: String,
+    distance: u32,
+}
+#[derive(Serialize)]
+struct DetectorStatus {
+    name: String,
+    available: bool,
+    detail: String,
+}
+#[derive(Serialize)]
 struct TrashItem {
     id: i64,
     created_at: i64,
@@ -352,6 +364,61 @@ fn similar_photos(database: String) -> Result<Vec<SimilarPhoto>, String> {
 }
 
 #[tauri::command]
+fn similar_documents(database: String) -> Result<Vec<SimilarDocument>, String> {
+    let connection = open_database(&database)?;
+    let mut statement = connection.prepare("SELECT a.path,b.path,d1.simhash,d2.simhash FROM document_fingerprints d1 JOIN document_fingerprints d2 ON d1.file_id<d2.file_id JOIN files a ON a.id=d1.file_id JOIN files b ON b.id=d2.file_id WHERE a.present=1 AND b.present=1 AND a.hash!=b.hash LIMIT 5000").map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u64,
+                row.get::<_, i64>(3)? as u64,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut result = Vec::new();
+    for row in rows {
+        let (first_path, second_path, first, second) = row.map_err(|e| e.to_string())?;
+        let distance = (first ^ second).count_ones();
+        if distance <= 8 {
+            result.push(SimilarDocument {
+                first_path,
+                second_path,
+                distance,
+            });
+        }
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+fn detector_status() -> Vec<DetectorStatus> {
+    vec![
+        DetectorStatus {
+            name: "照片相似".into(),
+            available: true,
+            detail: "本地 dHash，高置信度只读候选".into(),
+        },
+        DetectorStatus {
+            name: "文档近似".into(),
+            available: true,
+            detail: "TXT、Markdown、CSV、JSON、XML、HTML 的本地 SimHash".into(),
+        },
+        DetectorStatus {
+            name: "音频转码相似".into(),
+            available: false,
+            detail: "需要随安装包提供 Chromaprint/FFmpeg 解码器；当前不会产生不可靠结果".into(),
+        },
+        DetectorStatus {
+            name: "视频转码与片段包含".into(),
+            available: false,
+            detail: "需要随安装包提供 FFmpeg 解码器与帧指纹任务；当前不会产生不可靠结果".into(),
+        },
+    ]
+}
+
+#[tauri::command]
 fn trash_list(database: String) -> Result<Vec<TrashItem>, String> {
     let connection = open_database(&database)?;
     let mut statement = connection.prepare("SELECT id,created_at,source_path,trash_path FROM operations WHERE state='trashed' ORDER BY created_at DESC").map_err(|error| error.to_string())?;
@@ -383,6 +450,8 @@ fn main() {
             status,
             groups,
             similar_photos,
+            similar_documents,
+            detector_status,
             approve,
             unapprove,
             trash,
