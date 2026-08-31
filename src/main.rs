@@ -134,6 +134,17 @@ pub fn init(database: &Path, trash: &Path) -> Result<(), String> {
            scanned_at INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS files_hash_size_present ON files(hash, size, present);
+         CREATE TABLE IF NOT EXISTS photo_fingerprints (
+           file_id INTEGER PRIMARY KEY,
+           dhash INTEGER NOT NULL,
+           part_a INTEGER NOT NULL,
+           part_b INTEGER NOT NULL,
+           part_c INTEGER NOT NULL,
+           part_d INTEGER NOT NULL,
+           part_e INTEGER NOT NULL,
+           FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS photo_fingerprints_parts ON photo_fingerprints(part_a, part_b, part_c, part_d, part_e);
          CREATE TABLE IF NOT EXISTS operations (
            id INTEGER PRIMARY KEY,
            file_id INTEGER NOT NULL,
@@ -319,6 +330,7 @@ fn index_file(
                 params![path_text],
             )
             .map_err(|e| e.to_string())?;
+        save_photo_fingerprint(connection, &path_text, path)?;
         return Ok(IndexOutcome::Unchanged);
     }
     let hash = hash_file(path)?;
@@ -340,7 +352,48 @@ fn index_file(
          ON CONFLICT(path) DO UPDATE SET size=excluded.size,modified=excluded.modified,hash=excluded.hash,protected=excluded.protected,approved=0,present=1,scanned_at=excluded.scanned_at",
         params![path_text, size, modified, hash, is_protected as i64, now],
     ).map_err(|e| e.to_string())?;
+    connection
+        .execute(
+            "DELETE FROM photo_fingerprints WHERE file_id=(SELECT id FROM files WHERE path=?1)",
+            params![path_text],
+        )
+        .map_err(|e| e.to_string())?;
+    save_photo_fingerprint(connection, &path_text, path)?;
     Ok(outcome)
+}
+
+fn save_photo_fingerprint(
+    connection: &Connection,
+    path_text: &str,
+    path: &Path,
+) -> Result<(), String> {
+    let file_id: i64 = connection
+        .query_row(
+            "SELECT id FROM files WHERE path=?1",
+            params![path_text],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let existing: Option<i64> = connection
+        .query_row(
+            "SELECT 1 FROM photo_fingerprints WHERE file_id=?1",
+            params![file_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if existing.is_some() {
+        return Ok(());
+    }
+    let Some(hash) = perceptual_hash(path) else {
+        return Ok(());
+    };
+    let parts = fingerprint_parts(hash);
+    connection.execute(
+        "INSERT INTO photo_fingerprints(file_id,dhash,part_a,part_b,part_c,part_d,part_e) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        params![file_id, hash as i64, parts[0], parts[1], parts[2], parts[3], parts[4]],
+    ).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn hash_file(path: &Path) -> Result<String, String> {
@@ -355,6 +408,32 @@ fn hash_file(path: &Path) -> Result<String, String> {
         hasher.update(&buffer[..count]);
     }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn perceptual_hash(path: &Path) -> Option<u64> {
+    let image = image::ImageReader::open(path)
+        .ok()?
+        .decode()
+        .ok()?
+        .resize_exact(9, 8, image::imageops::FilterType::Triangle)
+        .to_luma8();
+    let mut hash = 0_u64;
+    for y in 0..8 {
+        for x in 0..8 {
+            hash = (hash << 1) | u64::from(image.get_pixel(x, y)[0] > image.get_pixel(x + 1, y)[0]);
+        }
+    }
+    Some(hash)
+}
+
+fn fingerprint_parts(hash: u64) -> [i64; 5] {
+    [
+        ((hash >> 51) & 0x1fff) as i64,
+        ((hash >> 38) & 0x1fff) as i64,
+        ((hash >> 25) & 0x1fff) as i64,
+        ((hash >> 12) & 0x1fff) as i64,
+        (hash & 0x0fff) as i64,
+    ]
 }
 
 fn groups(database: &Path) -> Result<(), String> {
@@ -740,6 +819,24 @@ mod tests {
             .unwrap();
         drop(connection);
         assert!(set_approval(&database, id, true).is_err());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn photo_hash_is_stable_for_the_same_image() {
+        let directory = test_directory("photo-hash");
+        let path = directory.join("photo.png");
+        let image = image::RgbImage::from_fn(32, 32, |x, y| {
+            if x > y {
+                image::Rgb([240, 240, 240])
+            } else {
+                image::Rgb([20, 20, 20])
+            }
+        });
+        image.save(&path).unwrap();
+        let hash = perceptual_hash(&path).unwrap();
+        assert_eq!(hash, perceptual_hash(&path).unwrap());
+        assert_eq!(fingerprint_parts(hash).len(), 5);
         let _ = fs::remove_dir_all(directory);
     }
 }

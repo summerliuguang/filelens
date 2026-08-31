@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
 
-type Page = "overview" | "sources" | "review" | "trash" | "settings";
+type Page = "overview" | "sources" | "review" | "similar" | "trash" | "settings";
 type GroupFile = {
   id: number;
   path: string;
@@ -29,11 +29,13 @@ type ScanState = {
   processed: number;
   message: string;
 };
+type SimilarPhoto = { first_path: string; second_path: string; distance: number };
 
 const nav: { id: Page; icon: string; label: string; caption: string }[] = [
   { id: "overview", icon: "◌", label: "概览", caption: "ARCHIVE HEALTH" },
   { id: "sources", icon: "⌁", label: "扫描来源", caption: "SCAN SOURCES" },
   { id: "review", icon: "⊞", label: "重复审核", caption: "REVIEW QUEUE" },
+  { id: "similar", icon: "◒", label: "相似照片", caption: "SIMILAR PHOTOS" },
   { id: "trash", icon: "↶", label: "应用回收站", caption: "RECOVERY" },
   { id: "settings", icon: "⚙", label: "项目设置", caption: "PROJECT SETTINGS" },
 ];
@@ -48,6 +50,7 @@ function App() {
   const [status, setStatus] = useState<Status | null>(null);
   const [groups, setGroups] = useState<Group[]>([]);
   const [trashItems, setTrashItems] = useState<TrashItem[]>([]);
+  const [similarPhotos, setSimilarPhotos] = useState<SimilarPhoto[]>([]);
   const [message, setMessage] = useState("请先在项目设置中创建或打开项目。");
   const [busy, setBusy] = useState(false);
   const [scanState, setScanState] = useState<ScanState>({
@@ -105,14 +108,16 @@ function App() {
   async function refresh() {
     if (!database) return;
     await execute(async () => {
-      const [nextStatus, nextGroups, nextTrash] = await Promise.all([
+      const [nextStatus, nextGroups, nextTrash, nextSimilarPhotos] = await Promise.all([
         invoke<Status>("status", { database }),
         invoke<Group[]>("groups", { database }),
         invoke<TrashItem[]>("trash_list", { database }),
+        invoke<SimilarPhoto[]>("similar_photos", { database }),
       ]);
       setStatus(nextStatus);
       setGroups(nextGroups);
       setTrashItems(nextTrash);
+      setSimilarPhotos(nextSimilarPhotos);
       return `索引已更新：${nextGroups.length} 个精确重复组待审核。`;
     });
   }
@@ -248,6 +253,7 @@ function App() {
             refresh={refresh}
           />
         )}
+        {page === "similar" && <SimilarPhotos photos={similarPhotos} />}
         {page === "trash" && (
           <Trash
             database={database}
@@ -605,6 +611,29 @@ function Thumbnail({ path }: { path: string }) {
     />
   ) : (
     <span className="thumbnail thumbnail-placeholder">▧</span>
+  );
+}
+
+function SimilarPhotos({ photos }: { photos: SimilarPhoto[] }) {
+  return (
+    <section className="panel review-page">
+      <div className="section-head">
+        <div>
+          <h2>高置信度相似照片</h2>
+          <p>仅供人工查看。结果来自本地 dHash 感知指纹，不会出现在自动处理队列。</p>
+        </div>
+        <span className="pill">{photos.length} 对</span>
+      </div>
+      {photos.length === 0 ? <Empty icon="◒" text="没有高置信度相似照片" detail="完成扫描后，这里会显示重压缩或缩放后的同源照片候选。" /> : (
+        <div className="similar-list">
+          {photos.map((photo, index) => <article className="similar-pair" key={`${photo.first_path}-${photo.second_path}`}>
+            <div className="similar-photos"><Thumbnail path={photo.first_path} /><Thumbnail path={photo.second_path} /></div>
+            <div><b>候选 {index + 1}</b><span>{photo.first_path}</span><span>{photo.second_path}</span></div>
+            <small>dHash 差异 {photo.distance}/64</small>
+          </article>)}
+        </div>
+      )}
+    </section>
   );
 }
 

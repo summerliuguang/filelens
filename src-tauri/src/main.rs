@@ -29,6 +29,13 @@ struct Group {
     size: i64,
     files: Vec<GroupFile>,
 }
+
+#[derive(Serialize)]
+struct SimilarPhoto {
+    first_path: String,
+    second_path: String,
+    distance: u32,
+}
 #[derive(Serialize)]
 struct TrashItem {
     id: i64,
@@ -306,6 +313,45 @@ fn groups(database: String) -> Result<Vec<Group>, String> {
 }
 
 #[tauri::command]
+fn similar_photos(database: String) -> Result<Vec<SimilarPhoto>, String> {
+    let connection = open_database(&database)?;
+    let mut statement = connection.prepare(
+        "SELECT DISTINCT a.path,b.path,p1.dhash,p2.dhash
+         FROM photo_fingerprints p1
+         JOIN photo_fingerprints p2 ON p1.file_id < p2.file_id
+           AND (p1.part_a=p2.part_a OR p1.part_b=p2.part_b OR p1.part_c=p2.part_c OR p1.part_d=p2.part_d OR p1.part_e=p2.part_e)
+         JOIN files a ON a.id=p1.file_id
+         JOIN files b ON b.id=p2.file_id
+         WHERE a.present=1 AND b.present=1 AND a.hash != b.hash
+         LIMIT 5000",
+    ).map_err(|error| error.to_string())?;
+    let candidates = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u64,
+                row.get::<_, i64>(3)? as u64,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut result = Vec::new();
+    for candidate in candidates {
+        let (first_path, second_path, first_hash, second_hash) =
+            candidate.map_err(|error| error.to_string())?;
+        let distance = (first_hash ^ second_hash).count_ones();
+        if distance <= 4 {
+            result.push(SimilarPhoto {
+                first_path,
+                second_path,
+                distance,
+            });
+        }
+    }
+    Ok(result)
+}
+
+#[tauri::command]
 fn trash_list(database: String) -> Result<Vec<TrashItem>, String> {
     let connection = open_database(&database)?;
     let mut statement = connection.prepare("SELECT id,created_at,source_path,trash_path FROM operations WHERE state='trashed' ORDER BY created_at DESC").map_err(|error| error.to_string())?;
@@ -336,6 +382,7 @@ fn main() {
             cancel_scan,
             status,
             groups,
+            similar_photos,
             approve,
             unapprove,
             trash,

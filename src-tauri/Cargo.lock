@@ -1118,6 +1118,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "clap",
+ "image",
  "rusqlite",
  "serde",
  "serde_json",
