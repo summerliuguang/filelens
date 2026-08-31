@@ -30,6 +30,13 @@ struct TrashItem {
     trash_path: String,
 }
 
+#[derive(Serialize)]
+struct ProjectConfig {
+    trash_path: String,
+    roots: Vec<String>,
+    protect_rules: Vec<String>,
+}
+
 fn open_database(path: &str) -> Result<Connection, String> {
     Connection::open(path).map_err(|error| error.to_string())
 }
@@ -41,9 +48,65 @@ fn initialize(database: String, trash: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn scan(database: String, roots: Vec<String>) -> Result<String, String> {
+fn project_config(database: String) -> Result<ProjectConfig, String> {
+    let connection = open_database(&database)?;
+    let trash_path = connection
+        .query_row(
+            "SELECT value FROM settings WHERE key='trash_path'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(ProjectConfig {
+        trash_path,
+        roots: setting_list(&connection, "roots")?,
+        protect_rules: setting_list(&connection, "protect_rules")?,
+    })
+}
+
+#[tauri::command]
+fn save_project_config(
+    database: String,
+    trash: String,
+    roots: Vec<String>,
+    protect_rules: Vec<String>,
+) -> Result<String, String> {
+    filelens::init(&PathBuf::from(&database), &PathBuf::from(&trash))?;
+    let connection = open_database(&database)?;
+    save_setting_list(&connection, "roots", &roots)?;
+    save_setting_list(&connection, "protect_rules", &protect_rules)?;
+    Ok("项目设置已保存。".into())
+}
+
+#[tauri::command]
+fn scan(
+    database: String,
+    roots: Vec<String>,
+    protect_rules: Vec<String>,
+) -> Result<String, String> {
     let roots = roots.into_iter().map(PathBuf::from).collect::<Vec<_>>();
-    filelens::scan(&PathBuf::from(database), &roots, &[]).map(|_| "扫描完成，索引已更新。".into())
+    filelens::scan(&PathBuf::from(database), &roots, &protect_rules)
+        .map(|_| "扫描完成，索引已更新。".into())
+}
+
+fn setting_list(connection: &Connection, key: &str) -> Result<Vec<String>, String> {
+    let value: Option<String> = connection
+        .query_row("SELECT value FROM settings WHERE key=?1", [key], |row| {
+            row.get(0)
+        })
+        .ok();
+    value
+        .map(|value| serde_json::from_str(&value).map_err(|error| error.to_string()))
+        .transpose()
+        .map(|value| value.unwrap_or_default())
+}
+
+fn save_setting_list(connection: &Connection, key: &str, values: &[String]) -> Result<(), String> {
+    let value = serde_json::to_string(values).map_err(|error| error.to_string())?;
+    connection
+        .execute("INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, value])
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -139,8 +202,19 @@ fn trash_list(database: String) -> Result<Vec<TrashItem>, String> {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
-            initialize, scan, status, groups, approve, unapprove, trash, restore, trash_list
+            initialize,
+            project_config,
+            save_project_config,
+            scan,
+            status,
+            groups,
+            approve,
+            unapprove,
+            trash,
+            restore,
+            trash_list
         ])
         .run(tauri::generate_context!())
         .expect("failed to run FileLens desktop application");

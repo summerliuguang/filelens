@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
 
 type Page = "overview" | "sources" | "review" | "trash" | "settings";
@@ -8,6 +9,7 @@ type GroupFile = { id: number; path: string; protected: boolean; approved: boole
 type Group = { hash: string; size: number; files: GroupFile[] };
 type Status = { files: number; duplicates: number; inTrash: number };
 type TrashItem = { id: number; created_at: number; source_path: string; trash_path: string };
+type ProjectConfig = { trash_path: string; roots: string[]; protect_rules: string[] };
 
 const nav: { id: Page; icon: string; label: string; caption: string }[] = [
   { id: "overview", icon: "◌", label: "概览", caption: "ARCHIVE HEALTH" },
@@ -22,12 +24,22 @@ function App() {
   const [database, setDatabase] = useState("");
   const [trash, setTrash] = useState("");
   const [roots, setRoots] = useState<string[]>([]);
+  const [protectRules, setProtectRules] = useState<string[]>([]);
   const [rootInput, setRootInput] = useState("");
   const [status, setStatus] = useState<Status | null>(null);
   const [groups, setGroups] = useState<Group[]>([]);
   const [trashItems, setTrashItems] = useState<TrashItem[]>([]);
   const [message, setMessage] = useState("请先在项目设置中创建或打开项目。");
   const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const saved = localStorage.getItem("filelens.database");
+    if (!saved) return;
+    setDatabase(saved);
+    invoke<ProjectConfig>("project_config", { database: saved }).then(config => {
+      setTrash(config.trash_path); setRoots(config.roots); setProtectRules(config.protect_rules);
+    }).catch(() => setMessage("未能打开上次项目，请在项目设置中确认路径。"));
+  }, []);
 
   async function execute(action: () => Promise<string>) {
     setBusy(true);
@@ -46,11 +58,15 @@ function App() {
   }
 
   async function initialize() {
-    await execute(async () => { const result = await invoke<string>("initialize", { database, trash }); await refresh(); return result; });
+    await execute(async () => {
+      const result = await invoke<string>("save_project_config", { database, trash, roots, protectRules });
+      localStorage.setItem("filelens.database", database);
+      await refresh(); return result;
+    });
   }
 
   async function scan() {
-    await execute(async () => { const result = await invoke<string>("scan", { database, roots }); await refresh(); return result; });
+    await execute(async () => { const result = await invoke<string>("scan", { database, roots, protectRules }); await refresh(); return result; });
   }
 
   function addRoot() { const value = rootInput.trim(); if (value && !roots.includes(value)) setRoots([...roots, value]); setRootInput(""); }
@@ -69,7 +85,7 @@ function App() {
       {page === "sources" && <Sources roots={roots} rootInput={rootInput} setRootInput={setRootInput} addRoot={addRoot} removeRoot={root => setRoots(roots.filter(item => item !== root))} scan={scan} disabled={busy || !database} />}
       {page === "review" && <Review database={database} groups={groups} busy={busy} execute={execute} refresh={refresh} />}
       {page === "trash" && <Trash database={database} items={trashItems} busy={busy} execute={execute} refresh={refresh} />}
-      {page === "settings" && <Settings database={database} trash={trash} setDatabase={setDatabase} setTrash={setTrash} initialize={initialize} busy={busy} />}
+      {page === "settings" && <Settings database={database} trash={trash} protectRules={protectRules} setDatabase={setDatabase} setTrash={setTrash} setProtectRules={setProtectRules} initialize={initialize} busy={busy} />}
       <footer className={message.startsWith("操作失败") ? "error" : ""}>{busy ? "正在处理，请不要关闭程序..." : message}</footer>
     </main>
   </div>;
@@ -83,7 +99,8 @@ function Overview({ status, groups, selected, onNavigate }: { status: Status | n
 function Metric({ value, label, detail }: { value: number | string; label: string; detail: string }) { return <article className="metric"><strong>{value}</strong><span>{label}</span><small>{detail}</small></article>; }
 
 function Sources({ roots, rootInput, setRootInput, addRoot, removeRoot, scan, disabled }: { roots: string[]; rootInput: string; setRootInput: (value: string) => void; addRoot: () => void; removeRoot: (root: string) => void; scan: () => void; disabled: boolean }) {
-  return <section className="panel sources-page"><div className="section-head"><div><h2>本次扫描范围</h2><p>多个根目录会全局互相比较。应用回收站和常见缓存目录会自动排除。</p></div><button disabled={disabled || !roots.length} onClick={scan}>开始增量扫描</button></div><div className="add-source"><input value={rootInput} onChange={event => setRootInput(event.target.value)} onKeyDown={event => event.key === "Enter" && addRoot()} placeholder="输入目录，例如 D:\\NAS-Sync\\Photos" /><button className="secondary" onClick={addRoot}>添加</button></div><div className="source-list">{roots.length === 0 ? <Empty icon="⌁" text="还没有扫描目录" detail="添加本地同步目录后，即可建立内容索引。" /> : roots.map((root, index) => <article className="source" key={root}><span className="source-icon">{index + 1}</span><div><b>{root}</b><small>本地来源 · 全局比较已启用</small></div><button className="text-button" onClick={() => removeRoot(root)}>移除</button></article>)}</div></section>;
+  async function pickDirectory() { const selected = await open({ directory: true, multiple: false, title: "选择扫描目录" }); if (typeof selected === "string") setRootInput(selected); }
+  return <section className="panel sources-page"><div className="section-head"><div><h2>本次扫描范围</h2><p>多个根目录会全局互相比较。应用回收站和常见缓存目录会自动排除。</p></div><button disabled={disabled || !roots.length} onClick={scan}>开始增量扫描</button></div><div className="add-source"><input value={rootInput} onChange={event => setRootInput(event.target.value)} onKeyDown={event => event.key === "Enter" && addRoot()} placeholder="输入目录，例如 D:\\NAS-Sync\\Photos" /><button className="secondary" onClick={pickDirectory}>选择目录</button><button className="secondary" onClick={addRoot}>添加</button></div><div className="source-list">{roots.length === 0 ? <Empty icon="⌁" text="还没有扫描目录" detail="添加本地同步目录后，即可建立内容索引。" /> : roots.map((root, index) => <article className="source" key={root}><span className="source-icon">{index + 1}</span><div><b>{root}</b><small>本地来源 · 全局比较已启用</small></div><button className="text-button" onClick={() => removeRoot(root)}>移除</button></article>)}</div></section>;
 }
 
 function Review({ database, groups, busy, execute, refresh }: { database: string; groups: Group[]; busy: boolean; execute: (action: () => Promise<string>) => Promise<void>; refresh: () => Promise<void> }) {
@@ -94,8 +111,10 @@ function Trash({ database, items, busy, execute, refresh }: { database: string; 
   return <section className="panel trash-page"><div className="section-head"><div><h2>可恢复文件</h2><p>恢复时不会覆盖原路径已有文件，并会再次进行内容完整性检查。</p></div><span className="pill">{items.length} 个文件</span></div>{items.length === 0 ? <Empty icon="↶" text="应用回收站为空" detail="从审核队列移入的副本将显示在这里，默认建议保留 30 天。" /> : <div className="trash-list">{items.map(item => <article className="trash-item" key={item.id}><span className="source-icon">↶</span><div><b>{item.source_path.split(/[\\/]/).pop()}</b><span>原位置：{item.source_path}</span><small>移入时间：{new Date(item.created_at * 1000).toLocaleString("zh-CN")}</small></div><button disabled={busy} onClick={() => execute(async () => { const result = await invoke<string>("restore", { database, operationId: item.id }); await refresh(); return result; })}>恢复原位置</button></article>)}</div>}</section>;
 }
 
-function Settings({ database, trash, setDatabase, setTrash, initialize, busy }: { database: string; trash: string; setDatabase: (value: string) => void; setTrash: (value: string) => void; initialize: () => Promise<void>; busy: boolean }) {
-  return <section className="panel settings-page"><div className="section-head"><div><h2>项目与安全设置</h2><p>数据库记录扫描结果和操作日志；回收站必须位于客户端本地磁盘。</p></div></div><label>项目数据库路径<input value={database} onChange={event => setDatabase(event.target.value)} placeholder="例如 D:\\FileLens\\archive.db" /></label><label>应用回收站路径<input value={trash} onChange={event => setTrash(event.target.value)} placeholder="例如 E:\\FileLens-Recycle" /></label><button disabled={busy || !database || !trash} onClick={initialize}>创建/打开项目</button><div className="safety"><b>安全承诺</b><span>扫描不会修改文件。移动只针对人工确认的精确重复副本，且执行前后均验证 BLAKE3 哈希。</span></div></section>;
+function Settings({ database, trash, protectRules, setDatabase, setTrash, setProtectRules, initialize, busy }: { database: string; trash: string; protectRules: string[]; setDatabase: (value: string) => void; setTrash: (value: string) => void; setProtectRules: (value: string[]) => void; initialize: () => Promise<void>; busy: boolean }) {
+  const [rule, setRule] = useState("");
+  async function pickTrash() { const selected = await open({ directory: true, multiple: false, title: "选择本地应用回收站目录" }); if (typeof selected === "string") setTrash(selected); }
+  return <section className="panel settings-page"><div className="section-head"><div><h2>项目与安全设置</h2><p>数据库记录扫描结果和操作日志；回收站必须位于客户端本地磁盘。</p></div></div><label>项目数据库路径<input value={database} onChange={event => setDatabase(event.target.value)} placeholder="例如 D:\\FileLens\\archive.db" /></label><label>应用回收站路径<div className="input-action"><input value={trash} onChange={event => setTrash(event.target.value)} placeholder="例如 E:\\FileLens-Recycle" /><button className="secondary" onClick={pickTrash}>选择目录</button></div></label><label>保护路径规则<div className="input-action"><input value={rule} onChange={event => setRule(event.target.value)} placeholder="例如 Originals" /><button className="secondary" onClick={() => { if (rule.trim() && !protectRules.includes(rule.trim())) setProtectRules([...protectRules, rule.trim()]); setRule(""); }}>添加</button></div></label><div className="rules">{protectRules.map(item => <span className="chip" key={item}>{item}<button onClick={() => setProtectRules(protectRules.filter(value => value !== item))}>×</button></span>)}</div><button disabled={busy || !database || !trash} onClick={initialize}>保存并打开项目</button><div className="safety"><b>安全承诺</b><span>扫描不会修改文件。移动只针对人工确认的精确重复副本，且执行前后均验证 BLAKE3 哈希。</span></div></section>;
 }
 
 function Empty({ icon, text, detail }: { icon: string; text: string; detail: string }) { return <div className="empty"><span>{icon}</span><b>{text}</b><p>{detail}</p></div>; }
