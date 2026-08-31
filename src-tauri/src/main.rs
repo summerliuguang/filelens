@@ -1,4 +1,10 @@
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use rusqlite::{Connection, params};
 use serde::Serialize;
@@ -35,6 +41,18 @@ struct ProjectConfig {
     trash_path: String,
     roots: Vec<String>,
     protect_rules: Vec<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct ScanState {
+    state: String,
+    processed: u64,
+    message: String,
+}
+
+struct ScanTask {
+    cancelled: Arc<AtomicBool>,
+    state: Arc<Mutex<ScanState>>,
 }
 
 fn open_database(path: &str) -> Result<Connection, String> {
@@ -79,14 +97,88 @@ fn save_project_config(
 }
 
 #[tauri::command]
-fn scan(
+fn start_scan(
+    task: tauri::State<'_, Mutex<Option<ScanTask>>>,
     database: String,
     roots: Vec<String>,
     protect_rules: Vec<String>,
 ) -> Result<String, String> {
+    let mut task = task.lock().map_err(|_| "scan task lock failed")?;
+    if task.is_some() {
+        return Err("已有扫描任务正在运行".into());
+    }
     let roots = roots.into_iter().map(PathBuf::from).collect::<Vec<_>>();
-    filelens::scan(&PathBuf::from(database), &roots, &protect_rules)
-        .map(|_| "扫描完成，索引已更新。".into())
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let state = Arc::new(Mutex::new(ScanState {
+        state: "running".into(),
+        processed: 0,
+        message: "正在扫描文件...".into(),
+    }));
+    let worker_cancelled = cancelled.clone();
+    let worker_state = state.clone();
+    std::thread::spawn(move || {
+        let progress_state = worker_state.clone();
+        let result = filelens::scan_with_control(
+            &PathBuf::from(database),
+            &roots,
+            &protect_rules,
+            &|| worker_cancelled.load(Ordering::Relaxed),
+            &|processed| {
+                if let Ok(mut current) = progress_state.lock() {
+                    current.processed = processed;
+                }
+            },
+        );
+        if let Ok(mut current) = worker_state.lock() {
+            match result {
+                Ok(()) => {
+                    current.state = "completed".into();
+                    current.message = "扫描完成，索引已更新。".into();
+                }
+                Err(error) if error == "scan cancelled" => {
+                    current.state = "cancelled".into();
+                    current.message = "扫描已取消，已完成的索引仍会保留。".into();
+                }
+                Err(error) => {
+                    current.state = "failed".into();
+                    current.message = error;
+                }
+            }
+        }
+    });
+    *task = Some(ScanTask { cancelled, state });
+    Ok("扫描任务已在后台启动。".into())
+}
+
+#[tauri::command]
+fn scan_state(task: tauri::State<'_, Mutex<Option<ScanTask>>>) -> Result<ScanState, String> {
+    let mut task = task.lock().map_err(|_| "scan task lock failed")?;
+    let Some(current) = task.as_ref() else {
+        return Ok(ScanState {
+            state: "idle".into(),
+            processed: 0,
+            message: "没有正在运行的扫描任务。".into(),
+        });
+    };
+    let state = current
+        .state
+        .lock()
+        .map_err(|_| "scan state lock failed")?
+        .clone();
+    if state.state != "running" {
+        *task = None;
+    }
+    Ok(state)
+}
+
+#[tauri::command]
+fn cancel_scan(task: tauri::State<'_, Mutex<Option<ScanTask>>>) -> Result<String, String> {
+    let task = task.lock().map_err(|_| "scan task lock failed")?;
+    let Some(current) = task.as_ref() else {
+        return Err("没有正在运行的扫描任务".into());
+    };
+    current.cancelled.store(true, Ordering::Relaxed);
+    Ok("正在请求取消，当前文件处理完成后会停止。".into())
 }
 
 fn setting_list(connection: &Connection, key: &str) -> Result<Vec<String>, String> {
@@ -202,12 +294,15 @@ fn trash_list(database: String) -> Result<Vec<TrashItem>, String> {
 
 fn main() {
     tauri::Builder::default()
+        .manage(Mutex::new(None::<ScanTask>))
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             initialize,
             project_config,
             save_project_config,
-            scan,
+            start_scan,
+            scan_state,
+            cancel_scan,
             status,
             groups,
             approve,

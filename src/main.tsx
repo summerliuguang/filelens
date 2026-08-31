@@ -10,6 +10,7 @@ type Group = { hash: string; size: number; files: GroupFile[] };
 type Status = { files: number; duplicates: number; inTrash: number };
 type TrashItem = { id: number; created_at: number; source_path: string; trash_path: string };
 type ProjectConfig = { trash_path: string; roots: string[]; protect_rules: string[] };
+type ScanState = { state: "idle" | "running" | "completed" | "cancelled" | "failed"; processed: number; message: string };
 
 const nav: { id: Page; icon: string; label: string; caption: string }[] = [
   { id: "overview", icon: "◌", label: "概览", caption: "ARCHIVE HEALTH" },
@@ -31,6 +32,7 @@ function App() {
   const [trashItems, setTrashItems] = useState<TrashItem[]>([]);
   const [message, setMessage] = useState("请先在项目设置中创建或打开项目。");
   const [busy, setBusy] = useState(false);
+  const [scanState, setScanState] = useState<ScanState>({ state: "idle", processed: 0, message: "" });
 
   useEffect(() => {
     const saved = localStorage.getItem("filelens.database");
@@ -40,6 +42,17 @@ function App() {
       setTrash(config.trash_path); setRoots(config.roots); setProtectRules(config.protect_rules);
     }).catch(() => setMessage("未能打开上次项目，请在项目设置中确认路径。"));
   }, []);
+
+  useEffect(() => {
+    if (scanState.state !== "running") return;
+    const timer = window.setInterval(() => {
+      invoke<ScanState>("scan_state").then(next => {
+        setScanState(next);
+        if (next.state !== "running") { setMessage(next.message); void refresh(); }
+      }).catch(error => setScanState({ state: "failed", processed: 0, message: String(error) }));
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [scanState.state]);
 
   async function execute(action: () => Promise<string>) {
     setBusy(true);
@@ -66,8 +79,14 @@ function App() {
   }
 
   async function scan() {
-    await execute(async () => { const result = await invoke<string>("scan", { database, roots, protectRules }); await refresh(); return result; });
+    await execute(async () => {
+      const result = await invoke<string>("start_scan", { database, roots, protectRules });
+      setScanState({ state: "running", processed: 0, message: result });
+      return result;
+    });
   }
+
+  async function cancelScan() { await execute(() => invoke<string>("cancel_scan")); }
 
   function addRoot() { const value = rootInput.trim(); if (value && !roots.includes(value)) setRoots([...roots, value]); setRootInput(""); }
   const active = nav.find(item => item.id === page)!;
@@ -81,8 +100,9 @@ function App() {
     </aside>
     <main>
       <header><div><p className="eyebrow">{active.caption}</p><h1>{active.label}</h1></div><button className="secondary" disabled={busy || !database} onClick={refresh}>↻ 刷新</button></header>
+      {scanState.state === "running" && <section className="scan-progress"><div><b>后台扫描中</b><span>已处理 {scanState.processed.toLocaleString()} 个条目</span></div><div className="progress-track"><i /></div><button className="secondary" disabled={busy} onClick={cancelScan}>取消扫描</button></section>}
       {page === "overview" && <Overview status={status} groups={groups} selected={selected} onNavigate={setPage} />}
-      {page === "sources" && <Sources roots={roots} rootInput={rootInput} setRootInput={setRootInput} addRoot={addRoot} removeRoot={root => setRoots(roots.filter(item => item !== root))} scan={scan} disabled={busy || !database} />}
+      {page === "sources" && <Sources roots={roots} rootInput={rootInput} setRootInput={setRootInput} addRoot={addRoot} removeRoot={root => setRoots(roots.filter(item => item !== root))} scan={scan} disabled={busy || !database || scanState.state === "running"} />}
       {page === "review" && <Review database={database} groups={groups} busy={busy} execute={execute} refresh={refresh} />}
       {page === "trash" && <Trash database={database} items={trashItems} busy={busy} execute={execute} refresh={refresh} />}
       {page === "settings" && <Settings database={database} trash={trash} protectRules={protectRules} setDatabase={setDatabase} setTrash={setTrash} setProtectRules={setProtectRules} initialize={initialize} busy={busy} />}

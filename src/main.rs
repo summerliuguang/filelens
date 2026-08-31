@@ -159,16 +159,37 @@ pub fn init(database: &Path, trash: &Path) -> Result<(), String> {
 }
 
 pub fn scan(database: &Path, roots: &[PathBuf], protect: &[String]) -> Result<(), String> {
+    scan_with_control(database, roots, protect, &|| false, &|_| {})
+}
+
+pub fn scan_with_control(
+    database: &Path,
+    roots: &[PathBuf],
+    protect: &[String],
+    cancelled: &dyn Fn() -> bool,
+    progress: &dyn Fn(u64),
+) -> Result<(), String> {
     let connection = open_database(database)?;
     ensure_initialized(&connection)?;
     let trash = PathBuf::from(required_setting(&connection, "trash_path")?);
     let mut counters = ScanCounters::default();
     for root in roots {
+        if cancelled() {
+            return Err("scan cancelled".to_string());
+        }
         let root = absolute_path(root)?;
         if !root.is_dir() {
             return Err(format!("scan root is not a directory: {}", root.display()));
         }
-        scan_directory(&connection, &root, &trash, protect, &mut counters)?;
+        scan_directory(
+            &connection,
+            &root,
+            &trash,
+            protect,
+            &mut counters,
+            cancelled,
+            progress,
+        )?;
     }
     println!(
         "Scanned: {} new, {} unchanged, {} updated, {} skipped, {} errors.",
@@ -192,9 +213,14 @@ fn scan_directory(
     trash: &Path,
     protect: &[String],
     counters: &mut ScanCounters,
+    cancelled: &dyn Fn() -> bool,
+    progress: &dyn Fn(u64),
 ) -> Result<(), String> {
     let mut directories = vec![root.to_path_buf()];
     while let Some(directory) = directories.pop() {
+        if cancelled() {
+            return Err("scan cancelled".to_string());
+        }
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(error) => {
@@ -204,6 +230,9 @@ fn scan_directory(
             }
         };
         for entry in entries.flatten() {
+            if cancelled() {
+                return Err("scan cancelled".to_string());
+            }
             let path = entry.path();
             let file_type = match entry.file_type() {
                 Ok(value) => value,
@@ -237,6 +266,13 @@ fn scan_directory(
                     counters.errors += 1;
                 }
             }
+            progress(
+                counters.new
+                    + counters.unchanged
+                    + counters.updated
+                    + counters.skipped
+                    + counters.errors,
+            );
         }
     }
     Ok(())
