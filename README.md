@@ -2,13 +2,19 @@
 
 FileLens is a local-first duplicate-file finder for personal media archives. This repository currently contains the safe MVP core: multi-root scanning, full BLAKE3 exact-duplicate detection, review-state tracking, and a recoverable local application recycle bin.
 
-The desktop UI described in `DESIGN.md` will be built on this core. The current environment has no Node/npm runtime, so this first commit supplies a tested Rust command-line interface rather than an unverified Tauri frontend.
+The repository includes a Tauri + React desktop interface in `src-tauri/` and `src/`. It currently exposes the exact-duplicate MVP workflow: project setup, scan roots, index statistics, exact duplicate review, explicit approval, and recycle-bin movement.
 
 ## Build
 
 ```bash
 cargo build --release
+
+# Build the desktop frontend.
+node .tools/npm/bin/npm-cli.js install
+node .tools/npm/bin/npm-cli.js run build
 ```
+
+The desktop command bridge uses the workspace Rust CLI during development. Before distributing an installer, the next packaging task is to bundle the CLI as a Tauri sidecar (or extract the core into a shared Rust library), so installed applications do not require Cargo.
 
 ## Quick start
 

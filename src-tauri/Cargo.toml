@@ -1,0 +1,12 @@
+[package]
+name = "filelens-desktop"
+version = "0.1.0"
+description = "FileLens desktop interface"
+edition = "2024"
+
+[build-dependencies]
+tauri-build = { version = "2.5" }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2.10" }
