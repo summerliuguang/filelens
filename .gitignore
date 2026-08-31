@@ -1,0 +1,5 @@
+/target/
+/.filelens/
+*.db
+*.db-shm
+*.db-wal
