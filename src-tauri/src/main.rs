@@ -1,5 +1,6 @@
-use std::process::Command;
+use std::path::PathBuf;
 
+use rusqlite::{Connection, params};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -8,7 +9,6 @@ struct Status {
     duplicates: i64,
     in_trash: i64,
 }
-
 #[derive(Serialize)]
 struct GroupFile {
     id: i64,
@@ -16,14 +16,12 @@ struct GroupFile {
     protected: bool,
     approved: bool,
 }
-
 #[derive(Serialize)]
 struct Group {
     hash: String,
     size: i64,
     files: Vec<GroupFile>,
 }
-
 #[derive(Serialize)]
 struct TrashItem {
     id: i64,
@@ -32,165 +30,111 @@ struct TrashItem {
     trash_path: String,
 }
 
-fn cli(arguments: &[String]) -> Result<String, String> {
-    let root = std::env::current_dir().map_err(|error| error.to_string())?;
-    let output = Command::new("cargo")
-        .current_dir(root)
-        .args(["run", "--quiet", "--"])
-        .args(arguments)
-        .output()
-        .map_err(|error| format!("start FileLens core: {error}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
-    }
+fn open_database(path: &str) -> Result<Connection, String> {
+    Connection::open(path).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 fn initialize(database: String, trash: String) -> Result<String, String> {
-    cli(&["init".into(), database, trash])
+    filelens::init(&PathBuf::from(database), &PathBuf::from(trash))
+        .map(|_| "项目已创建或打开。".into())
 }
 
 #[tauri::command]
 fn scan(database: String, roots: Vec<String>) -> Result<String, String> {
-    let mut arguments = vec!["scan".into(), database];
-    for root in roots {
-        arguments.push("--root".into());
-        arguments.push(root);
-    }
-    cli(&arguments)
-}
-
-#[tauri::command]
-fn status(database: String) -> Result<Status, String> {
-    let output = cli(&["status".into(), database])?;
-    let numbers: Vec<i64> = output
-        .lines()
-        .filter_map(|line| line.split(':').nth(1)?.trim().parse().ok())
-        .collect();
-    if numbers.len() == 3 {
-        Ok(Status {
-            files: numbers[0],
-            duplicates: numbers[1],
-            in_trash: numbers[2],
-        })
-    } else {
-        Err("unexpected core status response".into())
-    }
-}
-
-#[tauri::command]
-fn groups(database: String) -> Result<Vec<Group>, String> {
-    let output = cli(&["groups".into(), database])?;
-    parse_groups(&output)
+    let roots = roots.into_iter().map(PathBuf::from).collect::<Vec<_>>();
+    filelens::scan(&PathBuf::from(database), &roots, &[]).map(|_| "扫描完成，索引已更新。".into())
 }
 
 #[tauri::command]
 fn approve(database: String, file_id: i64) -> Result<String, String> {
-    cli(&[
-        "approve".into(),
-        database,
-        "--file-id".into(),
-        file_id.to_string(),
-    ])
+    filelens::set_approval(&PathBuf::from(database), file_id, true).map(|_| "副本已确认。".into())
 }
+
 #[tauri::command]
 fn unapprove(database: String, file_id: i64) -> Result<String, String> {
-    cli(&[
-        "unapprove".into(),
-        database,
-        "--file-id".into(),
-        file_id.to_string(),
-    ])
+    filelens::set_approval(&PathBuf::from(database), file_id, false).map(|_| "已取消确认。".into())
 }
+
 #[tauri::command]
 fn trash(database: String, file_id: i64) -> Result<String, String> {
-    cli(&[
-        "trash".into(),
-        database,
-        "--file-id".into(),
-        file_id.to_string(),
-    ])
+    filelens::trash(&PathBuf::from(database), file_id).map(|_| "文件已移入应用回收站。".into())
 }
 
 #[tauri::command]
 fn restore(database: String, operation_id: i64) -> Result<String, String> {
-    cli(&[
-        "restore".into(),
-        database,
-        "--operation-id".into(),
-        operation_id.to_string(),
-    ])
+    filelens::restore(&PathBuf::from(database), operation_id).map(|_| "文件已恢复至原位置。".into())
+}
+
+#[tauri::command]
+fn status(database: String) -> Result<Status, String> {
+    let connection = open_database(&database)?;
+    let files = connection
+        .query_row("SELECT COUNT(*) FROM files WHERE present=1", [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| error.to_string())?;
+    let duplicates = connection.query_row("SELECT COALESCE(SUM(n - 1),0) FROM (SELECT COUNT(*) n FROM files WHERE present=1 GROUP BY hash,size HAVING n > 1)", [], |row| row.get(0)).map_err(|error| error.to_string())?;
+    let in_trash = connection
+        .query_row(
+            "SELECT COUNT(*) FROM operations WHERE state='trashed'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(Status {
+        files,
+        duplicates,
+        in_trash,
+    })
+}
+
+#[tauri::command]
+fn groups(database: String) -> Result<Vec<Group>, String> {
+    let connection = open_database(&database)?;
+    let mut statement = connection.prepare("SELECT hash,size FROM files WHERE present=1 GROUP BY hash,size HAVING COUNT(*) > 1 ORDER BY size DESC").map_err(|error| error.to_string())?;
+    let keys = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut result = Vec::new();
+    for key in keys {
+        let (hash, size) = key.map_err(|error| error.to_string())?;
+        let mut members = connection.prepare("SELECT id,path,protected,approved FROM files WHERE present=1 AND hash=?1 AND size=?2 ORDER BY path").map_err(|error| error.to_string())?;
+        let files = members
+            .query_map(params![hash, size], |row| {
+                Ok(GroupFile {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    protected: row.get::<_, i64>(2)? != 0,
+                    approved: row.get::<_, i64>(3)? != 0,
+                })
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        result.push(Group { hash, size, files });
+    }
+    Ok(result)
 }
 
 #[tauri::command]
 fn trash_list(database: String) -> Result<Vec<TrashItem>, String> {
-    let output = cli(&["trash-list".into(), database])?;
-    output
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            let end = line.find(']').ok_or("invalid recycle-bin item")?;
-            let id = line[1..end].parse().map_err(|_| "invalid recycle-bin id")?;
-            let parts: Vec<_> = line[end + 1..].trim().split('\t').collect();
-            if parts.len() != 3 {
-                return Err("invalid recycle-bin item".into());
-            }
+    let connection = open_database(&database)?;
+    let mut statement = connection.prepare("SELECT id,created_at,source_path,trash_path FROM operations WHERE state='trashed' ORDER BY created_at DESC").map_err(|error| error.to_string())?;
+    statement
+        .query_map([], |row| {
             Ok(TrashItem {
-                id,
-                created_at: parts[0].parse().map_err(|_| "invalid recycle-bin date")?,
-                source_path: parts[1].into(),
-                trash_path: parts[2].into(),
+                id: row.get(0)?,
+                created_at: row.get(1)?,
+                source_path: row.get(2)?,
+                trash_path: row.get(3)?,
             })
         })
-        .collect()
-}
-
-fn parse_groups(output: &str) -> Result<Vec<Group>, String> {
-    let mut groups = Vec::new();
-    let mut current: Option<Group> = None;
-    for line in output.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("Group ") {
-            if let Some(group) = current.take() {
-                groups.push(group);
-            }
-            let parts: Vec<_> = trimmed.split_whitespace().collect();
-            let size = parts
-                .get(6)
-                .and_then(|value| value.parse().ok())
-                .ok_or("invalid group size")?;
-            let hash = parts.last().ok_or("invalid group hash")?.to_string();
-            current = Some(Group {
-                hash,
-                size,
-                files: Vec::new(),
-            });
-        } else if trimmed.starts_with('[') {
-            let end = trimmed.find(']').ok_or("invalid file item")?;
-            let id = trimmed[1..end].parse().map_err(|_| "invalid file id")?;
-            let remaining = trimmed[end + 1..].trim();
-            let protected =
-                remaining.ends_with(" [protected]") || remaining.contains(" [protected] ");
-            let approved = remaining.ends_with(" [approved]") || remaining.contains(" [approved] ");
-            let path = remaining
-                .replace(" [protected]", "")
-                .replace(" [approved]", "");
-            if let Some(group) = &mut current {
-                group.files.push(GroupFile {
-                    id,
-                    path,
-                    protected,
-                    approved,
-                });
-            }
-        }
-    }
-    if let Some(group) = current {
-        groups.push(group);
-    }
-    Ok(groups)
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
 }
 
 fn main() {

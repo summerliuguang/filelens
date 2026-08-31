@@ -116,7 +116,7 @@ fn open_database(path: &Path) -> Result<Connection, String> {
     Ok(connection)
 }
 
-fn init(database: &Path, trash: &Path) -> Result<(), String> {
+pub fn init(database: &Path, trash: &Path) -> Result<(), String> {
     fs::create_dir_all(trash).map_err(|e| format!("create recycle bin: {e}"))?;
     let connection = open_database(database)?;
     connection
@@ -158,7 +158,7 @@ fn init(database: &Path, trash: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn scan(database: &Path, roots: &[PathBuf], protect: &[String]) -> Result<(), String> {
+pub fn scan(database: &Path, roots: &[PathBuf], protect: &[String]) -> Result<(), String> {
     let connection = open_database(database)?;
     ensure_initialized(&connection)?;
     let trash = PathBuf::from(required_setting(&connection, "trash_path")?);
@@ -370,7 +370,7 @@ fn groups(database: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn set_approval(database: &Path, file_id: i64, approved: bool) -> Result<(), String> {
+pub fn set_approval(database: &Path, file_id: i64, approved: bool) -> Result<(), String> {
     let connection = open_database(database)?;
     ensure_initialized(&connection)?;
     let file =
@@ -394,7 +394,7 @@ fn set_approval(database: &Path, file_id: i64, approved: bool) -> Result<(), Str
     Ok(())
 }
 
-fn trash(database: &Path, file_id: i64) -> Result<(), String> {
+pub fn trash(database: &Path, file_id: i64) -> Result<(), String> {
     let connection = open_database(database)?;
     ensure_initialized(&connection)?;
     let file =
@@ -430,7 +430,7 @@ fn trash(database: &Path, file_id: i64) -> Result<(), String> {
     Ok(())
 }
 
-fn restore(database: &Path, operation_id: i64) -> Result<(), String> {
+pub fn restore(database: &Path, operation_id: i64) -> Result<(), String> {
     let connection = open_database(database)?;
     ensure_initialized(&connection)?;
     let record: Option<(i64, String, String, String, String)> = connection
@@ -531,7 +531,7 @@ fn status(database: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn trash_list(database: &Path) -> Result<(), String> {
+pub fn trash_list(database: &Path) -> Result<(), String> {
     let connection = open_database(database)?;
     ensure_initialized(&connection)?;
     let mut statement = connection
