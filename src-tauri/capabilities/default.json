@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default window capabilities: core APIs and native dialogs",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:default"]
+}

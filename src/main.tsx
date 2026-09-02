@@ -24,6 +24,7 @@ type ProjectConfig = {
   roots: string[];
   protect_rules: string[];
 };
+type ProjectState = ProjectConfig & { database: string };
 type ScanState = {
   state: "idle" | "running" | "completed" | "cancelled" | "failed";
   processed: number;
@@ -57,7 +58,7 @@ function App() {
   const [similarPhotos, setSimilarPhotos] = useState<SimilarPhoto[]>([]);
   const [similarDocuments, setSimilarDocuments] = useState<SimilarDocument[]>([]);
   const [detectors, setDetectors] = useState<DetectorStatus[]>([]);
-  const [message, setMessage] = useState("请先在项目设置中创建或打开项目。");
+  const [message, setMessage] = useState("正在打开本地项目...");
   const [busy, setBusy] = useState(false);
   const [scanState, setScanState] = useState<ScanState>({
     state: "idle",
@@ -66,16 +67,15 @@ function App() {
   });
 
   useEffect(() => {
-    const saved = localStorage.getItem("filelens.database");
-    if (!saved) return;
-    setDatabase(saved);
-    invoke<ProjectConfig>("project_config", { database: saved })
-      .then((config) => {
-        setTrash(config.trash_path);
-        setRoots(config.roots);
-        setProtectRules(config.protect_rules);
+    invoke<ProjectState>("open_project")
+      .then((project) => {
+        setDatabase(project.database);
+        setTrash(project.trash_path);
+        setRoots(project.roots);
+        setProtectRules(project.protect_rules);
+        void refresh(project.database);
       })
-      .catch(() => setMessage("未能打开上次项目，请在项目设置中确认路径。"));
+      .catch((error) => setMessage(`自动打开本地项目失败：${String(error)}`));
   }, []);
 
   useEffect(() => {
@@ -111,15 +111,15 @@ function App() {
     }
   }
 
-  async function refresh() {
-    if (!database) return;
+  async function refresh(target = database) {
+    if (!target) return;
     await execute(async () => {
       const [nextStatus, nextGroups, nextTrash, nextSimilarPhotos, nextDocuments, nextDetectors] = await Promise.all([
-        invoke<Status>("status", { database }),
-        invoke<Group[]>("groups", { database }),
-        invoke<TrashItem[]>("trash_list", { database }),
-        invoke<SimilarPhoto[]>("similar_photos", { database }),
-        invoke<SimilarDocument[]>("similar_documents", { database }),
+        invoke<Status>("status", { database: target }),
+        invoke<Group[]>("groups", { database: target }),
+        invoke<TrashItem[]>("trash_list", { database: target }),
+        invoke<SimilarPhoto[]>("similar_photos", { database: target }),
+        invoke<SimilarDocument[]>("similar_documents", { database: target }),
         invoke<DetectorStatus[]>("detector_status"),
       ]);
       setStatus(nextStatus);
@@ -140,8 +140,7 @@ function App() {
         roots,
         protectRules,
       });
-      localStorage.setItem("filelens.database", database);
-      await refresh();
+      await refresh(database);
       return result;
     });
   }
@@ -214,7 +213,7 @@ function App() {
           <button
             className="secondary"
             disabled={busy || !database}
-            onClick={refresh}
+            onClick={() => refresh()}
           >
             ↻ 刷新
           </button>

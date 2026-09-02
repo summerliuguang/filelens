@@ -1,4 +1,5 @@
 use std::{
+    fs,
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -9,6 +10,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rusqlite::{Connection, params};
 use serde::Serialize;
+use tauri::Manager;
 
 #[derive(Serialize)]
 struct Status {
@@ -63,6 +65,14 @@ struct ProjectConfig {
     protect_rules: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct ProjectState {
+    database: String,
+    trash_path: String,
+    roots: Vec<String>,
+    protect_rules: Vec<String>,
+}
+
 #[derive(Clone, Serialize)]
 struct ScanState {
     state: String,
@@ -83,6 +93,47 @@ fn open_database(path: &str) -> Result<Connection, String> {
 fn initialize(database: String, trash: String) -> Result<String, String> {
     filelens::init(&PathBuf::from(database), &PathBuf::from(trash))
         .map(|_| "项目已创建或打开。".into())
+}
+
+#[tauri::command]
+fn open_project(app: tauri::AppHandle) -> Result<ProjectState, String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("resolve app data directory: {error}"))?;
+    fs::create_dir_all(&data_dir).map_err(|error| format!("create app data directory: {error}"))?;
+    let pointer = data_dir.join("project.json");
+    let database = match fs::read_to_string(&pointer) {
+        Ok(saved) => PathBuf::from(
+            serde_json::from_str::<String>(&saved).map_err(|error| error.to_string())?,
+        ),
+        Err(_) => data_dir.join("filelens.db"),
+    };
+    let connection = open_database(&database.to_string_lossy())?;
+    let stored_trash: Option<String> = connection
+        .query_row(
+            "SELECT value FROM settings WHERE key='trash_path'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    drop(connection);
+    let trash = stored_trash
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir.join("recycle"));
+    filelens::init(&database, &trash)?;
+    fs::write(
+        &pointer,
+        serde_json::to_string(&database.to_string_lossy()).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("save project pointer: {error}"))?;
+    let connection = open_database(&database.to_string_lossy())?;
+    Ok(ProjectState {
+        database: database.to_string_lossy().into_owned(),
+        trash_path: trash.to_string_lossy().into_owned(),
+        roots: setting_list(&connection, "roots")?,
+        protect_rules: setting_list(&connection, "protect_rules")?,
+    })
 }
 
 #[tauri::command]
@@ -441,6 +492,7 @@ fn main() {
         .manage(Mutex::new(None::<ScanTask>))
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
+            open_project,
             initialize,
             project_config,
             save_project_config,
