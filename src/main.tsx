@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -12,7 +12,12 @@ type GroupFile = {
   approved: boolean;
 };
 type Group = { hash: string; size: number; files: GroupFile[] };
-type Status = { files: number; duplicates: number; inTrash: number };
+type Status = {
+  files: number;
+  duplicates: number;
+  inTrash: number;
+  lastScanAt: number | null;
+};
 type TrashItem = {
   id: number;
   created_at: number;
@@ -28,6 +33,7 @@ type ProjectState = ProjectConfig & { database: string };
 type ScanState = {
   state: "idle" | "running" | "completed" | "cancelled" | "failed";
   processed: number;
+  total: number;
   message: string;
 };
 type SimilarPhoto = { first_path: string; second_path: string; distance: number };
@@ -63,8 +69,10 @@ function App() {
   const [scanState, setScanState] = useState<ScanState>({
     state: "idle",
     processed: 0,
+    total: 0,
     message: "",
   });
+  const progressHistory = useRef<{ t: number; processed: number }[]>([]);
 
   useEffect(() => {
     invoke<ProjectState>("open_project")
@@ -80,9 +88,14 @@ function App() {
 
   useEffect(() => {
     if (scanState.state !== "running") return;
+    progressHistory.current = [];
     const timer = window.setInterval(() => {
       invoke<ScanState>("scan_state")
         .then((next) => {
+          const now = Date.now();
+          const history = progressHistory.current;
+          history.push({ t: now, processed: next.processed });
+          while (history.length > 1 && now - history[0].t > 8000) history.shift();
           setScanState(next);
           if (next.state !== "running") {
             setMessage(next.message);
@@ -93,6 +106,7 @@ function App() {
           setScanState({
             state: "failed",
             processed: 0,
+            total: 0,
             message: String(error),
           }),
         );
@@ -105,7 +119,7 @@ function App() {
     try {
       setMessage(await action());
     } catch (error) {
-      setMessage(`操作失败：${String(error)}`);
+      setMessage(friendlyError(error));
     } finally {
       setBusy(false);
     }
@@ -152,7 +166,7 @@ function App() {
         roots,
         protectRules,
       });
-      setScanState({ state: "running", processed: 0, message: result });
+      setScanState({ state: "running", processed: 0, total: 0, message: result });
       return result;
     });
   }
@@ -161,10 +175,27 @@ function App() {
     await execute(() => invoke<string>("cancel_scan"));
   }
 
-  function addRoot() {
-    const value = rootInput.trim();
-    if (value && !roots.includes(value)) setRoots([...roots, value]);
-    setRootInput("");
+  async function persistRoots(next: string[]) {
+    if (!database) return;
+    try {
+      await invoke("save_roots", { database, roots: next, protectRules });
+    } catch (error) {
+      setMessage(friendlyError(error));
+    }
+  }
+
+  function addRootPath(value: string) {
+    const trimmed = value.trim();
+    if (!trimmed || roots.includes(trimmed)) return false;
+    const next = [...roots, trimmed];
+    setRoots(next);
+    void persistRoots(next);
+    return true;
+  }
+  function removeRootPath(root: string) {
+    const next = roots.filter((item) => item !== root);
+    setRoots(next);
+    void persistRoots(next);
   }
   const active = nav.find((item) => item.id === page)!;
   const selected = groups.reduce(
@@ -218,20 +249,7 @@ function App() {
             ↻ 刷新
           </button>
         </header>
-        {scanState.state === "running" && (
-          <section className="scan-progress">
-            <div>
-              <b>后台扫描中</b>
-              <span>已处理 {scanState.processed.toLocaleString()} 个条目</span>
-            </div>
-            <div className="progress-track">
-              <i />
-            </div>
-            <button className="secondary" disabled={busy} onClick={cancelScan}>
-              取消扫描
-            </button>
-          </section>
-        )}
+        {scanState.state === "running" && <ScanProgress scanState={scanState} history={progressHistory.current} onCancel={cancelScan} disabled={busy} />}
         {page === "overview" && (
           <Overview
             status={status}
@@ -245,10 +263,8 @@ function App() {
             roots={roots}
             rootInput={rootInput}
             setRootInput={setRootInput}
-            addRoot={addRoot}
-            removeRoot={(root) =>
-              setRoots(roots.filter((item) => item !== root))
-            }
+            addRoot={addRootPath}
+            removeRoot={removeRootPath}
             scan={scan}
             disabled={busy || !database || scanState.state === "running"}
           />
@@ -294,6 +310,62 @@ function App() {
   );
 }
 
+function ScanProgress({
+  scanState,
+  history,
+  onCancel,
+  disabled,
+}: {
+  scanState: ScanState;
+  history: { t: number; processed: number }[];
+  onCancel: () => void;
+  disabled: boolean;
+}) {
+  const percent =
+    scanState.total > 0
+      ? Math.min(100, Math.round((scanState.processed / scanState.total) * 100))
+      : null;
+  let rate: number | null = null;
+  if (history.length >= 2) {
+    const seconds = (history[history.length - 1].t - history[0].t) / 1000;
+    const delta = history[history.length - 1].processed - history[0].processed;
+    if (seconds > 0 && delta > 0) rate = delta / seconds;
+  }
+  const etaSeconds =
+    rate !== null && scanState.total > scanState.processed
+      ? (scanState.total - scanState.processed) / rate
+      : null;
+  return (
+    <section className="scan-progress">
+      <div className="scan-progress-head">
+        <b>后台扫描中</b>
+        <span>
+          已处理 {scanState.processed.toLocaleString()}
+          {scanState.total > 0
+            ? ` / ${scanState.total.toLocaleString()} 个条目`
+            : " 个条目"}
+          {rate !== null && ` · ${formatRate(rate)}`}
+          {etaSeconds !== null && ` · ${formatEta(etaSeconds)}`}
+        </span>
+      </div>
+      <div className="progress-track">
+        <i
+          className={percent === null ? "indeterminate" : ""}
+          style={percent === null ? undefined : { width: `${percent}%` }}
+        />
+      </div>
+      <div className="scan-progress-foot">
+        <span>
+          {percent === null ? "正在统计文件数量..." : `${percent}%`}
+        </span>
+        <button className="secondary" disabled={disabled} onClick={onCancel}>
+          取消扫描
+        </button>
+      </div>
+    </section>
+  );
+}
+
 function Overview({
   status,
   groups,
@@ -313,7 +385,11 @@ function Overview({
     <>
       <section className="hero">
         <div>
-          <span className="signal">● 索引就绪</span>
+          <span className="signal">
+            {status?.lastScanAt
+              ? `● 上次扫描：${new Date(status.lastScanAt * 1000).toLocaleString("zh-CN")}`
+              : "● 等待首次扫描"}
+          </span>
           <h2>
             让重复文件变得
             <br />
@@ -403,7 +479,7 @@ function Sources({
   roots: string[];
   rootInput: string;
   setRootInput: (value: string) => void;
-  addRoot: () => void;
+  addRoot: (value: string) => boolean;
   removeRoot: (root: string) => void;
   scan: () => void;
   disabled: boolean;
@@ -414,7 +490,10 @@ function Sources({
       multiple: false,
       title: "选择扫描目录",
     });
-    if (typeof selected === "string") setRootInput(selected);
+    if (typeof selected === "string") addRoot(selected);
+  }
+  function submitInput() {
+    if (addRoot(rootInput)) setRootInput("");
   }
   return (
     <section className="panel sources-page">
@@ -431,13 +510,13 @@ function Sources({
         <input
           value={rootInput}
           onChange={(event) => setRootInput(event.target.value)}
-          onKeyDown={(event) => event.key === "Enter" && addRoot()}
-          placeholder="输入目录，例如 D:\\NAS-Sync\\Photos"
+          onKeyDown={(event) => event.key === "Enter" && submitInput()}
+          placeholder="输入目录路径，或点击右侧按钮选择"
         />
         <button className="secondary" onClick={pickDirectory}>
           选择目录
         </button>
-        <button className="secondary" onClick={addRoot}>
+        <button className="secondary" onClick={submitInput}>
           添加
         </button>
       </div>
@@ -676,7 +755,32 @@ function Trash({
           <h2>可恢复文件</h2>
           <p>恢复时不会覆盖原路径已有文件，并会再次进行内容完整性检查。</p>
         </div>
-        <span className="pill">{items.length} 个文件</span>
+        <div className="head-actions">
+          <span className="pill">{items.length} 个文件</span>
+          {items.length > 0 && (
+            <button
+              className="danger"
+              disabled={busy}
+              onClick={() => {
+                if (
+                  window.confirm(
+                    `确定永久删除回收站中的 ${items.length} 个文件吗？此操作不可恢复。`,
+                  )
+                ) {
+                  void execute(async () => {
+                    const result = await invoke<string>("trash_empty", {
+                      database,
+                    });
+                    await refresh();
+                    return result;
+                  });
+                }
+              }}
+            >
+              清空回收站
+            </button>
+          )}
+        </div>
       </div>
       {items.length === 0 ? (
         <Empty
@@ -697,21 +801,45 @@ function Trash({
                   {new Date(item.created_at * 1000).toLocaleString("zh-CN")}
                 </small>
               </div>
-              <button
-                disabled={busy}
-                onClick={() =>
-                  execute(async () => {
-                    const result = await invoke<string>("restore", {
-                      database,
-                      operationId: item.id,
-                    });
-                    await refresh();
-                    return result;
-                  })
-                }
-              >
-                恢复原位置
-              </button>
+              <div className="trash-actions">
+                <button
+                  disabled={busy}
+                  onClick={() =>
+                    execute(async () => {
+                      const result = await invoke<string>("restore", {
+                        database,
+                        operationId: item.id,
+                      });
+                      await refresh();
+                      return result;
+                    })
+                  }
+                >
+                  恢复原位置
+                </button>
+                <button
+                  className="danger"
+                  disabled={busy}
+                  onClick={() => {
+                    if (
+                      window.confirm(
+                        "确定永久删除该文件吗？删除后将无法再恢复。",
+                      )
+                    ) {
+                      void execute(async () => {
+                        const result = await invoke<string>("trash_delete", {
+                          database,
+                          operationId: item.id,
+                        });
+                        await refresh();
+                        return result;
+                      });
+                    }
+                  }}
+                >
+                  永久删除
+                </button>
+              </div>
             </article>
           ))}
         </div>
@@ -761,7 +889,7 @@ function Settings({
         <input
           value={database}
           onChange={(event) => setDatabase(event.target.value)}
-          placeholder="例如 D:\\FileLens\\archive.db"
+          placeholder="默认自动管理，可输入自定义 .db 文件完整路径"
         />
       </label>
       <label>
@@ -770,7 +898,7 @@ function Settings({
           <input
             value={trash}
             onChange={(event) => setTrash(event.target.value)}
-            placeholder="例如 E:\\FileLens-Recycle"
+            placeholder="选择本地磁盘上的回收站目录"
           />
           <button className="secondary" onClick={pickTrash}>
             选择目录
@@ -852,6 +980,36 @@ function formatBytes(bytes: number) {
     unit++;
   }
   return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unit]}`;
+}
+
+function friendlyError(error: unknown) {
+  const raw = String(error);
+  const rules: [RegExp, string][] = [
+    [/permission denied|access is denied/i, "没有访问权限，请检查文件或目录的读取权限。"],
+    [/database is locked|database table is locked/i, "数据库正被其他操作占用，请稍后重试。"],
+    [/no such file|os error 2/i, "文件或目录不存在，可能已被移动或删除。"],
+    [/no longer matches indexed hash/, "文件内容与索引记录不一致，请重新扫描后再试。"],
+    [/file changed while hashing/, "扫描期间文件内容发生了变化，将在下次扫描时重试。"],
+    [/must be an approved/, "只有已确认的精确重复副本才能移入回收站。"],
+    [/is not a directory/, "扫描目录无效或已不存在，请重新添加。"],
+    [/restore refused/, "原位置已存在文件，恢复被拒绝以避免覆盖。"],
+    [/unknown file id/, "该文件已不在索引中，请刷新后重试。"],
+  ];
+  for (const [pattern, text] of rules) {
+    if (pattern.test(raw)) return text;
+  }
+  return `操作失败：${raw}`;
+}
+
+function formatRate(rate: number) {
+  return `${rate.toLocaleString("zh-CN", { maximumFractionDigits: 0 })} 个/秒`;
+}
+
+function formatEta(seconds: number) {
+  if (seconds < 60) return `预计剩余 ${Math.ceil(seconds)} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `预计剩余 ${minutes} 分 ${Math.ceil(seconds % 60)} 秒`;
+  return `预计剩余 ${Math.floor(minutes / 60)} 时 ${minutes % 60} 分`;
 }
 
 createRoot(document.getElementById("root")!).render(<App />);

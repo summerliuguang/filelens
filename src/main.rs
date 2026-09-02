@@ -177,7 +177,7 @@ pub fn init(database: &Path, trash: &Path) -> Result<(), String> {
 }
 
 pub fn scan(database: &Path, roots: &[PathBuf], protect: &[String]) -> Result<(), String> {
-    scan_with_control(database, roots, protect, &|| false, &|_| {})
+    scan_with_control(database, roots, protect, &|| false, &|_, _| {})
 }
 
 pub fn scan_with_control(
@@ -185,35 +185,142 @@ pub fn scan_with_control(
     roots: &[PathBuf],
     protect: &[String],
     cancelled: &dyn Fn() -> bool,
-    progress: &dyn Fn(u64),
+    progress: &dyn Fn(u64, u64),
 ) -> Result<(), String> {
     let connection = open_database(database)?;
     ensure_initialized(&connection)?;
     let trash = PathBuf::from(required_setting(&connection, "trash_path")?);
+    let scan_started = now_seconds()?;
     let mut counters = ScanCounters::default();
-    for root in roots {
+    let absolute_roots = roots
+        .iter()
+        .map(|root| absolute_path(root))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut scanned_roots = Vec::new();
+    let mut failed_roots = Vec::new();
+    let total = count_entries(&absolute_roots, &trash, cancelled)?;
+    progress(0, total);
+    for root in &absolute_roots {
         if cancelled() {
             return Err("scan cancelled".to_string());
         }
-        let root = absolute_path(root)?;
         if !root.is_dir() {
-            return Err(format!("scan root is not a directory: {}", root.display()));
+            failed_roots.push(root.to_string_lossy().into_owned());
+            eprintln!(
+                "warning: skipping scan root that is not a directory: {}",
+                root.display()
+            );
+            continue;
         }
         scan_directory(
             &connection,
-            &root,
+            root,
             &trash,
             protect,
             &mut counters,
             cancelled,
             progress,
+            total,
         )?;
+        scanned_roots.push(root.clone());
     }
+    let removed = mark_missing_absent(&connection, &scanned_roots, scan_started)?;
+    set_setting(&connection, "last_scan_at", &now_seconds()?.to_string())?;
     println!(
-        "Scanned: {} new, {} unchanged, {} updated, {} skipped, {} errors.",
-        counters.new, counters.unchanged, counters.updated, counters.skipped, counters.errors
+        "Scanned: {} new, {} unchanged, {} updated, {} skipped, {} errors, {} missing.",
+        counters.new,
+        counters.unchanged,
+        counters.updated,
+        counters.skipped,
+        counters.errors,
+        removed
     );
+    if !failed_roots.is_empty() {
+        println!("Skipped missing roots: {}", failed_roots.join(", "));
+    }
     Ok(())
+}
+
+/// Pre-walk the roots counting the entries the scan will report, so progress
+/// can be shown as a fraction. Counts mirror scan_directory: every entry in a
+/// walked directory counts once, except non-excluded subdirectories which are
+/// walked instead of counted.
+fn count_entries(
+    roots: &[PathBuf],
+    trash: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<u64, String> {
+    let mut total = 0_u64;
+    let mut directories: Vec<PathBuf> = roots
+        .iter()
+        .filter(|root| root.is_dir())
+        .cloned()
+        .collect();
+    while let Some(directory) = directories.pop() {
+        if cancelled() {
+            return Err("scan cancelled".to_string());
+        }
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(_) => {
+                total += 1;
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            if cancelled() {
+                return Err("scan cancelled".to_string());
+            }
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(file_type) if file_type.is_dir() && !file_type.is_symlink() => {
+                    if is_excluded(&path, trash) {
+                        total += 1;
+                    } else {
+                        directories.push(path);
+                    }
+                }
+                Ok(_) => total += 1,
+                Err(_) => total += 1,
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Mark files under the successfully scanned roots that were not seen this
+/// round (scanned_at older than the scan start) as absent, so files deleted
+/// outside the application stop showing up in duplicate groups.
+fn mark_missing_absent(
+    connection: &Connection,
+    roots: &[PathBuf],
+    scan_started: i64,
+) -> Result<u64, String> {
+    let mut removed = 0_u64;
+    for root in roots {
+        let root_text = root.to_string_lossy();
+        let root_str: &str = &root_text;
+        let escaped = like_escape(root_str);
+        let posix_pattern = format!("{escaped}/%");
+        let windows_pattern = format!("{escaped}\\\\%");
+        let changed = connection
+            .execute(
+                "UPDATE files SET present=0, approved=0
+                 WHERE present=1 AND scanned_at < ?1
+                   AND (path = ?2 OR path LIKE ?3 ESCAPE '\\' OR path LIKE ?4 ESCAPE '\\')",
+                params![scan_started, root_str, posix_pattern, windows_pattern],
+            )
+            .map_err(|e| e.to_string())?;
+        removed += changed as u64;
+    }
+    Ok(removed)
+}
+
+fn like_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 #[derive(Default)]
@@ -232,7 +339,8 @@ fn scan_directory(
     protect: &[String],
     counters: &mut ScanCounters,
     cancelled: &dyn Fn() -> bool,
-    progress: &dyn Fn(u64),
+    progress: &dyn Fn(u64, u64),
+    total: u64,
 ) -> Result<(), String> {
     let mut directories = vec![root.to_path_buf()];
     while let Some(directory) = directories.pop() {
@@ -290,6 +398,7 @@ fn scan_directory(
                     + counters.updated
                     + counters.skipped
                     + counters.errors,
+                total,
             );
         }
     }
@@ -333,8 +442,8 @@ fn index_file(
     if current == Some((size, modified)) {
         connection
             .execute(
-                "UPDATE files SET present=1 WHERE path=?1",
-                params![path_text],
+                "UPDATE files SET present=1, scanned_at=?2 WHERE path=?1",
+                params![path_text, now_seconds()?],
             )
             .map_err(|e| e.to_string())?;
         save_photo_fingerprint(connection, &path_text, path)?;
@@ -659,6 +768,71 @@ pub fn restore(database: &Path, operation_id: i64) -> Result<(), String> {
     Ok(())
 }
 
+/// Permanently delete one file from the application recycle bin.
+pub fn delete_trash(database: &Path, operation_id: i64) -> Result<(), String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    let record: Option<(String, String)> = connection
+        .query_row(
+            "SELECT trash_path,state FROM operations WHERE id=?1",
+            params![operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some((trashed, state)) = record else {
+        return Err(format!("unknown operation id {operation_id}"));
+    };
+    if state != "trashed" {
+        return Err("operation is not available for delete".to_string());
+    }
+    let trashed_path = PathBuf::from(&trashed);
+    if trashed_path.exists() {
+        fs::remove_file(&trashed_path).map_err(|e| format!("delete recycled file: {e}"))?;
+    }
+    let trash_root = PathBuf::from(required_setting(&connection, "trash_path")?);
+    cleanup_empty_parents(&trashed_path, &trash_root);
+    connection
+        .execute(
+            "UPDATE operations SET state='deleted' WHERE id=?1",
+            params![operation_id],
+        )
+        .map_err(|e| e.to_string())?;
+    println!("Deleted permanently: {trashed}");
+    Ok(())
+}
+
+fn cleanup_empty_parents(start: &Path, stop_at: &Path) {
+    let mut current = start.parent().map(Path::to_path_buf);
+    while let Some(directory) = current {
+        if directory == stop_at || fs::remove_dir(&directory).is_err() {
+            break;
+        }
+        current = directory.parent().map(Path::to_path_buf);
+    }
+}
+
+/// Permanently delete every file currently in the application recycle bin.
+pub fn empty_trash(database: &Path) -> Result<u64, String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    let mut statement = connection
+        .prepare("SELECT id FROM operations WHERE state='trashed'")
+        .map_err(|e| e.to_string())?;
+    let ids = statement
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    drop(statement);
+    drop(connection);
+    for id in &ids {
+        delete_trash(database, *id)?;
+    }
+    println!("Recycle bin emptied: {} files", ids.len());
+    Ok(ids.len() as u64)
+}
+
 fn move_verified(source: &Path, destination: &Path, expected_hash: &str) -> Result<(), String> {
     match fs::rename(source, destination) {
         Ok(()) => Ok(()),
@@ -878,6 +1052,120 @@ mod tests {
             .unwrap();
         drop(connection);
         assert!(set_approval(&database, id, true).is_err());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn rescan_marks_missing_files_absent_and_skips_missing_roots() {
+        let directory = test_directory("missing");
+        let source = directory.join("source");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("keep.txt"), b"same content").unwrap();
+        fs::write(source.join("copy.txt"), b"same content").unwrap();
+        let database = directory.join("index.db");
+
+        init(&database, &recycle).unwrap();
+        // A missing root must be skipped without aborting the scan.
+        let roots = vec![source.clone(), directory.join("not-exists")];
+        scan(&database, &roots, &[]).unwrap();
+
+        // scanned_at has second resolution; make sure the second scan starts
+        // strictly after the first one finished.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::remove_file(source.join("copy.txt")).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+
+        let connection = open_database(&database).unwrap();
+        let present: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE present=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 1, "deleted file should be marked absent");
+        let duplicates: i64 = connection
+            .query_row(
+                "SELECT COALESCE(SUM(n - 1),0) FROM (SELECT COUNT(*) n FROM files WHERE present=1 GROUP BY hash,size HAVING n > 1)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(duplicates, 0, "no duplicate group should remain");
+        let last_scan: String = connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='last_scan_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(last_scan.parse::<i64>().is_ok());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn trash_can_be_deleted_permanently_and_emptied() {
+        let directory = test_directory("trash-delete");
+        let source = directory.join("source");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("a.txt"), b"same content").unwrap();
+        fs::write(source.join("b.txt"), b"same content").unwrap();
+        let database = directory.join("index.db");
+
+        init(&database, &recycle).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        let connection = open_database(&database).unwrap();
+        let b_id: i64 = connection
+            .query_row(
+                "SELECT id FROM files WHERE path LIKE '%b.txt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(connection);
+        set_approval(&database, b_id, true).unwrap();
+        trash(&database, b_id).unwrap();
+
+        let connection = open_database(&database).unwrap();
+        let (operation_id, trash_path): (i64, String) = connection
+            .query_row(
+                "SELECT id,trash_path FROM operations WHERE state='trashed'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        drop(connection);
+        delete_trash(&database, operation_id).unwrap();
+        assert!(!PathBuf::from(&trash_path).exists());
+        let connection = open_database(&database).unwrap();
+        let state: String = connection
+            .query_row(
+                "SELECT state FROM operations WHERE id=?1",
+                params![operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "deleted");
+        drop(connection);
+
+        // Recreate the duplicate, trash it again, then empty the bin.
+        fs::write(source.join("b.txt"), b"same content").unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        set_approval(&database, b_id, true).unwrap();
+        trash(&database, b_id).unwrap();
+        let removed = empty_trash(&database).unwrap();
+        assert_eq!(removed, 1);
+        let connection = open_database(&database).unwrap();
+        let trashed: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM operations WHERE state='trashed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trashed, 0);
         let _ = fs::remove_dir_all(directory);
     }
 

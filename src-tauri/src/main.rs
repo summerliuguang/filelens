@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     path::PathBuf,
     sync::{
@@ -17,6 +18,7 @@ struct Status {
     files: i64,
     duplicates: i64,
     in_trash: i64,
+    last_scan_at: Option<i64>,
 }
 #[derive(Serialize)]
 struct GroupFile {
@@ -77,6 +79,7 @@ struct ProjectState {
 struct ScanState {
     state: String,
     processed: u64,
+    total: u64,
     message: String,
 }
 
@@ -93,6 +96,17 @@ fn open_database(path: &str) -> Result<Connection, String> {
 fn initialize(database: String, trash: String) -> Result<String, String> {
     filelens::init(&PathBuf::from(database), &PathBuf::from(trash))
         .map(|_| "项目已创建或打开。".into())
+}
+
+fn write_project_pointer(app: &tauri::AppHandle, database: &str) -> Result<(), String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("resolve app data directory: {error}"))?;
+    fs::create_dir_all(&data_dir).map_err(|error| format!("create app data directory: {error}"))?;
+    let pointer = serde_json::to_string(database).map_err(|error| error.to_string())?;
+    fs::write(data_dir.join("project.json"), pointer)
+        .map_err(|error| format!("save project pointer: {error}"))
 }
 
 #[tauri::command]
@@ -122,11 +136,7 @@ fn open_project(app: tauri::AppHandle) -> Result<ProjectState, String> {
         .map(PathBuf::from)
         .unwrap_or_else(|| data_dir.join("recycle"));
     filelens::init(&database, &trash)?;
-    fs::write(
-        &pointer,
-        serde_json::to_string(&database.to_string_lossy()).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| format!("save project pointer: {error}"))?;
+    write_project_pointer(&app, &database.to_string_lossy())?;
     let connection = open_database(&database.to_string_lossy())?;
     Ok(ProjectState {
         database: database.to_string_lossy().into_owned(),
@@ -155,6 +165,7 @@ fn project_config(database: String) -> Result<ProjectConfig, String> {
 
 #[tauri::command]
 fn save_project_config(
+    app: tauri::AppHandle,
     database: String,
     trash: String,
     roots: Vec<String>,
@@ -164,7 +175,20 @@ fn save_project_config(
     let connection = open_database(&database)?;
     save_setting_list(&connection, "roots", &roots)?;
     save_setting_list(&connection, "protect_rules", &protect_rules)?;
+    write_project_pointer(&app, &database)?;
     Ok("项目设置已保存。".into())
+}
+
+#[tauri::command]
+fn save_roots(
+    database: String,
+    roots: Vec<String>,
+    protect_rules: Vec<String>,
+) -> Result<String, String> {
+    let connection = open_database(&database)?;
+    save_setting_list(&connection, "roots", &roots)?;
+    save_setting_list(&connection, "protect_rules", &protect_rules)?;
+    Ok("扫描目录已保存。".into())
 }
 
 #[tauri::command]
@@ -178,12 +202,18 @@ fn start_scan(
     if task.is_some() {
         return Err("已有扫描任务正在运行".into());
     }
+    {
+        let connection = open_database(&database)?;
+        save_setting_list(&connection, "roots", &roots)?;
+        save_setting_list(&connection, "protect_rules", &protect_rules)?;
+    }
     let roots = roots.into_iter().map(PathBuf::from).collect::<Vec<_>>();
     let cancelled = Arc::new(AtomicBool::new(false));
     let state = Arc::new(Mutex::new(ScanState {
         state: "running".into(),
         processed: 0,
-        message: "正在扫描文件...".into(),
+        total: 0,
+        message: "正在准备扫描...".into(),
     }));
     let worker_cancelled = cancelled.clone();
     let worker_state = state.clone();
@@ -194,9 +224,10 @@ fn start_scan(
             &roots,
             &protect_rules,
             &|| worker_cancelled.load(Ordering::Relaxed),
-            &|processed| {
+            &|processed, total| {
                 if let Ok(mut current) = progress_state.lock() {
                     current.processed = processed;
+                    current.total = total;
                 }
             },
         );
@@ -228,6 +259,7 @@ fn scan_state(task: tauri::State<'_, Mutex<Option<ScanTask>>>) -> Result<ScanSta
         return Ok(ScanState {
             state: "idle".into(),
             processed: 0,
+            total: 0,
             message: "没有正在运行的扫描任务。".into(),
         });
     };
@@ -290,11 +322,34 @@ fn trash(database: String, file_id: i64) -> Result<String, String> {
 #[tauri::command]
 fn trash_approved(database: String, file_ids: Vec<i64>) -> Result<String, String> {
     let mut moved = 0;
+    let mut failed: Vec<String> = Vec::new();
     for file_id in file_ids {
-        filelens::trash(&PathBuf::from(&database), file_id)?;
-        moved += 1;
+        match filelens::trash(&PathBuf::from(&database), file_id) {
+            Ok(()) => moved += 1,
+            Err(error) => failed.push(format!("文件 #{file_id}：{error}")),
+        }
     }
-    Ok(format!("已将 {moved} 个确认副本移入应用回收站。"))
+    if failed.is_empty() {
+        Ok(format!("已将 {moved} 个确认副本移入应用回收站。"))
+    } else {
+        Ok(format!(
+            "已移动 {moved} 个，{} 个失败：{}",
+            failed.len(),
+            failed.join("；")
+        ))
+    }
+}
+
+#[tauri::command]
+fn trash_delete(database: String, operation_id: i64) -> Result<String, String> {
+    filelens::delete_trash(&PathBuf::from(database), operation_id)
+        .map(|_| "文件已永久删除。".into())
+}
+
+#[tauri::command]
+fn trash_empty(database: String) -> Result<String, String> {
+    filelens::empty_trash(&PathBuf::from(database))
+        .map(|count| format!("已清空回收站，永久删除 {count} 个文件。"))
 }
 
 #[tauri::command]
@@ -338,10 +393,19 @@ fn status(database: String) -> Result<Status, String> {
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
+    let last_scan_at = connection
+        .query_row(
+            "SELECT value FROM settings WHERE key='last_scan_at'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok());
     Ok(Status {
         files,
         duplicates,
         in_trash,
+        last_scan_at,
     })
 }
 
@@ -375,72 +439,134 @@ fn groups(database: String) -> Result<Vec<Group>, String> {
     Ok(result)
 }
 
+struct FingerprintEntry {
+    path: String,
+    hash: String,
+    value: u64,
+}
+
+/// Disjoint 64-bit chunks used for candidate bucketing. Pigeonhole: with N
+/// chunks, any pair differing in at most N-1 bits must share at least one
+/// chunk value, so the bucket join is exact for the thresholds below.
+const PHOTO_CHUNKS: [(u32, u64); 5] = [
+    (51, 0x1fff),
+    (38, 0x1fff),
+    (25, 0x1fff),
+    (12, 0x1fff),
+    (0, 0x0fff),
+];
+const DOCUMENT_CHUNKS: [(u32, u64); 8] = [
+    (56, 0xff),
+    (48, 0xff),
+    (40, 0xff),
+    (32, 0xff),
+    (24, 0xff),
+    (16, 0xff),
+    (8, 0xff),
+    (0, 0xff),
+];
+const SIMILAR_MAX_BUCKET: usize = 256;
+const SIMILAR_RESULT_LIMIT: usize = 5000;
+
+fn load_fingerprints(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> Result<Vec<FingerprintEntry>, String> {
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT a.path, a.hash, f.{column} FROM {table} f \
+             JOIN files a ON a.id = f.file_id WHERE a.present = 1"
+        ))
+        .map_err(|e| e.to_string())?;
+    statement
+        .query_map([], |row| {
+            Ok(FingerprintEntry {
+                path: row.get(0)?,
+                hash: row.get(1)?,
+                value: row.get::<_, i64>(2)? as u64,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+fn similar_pairs(
+    entries: &[FingerprintEntry],
+    chunks: &[(u32, u64)],
+    max_distance: u32,
+) -> Vec<(usize, usize, u32)> {
+    let mut seen: HashSet<(usize, usize)> = HashSet::new();
+    let mut result: Vec<(usize, usize, u32)> = Vec::new();
+    for &(shift, mask) in chunks {
+        let mut buckets: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (index, entry) in entries.iter().enumerate() {
+            buckets
+                .entry((entry.value >> shift) & mask)
+                .or_default()
+                .push(index);
+        }
+        for members in buckets.into_values() {
+            // Oversized buckets (e.g. thousands of near-black thumbnails)
+            // would pair quadratically; these clusters are skipped.
+            if members.len() < 2 || members.len() > SIMILAR_MAX_BUCKET {
+                continue;
+            }
+            for i in 0..members.len() {
+                for j in (i + 1)..members.len() {
+                    let key = (members[i].min(members[j]), members[i].max(members[j]));
+                    if seen.contains(&key) {
+                        continue;
+                    }
+                    let (first, second) = (&entries[key.0], &entries[key.1]);
+                    if first.hash == second.hash {
+                        seen.insert(key);
+                        continue;
+                    }
+                    let distance = (first.value ^ second.value).count_ones();
+                    if distance <= max_distance {
+                        seen.insert(key);
+                        result.push((key.0, key.1, distance));
+                    }
+                }
+            }
+        }
+    }
+    result.sort_by(|a, b| {
+        a.2.cmp(&b.2)
+            .then_with(|| entries[a.0].path.cmp(&entries[b.0].path))
+    });
+    result.truncate(SIMILAR_RESULT_LIMIT);
+    result
+}
+
 #[tauri::command]
 fn similar_photos(database: String) -> Result<Vec<SimilarPhoto>, String> {
     let connection = open_database(&database)?;
-    let mut statement = connection.prepare(
-        "SELECT DISTINCT a.path,b.path,p1.dhash,p2.dhash
-         FROM photo_fingerprints p1
-         JOIN photo_fingerprints p2 ON p1.file_id < p2.file_id
-           AND (p1.part_a=p2.part_a OR p1.part_b=p2.part_b OR p1.part_c=p2.part_c OR p1.part_d=p2.part_d OR p1.part_e=p2.part_e)
-         JOIN files a ON a.id=p1.file_id
-         JOIN files b ON b.id=p2.file_id
-         WHERE a.present=1 AND b.present=1 AND a.hash != b.hash
-         LIMIT 5000",
-    ).map_err(|error| error.to_string())?;
-    let candidates = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)? as u64,
-                row.get::<_, i64>(3)? as u64,
-            ))
+    let entries = load_fingerprints(&connection, "photo_fingerprints", "dhash")?;
+    Ok(similar_pairs(&entries, &PHOTO_CHUNKS, 4)
+        .into_iter()
+        .map(|(a, b, distance)| SimilarPhoto {
+            first_path: entries[a].path.clone(),
+            second_path: entries[b].path.clone(),
+            distance,
         })
-        .map_err(|error| error.to_string())?;
-    let mut result = Vec::new();
-    for candidate in candidates {
-        let (first_path, second_path, first_hash, second_hash) =
-            candidate.map_err(|error| error.to_string())?;
-        let distance = (first_hash ^ second_hash).count_ones();
-        if distance <= 4 {
-            result.push(SimilarPhoto {
-                first_path,
-                second_path,
-                distance,
-            });
-        }
-    }
-    Ok(result)
+        .collect())
 }
 
 #[tauri::command]
 fn similar_documents(database: String) -> Result<Vec<SimilarDocument>, String> {
     let connection = open_database(&database)?;
-    let mut statement = connection.prepare("SELECT a.path,b.path,d1.simhash,d2.simhash FROM document_fingerprints d1 JOIN document_fingerprints d2 ON d1.file_id<d2.file_id JOIN files a ON a.id=d1.file_id JOIN files b ON b.id=d2.file_id WHERE a.present=1 AND b.present=1 AND a.hash!=b.hash LIMIT 5000").map_err(|e| e.to_string())?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)? as u64,
-                row.get::<_, i64>(3)? as u64,
-            ))
+    let entries = load_fingerprints(&connection, "document_fingerprints", "simhash")?;
+    Ok(similar_pairs(&entries, &DOCUMENT_CHUNKS, 8)
+        .into_iter()
+        .map(|(a, b, distance)| SimilarDocument {
+            first_path: entries[a].path.clone(),
+            second_path: entries[b].path.clone(),
+            distance,
         })
-        .map_err(|e| e.to_string())?;
-    let mut result = Vec::new();
-    for row in rows {
-        let (first_path, second_path, first, second) = row.map_err(|e| e.to_string())?;
-        let distance = (first ^ second).count_ones();
-        if distance <= 8 {
-            result.push(SimilarDocument {
-                first_path,
-                second_path,
-                distance,
-            });
-        }
-    }
-    Ok(result)
+        .collect())
 }
 
 #[tauri::command]
@@ -496,6 +622,7 @@ fn main() {
             initialize,
             project_config,
             save_project_config,
+            save_roots,
             start_scan,
             scan_state,
             cancel_scan,
@@ -508,6 +635,8 @@ fn main() {
             unapprove,
             trash,
             trash_approved,
+            trash_delete,
+            trash_empty,
             image_thumbnail,
             restore,
             trash_list
