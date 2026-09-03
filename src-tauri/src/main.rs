@@ -9,8 +9,10 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use image::ImageDecoder as _;
 use rusqlite::{Connection, params};
 use serde::Serialize;
+use std::path::Path;
 use tauri::Manager;
 
 #[derive(Serialize)]
@@ -89,7 +91,13 @@ struct ScanTask {
 }
 
 fn open_database(path: &str) -> Result<Connection, String> {
-    Connection::open(path).map_err(|error| error.to_string())
+    let connection = Connection::open(path).map_err(|error| error.to_string())?;
+    // WAL lets UI reads proceed while the scan thread writes; busy_timeout
+    // absorbs the brief lock contention that remains.
+    connection
+        .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+        .map_err(|error| error.to_string())?;
+    Ok(connection)
 }
 
 #[tauri::command]
@@ -352,23 +360,69 @@ fn trash_empty(database: String) -> Result<String, String> {
         .map(|count| format!("已清空回收站，永久删除 {count} 个文件。"))
 }
 
+fn thumbnail_cache_key(path: &Path) -> String {
+    let metadata = fs::metadata(path).ok();
+    let modified = metadata
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+    blake3::hash(format!("{}|{modified}|{size}", path.display()).as_bytes())
+        .to_hex()[..20]
+        .to_string()
+}
+
 #[tauri::command]
-fn image_thumbnail(path: String) -> Result<Option<String>, String> {
-    let reader = match image::ImageReader::open(path) {
+async fn image_thumbnail(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<Option<String>, String> {
+    let source = PathBuf::from(&path);
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?
+        .join("thumbnails");
+    let cached = cache_dir.join(format!("{}.png", thumbnail_cache_key(&source)));
+    if let Ok(bytes) = fs::read(&cached) {
+        return Ok(Some(format!(
+            "data:image/png;base64,{}",
+            STANDARD.encode(bytes)
+        )));
+    }
+    let reader = match image::ImageReader::open(&source) {
         Ok(reader) => reader,
         Err(_) => return Ok(None),
     };
-    let image = match reader.decode() {
-        Ok(image) => image.thumbnail(320, 240),
+    let mut decoder = match reader.into_decoder() {
+        Ok(decoder) => decoder,
         Err(_) => return Ok(None),
     };
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut image = match image::DynamicImage::from_decoder(decoder) {
+        Ok(image) => image,
+        Err(_) => return Ok(None),
+    };
+    image.apply_orientation(orientation);
+    let thumbnail = image.thumbnail(320, 240);
     let mut output = std::io::Cursor::new(Vec::new());
-    image
-        .write_to(&mut output, image::ImageFormat::Png)
-        .map_err(|error| error.to_string())?;
+    let bytes = match thumbnail.write_to(&mut output, image::ImageFormat::Png) {
+        Ok(()) => output.into_inner(),
+        Err(_) => return Ok(None),
+    };
+    // Best-effort cache: a full or read-only disk must not break previews.
+    let _ = fs::create_dir_all(&cache_dir);
+    let temporary = cached.with_extension("tmp");
+    if fs::write(&temporary, &bytes).is_ok() {
+        let _ = fs::rename(&temporary, &cached);
+    }
     Ok(Some(format!(
         "data:image/png;base64,{}",
-        STANDARD.encode(output.into_inner())
+        STANDARD.encode(bytes)
     )))
 }
 
@@ -410,11 +464,22 @@ fn status(database: String) -> Result<Status, String> {
 }
 
 #[tauri::command]
-fn groups(database: String) -> Result<Vec<Group>, String> {
+fn groups(
+    database: String,
+    offset: Option<i64>,
+    limit: Option<i64>,
+) -> Result<Vec<Group>, String> {
+    let limit = limit.unwrap_or(50).clamp(1, 200);
+    let offset = offset.unwrap_or(0).max(0);
     let connection = open_database(&database)?;
-    let mut statement = connection.prepare("SELECT hash,size FROM files WHERE present=1 GROUP BY hash,size HAVING COUNT(*) > 1 ORDER BY size DESC").map_err(|error| error.to_string())?;
+    let mut statement = connection
+        .prepare(
+            "SELECT hash,size FROM files WHERE present=1 \
+             GROUP BY hash,size HAVING COUNT(*) > 1 ORDER BY size DESC LIMIT ?1 OFFSET ?2",
+        )
+        .map_err(|error| error.to_string())?;
     let keys = statement
-        .query_map([], |row| {
+        .query_map(params![limit, offset], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })
         .map_err(|error| error.to_string())?;

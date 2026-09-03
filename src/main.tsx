@@ -51,6 +51,8 @@ const nav: { id: Page; icon: string; label: string; caption: string }[] = [
   { id: "settings", icon: "⚙", label: "项目设置", caption: "PROJECT SETTINGS" },
 ];
 
+const GROUPS_PAGE = 50;
+
 function App() {
   const [page, setPage] = useState<Page>("overview");
   const [database, setDatabase] = useState("");
@@ -60,6 +62,7 @@ function App() {
   const [rootInput, setRootInput] = useState("");
   const [status, setStatus] = useState<Status | null>(null);
   const [groups, setGroups] = useState<Group[]>([]);
+  const [groupsExhausted, setGroupsExhausted] = useState(true);
   const [trashItems, setTrashItems] = useState<TrashItem[]>([]);
   const [similarPhotos, setSimilarPhotos] = useState<SimilarPhoto[]>([]);
   const [similarDocuments, setSimilarDocuments] = useState<SimilarDocument[]>([]);
@@ -130,7 +133,7 @@ function App() {
     await execute(async () => {
       const [nextStatus, nextGroups, nextTrash, nextSimilarPhotos, nextDocuments, nextDetectors] = await Promise.all([
         invoke<Status>("status", { database: target }),
-        invoke<Group[]>("groups", { database: target }),
+        invoke<Group[]>("groups", { database: target, offset: 0, limit: GROUPS_PAGE }),
         invoke<TrashItem[]>("trash_list", { database: target }),
         invoke<SimilarPhoto[]>("similar_photos", { database: target }),
         invoke<SimilarDocument[]>("similar_documents", { database: target }),
@@ -138,6 +141,7 @@ function App() {
       ]);
       setStatus(nextStatus);
       setGroups(nextGroups);
+      setGroupsExhausted(nextGroups.length < GROUPS_PAGE);
       setTrashItems(nextTrash);
       setSimilarPhotos(nextSimilarPhotos);
       setSimilarDocuments(nextDocuments);
@@ -168,6 +172,20 @@ function App() {
       });
       setScanState({ state: "running", processed: 0, total: 0, message: result });
       return result;
+    });
+  }
+
+  async function loadMoreGroups() {
+    if (!database) return;
+    await execute(async () => {
+      const next = await invoke<Group[]>("groups", {
+        database,
+        offset: groups.length,
+        limit: GROUPS_PAGE,
+      });
+      setGroups((current) => [...current, ...next]);
+      setGroupsExhausted(next.length < GROUPS_PAGE);
+      return `已加载 ${groups.length + next.length} 个重复组。`;
     });
   }
 
@@ -276,6 +294,8 @@ function App() {
             busy={busy}
             execute={execute}
             refresh={refresh}
+            hasMore={!groupsExhausted}
+            onLoadMore={loadMoreGroups}
           />
         )}
         {page === "similar" && <SimilarPhotos photos={similarPhotos} />}
@@ -552,12 +572,16 @@ function Review({
   busy,
   execute,
   refresh,
+  hasMore,
+  onLoadMore,
 }: {
   database: string;
   groups: Group[];
   busy: boolean;
   execute: (action: () => Promise<string>) => Promise<void>;
   refresh: () => Promise<void>;
+  hasMore: boolean;
+  onLoadMore: () => Promise<void>;
 }) {
   return (
     <section className="panel review-page">
@@ -680,6 +704,17 @@ function Review({
               )}
             </article>
           ))}
+          {hasMore && (
+            <div className="load-more">
+              <button
+                className="secondary"
+                disabled={busy}
+                onClick={() => void onLoadMore()}
+              >
+                加载更多重复组
+              </button>
+            </div>
+          )}
         </div>
       )}
     </section>
@@ -705,6 +740,8 @@ function Thumbnail({ path }: { path: string }) {
 }
 
 function SimilarPhotos({ photos }: { photos: SimilarPhoto[] }) {
+  const [visible, setVisible] = useState(60);
+  const shown = photos.slice(0, visible);
   return (
     <section className="panel review-page">
       <div className="section-head">
@@ -716,11 +753,21 @@ function SimilarPhotos({ photos }: { photos: SimilarPhoto[] }) {
       </div>
       {photos.length === 0 ? <Empty icon="◒" text="没有高置信度相似照片" detail="完成扫描后，这里会显示重压缩或缩放后的同源照片候选。" /> : (
         <div className="similar-list">
-          {photos.map((photo, index) => <article className="similar-pair" key={`${photo.first_path}-${photo.second_path}`}>
+          {shown.map((photo, index) => <article className="similar-pair" key={`${photo.first_path}-${photo.second_path}`}>
             <div className="similar-photos"><Thumbnail path={photo.first_path} /><Thumbnail path={photo.second_path} /></div>
             <div><b>候选 {index + 1}</b><span>{photo.first_path}</span><span>{photo.second_path}</span></div>
             <small>dHash 差异 {photo.distance}/64</small>
           </article>)}
+          {visible < photos.length && (
+            <div className="load-more">
+              <button
+                className="secondary"
+                onClick={() => setVisible((count) => count + 120)}
+              >
+                显示更多（还有 {photos.length - visible} 对）
+              </button>
+            </div>
+          )}
         </div>
       )}
     </section>
@@ -728,7 +775,9 @@ function SimilarPhotos({ photos }: { photos: SimilarPhoto[] }) {
 }
 
 function SimilarDocuments({ documents }: { documents: SimilarDocument[] }) {
-  return <section className="panel review-page"><div className="section-head"><div><h2>相似文档</h2><p>文本近似仅供人工查看，不能作为自动处理依据。</p></div><span className="pill">{documents.length} 对</span></div>{documents.length === 0 ? <Empty icon="≡" text="没有高置信度相似文档" detail="扫描 TXT、Markdown、CSV、JSON、XML 或 HTML 后会显示候选。" /> : <div className="similar-list">{documents.map((document, index) => <article className="similar-pair" key={`${document.first_path}-${document.second_path}`}><div><b>候选 {index + 1}</b><span>{document.first_path}</span><span>{document.second_path}</span></div><small>SimHash 差异 {document.distance}/64</small></article>)}</div>}</section>;
+  const [visible, setVisible] = useState(60);
+  const shown = documents.slice(0, visible);
+  return <section className="panel review-page"><div className="section-head"><div><h2>相似文档</h2><p>文本近似仅供人工查看，不能作为自动处理依据。</p></div><span className="pill">{documents.length} 对</span></div>{documents.length === 0 ? <Empty icon="≡" text="没有高置信度相似文档" detail="扫描 TXT、Markdown、CSV、JSON、XML 或 HTML 后会显示候选。" /> : <div className="similar-list">{shown.map((document, index) => <article className="similar-pair" key={`${document.first_path}-${document.second_path}`}><div><b>候选 {index + 1}</b><span>{document.first_path}</span><span>{document.second_path}</span></div><small>SimHash 差异 {document.distance}/64</small></article>)}{visible < documents.length && (<div className="load-more"><button className="secondary" onClick={() => setVisible((count) => count + 120)}>显示更多（还有 {documents.length - visible} 对）</button></div>)}</div>}</section>;
 }
 
 function Detectors({ detectors }: { detectors: DetectorStatus[] }) {

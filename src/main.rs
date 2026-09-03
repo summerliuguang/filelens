@@ -184,8 +184,8 @@ pub fn scan_with_control(
     database: &Path,
     roots: &[PathBuf],
     protect: &[String],
-    cancelled: &dyn Fn() -> bool,
-    progress: &dyn Fn(u64, u64),
+    cancelled: &(dyn Fn() -> bool + Send + Sync),
+    progress: &(dyn Fn(u64, u64) + Send + Sync),
 ) -> Result<(), String> {
     let connection = open_database(database)?;
     ensure_initialized(&connection)?;
@@ -212,8 +212,9 @@ pub fn scan_with_control(
             );
             continue;
         }
-        scan_directory(
+        run_parallel_scan(
             &connection,
+            database,
             root,
             &trash,
             protect,
@@ -332,16 +333,71 @@ struct ScanCounters {
     errors: u64,
 }
 
-fn scan_directory(
-    connection: &Connection,
+struct ProcessedEntry {
+    path_text: String,
+    size: i64,
+    modified: i64,
+    hash: String,
+    photo: Option<u64>,
+    document: Option<(u64, i64)>,
+}
+
+enum WorkResult {
+    Unchanged(String),
+    Skipped,
+    WalkError(String),
+    Processed(Result<ProcessedEntry, (String, String)>),
+}
+
+/// Hash and fingerprint one file on a worker thread. Pure file I/O: the
+/// database is only touched by the writer thread.
+fn process_file(path: PathBuf) -> WorkResult {
+    let path_text = match absolute_path(&path) {
+        Ok(absolute) => absolute.to_string_lossy().into_owned(),
+        Err(error) => {
+            return WorkResult::Processed(Err((path.to_string_lossy().into_owned(), error)))
+        }
+    };
+    let work = || -> Result<ProcessedEntry, String> {
+        let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
+        let size =
+            i64::try_from(metadata.len()).map_err(|_| "file is too large".to_string())?;
+        let modified = unix_seconds(metadata.modified().map_err(|e| e.to_string())?)?;
+        let hash = hash_file(&path)?;
+        let after = fs::metadata(&path).map_err(|e| e.to_string())?;
+        if after.len() != metadata.len()
+            || unix_seconds(after.modified().map_err(|e| e.to_string())?)? != modified
+        {
+            return Err("file changed while hashing; retry on next scan".to_string());
+        }
+        let photo = perceptual_hash(&path);
+        let document = document_simhash(&path);
+        Ok(ProcessedEntry {
+            path_text: path_text.clone(),
+            size,
+            modified,
+            hash,
+            photo,
+            document,
+        })
+    };
+    match work() {
+        Ok(entry) => WorkResult::Processed(Ok(entry)),
+        Err(error) => WorkResult::Processed(Err((path_text, error))),
+    }
+}
+
+/// Walk one root, sending unchanged files straight to the writer and the rest
+/// to the hashing workers. Uses its own read-only view of the database.
+fn walk_root(
+    database: &Path,
     root: &Path,
     trash: &Path,
-    protect: &[String],
-    counters: &mut ScanCounters,
+    work_tx: &std::sync::mpsc::Sender<PathBuf>,
+    result_tx: &std::sync::mpsc::Sender<WorkResult>,
     cancelled: &dyn Fn() -> bool,
-    progress: &dyn Fn(u64, u64),
-    total: u64,
 ) -> Result<(), String> {
+    let connection = open_database(database)?;
     let mut directories = vec![root.to_path_buf()];
     while let Some(directory) = directories.pop() {
         if cancelled() {
@@ -351,7 +407,9 @@ fn scan_directory(
             Ok(entries) => entries,
             Err(error) => {
                 eprintln!("warning: cannot read {}: {error}", directory.display());
-                counters.errors += 1;
+                let _ = result_tx.send(WorkResult::WalkError(
+                    directory.to_string_lossy().into_owned(),
+                ));
                 continue;
             }
         };
@@ -360,35 +418,213 @@ fn scan_directory(
                 return Err("scan cancelled".to_string());
             }
             let path = entry.path();
-            let file_type = match entry.file_type() {
-                Ok(value) => value,
-                Err(_) => {
-                    counters.errors += 1;
-                    continue;
-                }
+            let Ok(file_type) = entry.file_type() else {
+                let _ = result_tx.send(WorkResult::Skipped);
+                continue;
             };
             if file_type.is_symlink() {
-                counters.skipped += 1;
+                let _ = result_tx.send(WorkResult::Skipped);
                 continue;
             }
             if file_type.is_dir() {
                 if is_excluded(&path, trash) {
-                    counters.skipped += 1;
+                    let _ = result_tx.send(WorkResult::Skipped);
                 } else {
                     directories.push(path);
                 }
                 continue;
             }
             if !file_type.is_file() || is_excluded(&path, trash) {
-                counters.skipped += 1;
+                let _ = result_tx.send(WorkResult::Skipped);
                 continue;
             }
-            match index_file(connection, &path, protect) {
-                Ok(IndexOutcome::New) => counters.new += 1,
-                Ok(IndexOutcome::Unchanged) => counters.unchanged += 1,
-                Ok(IndexOutcome::Updated) => counters.updated += 1,
-                Err(error) => {
-                    eprintln!("warning: {}: {error}", path.display());
+            if is_unchanged(&connection, &path) {
+                let _ = result_tx.send(WorkResult::Unchanged(
+                    path.to_string_lossy().into_owned(),
+                ));
+            } else if work_tx.send(path).is_err() {
+                // Workers only exit early on cancellation.
+                return Err("scan cancelled".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_unchanged(connection: &Connection, path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    let Ok(size) = i64::try_from(metadata.len()) else {
+        return false;
+    };
+    let Ok(modified_time) = metadata.modified() else {
+        return false;
+    };
+    let Ok(modified) = unix_seconds(modified_time) else {
+        return false;
+    };
+    // Non-image files need no fingerprint; images are reprocessed until their
+    // photo fingerprint exists.
+    let fingerprint_required = is_image_path(path);
+    let current: Option<(i64, i64, bool)> = connection
+        .query_row(
+            "SELECT f.size, f.modified, EXISTS(SELECT 1 FROM photo_fingerprints p WHERE p.file_id = f.id) \
+             FROM files f WHERE f.path = ?1",
+            params![path.to_string_lossy()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0)),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    matches!(&current, Some((size_, modified_, has_fingerprint))
+        if *size_ == size && *modified_ == modified && (!fingerprint_required || *has_fingerprint))
+}
+
+fn is_image_path(path: &Path) -> bool {
+    let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "tif" | "tiff"
+    )
+}
+
+fn write_entry(
+    connection: &Connection,
+    entry: &ProcessedEntry,
+    protect: &[String],
+) -> Result<IndexOutcome, String> {
+    let is_protected = protect.iter().any(|rule| entry.path_text.contains(rule));
+    let now = now_seconds()?;
+    let outcome = if connection
+        .query_row(
+            "SELECT 1 FROM files WHERE path=?1",
+            params![entry.path_text],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {
+        IndexOutcome::Updated
+    } else {
+        IndexOutcome::New
+    };
+    connection.execute(
+        "INSERT INTO files(path,size,modified,hash,protected,approved,present,scanned_at) VALUES(?1,?2,?3,?4,?5,0,1,?6)
+         ON CONFLICT(path) DO UPDATE SET size=excluded.size,modified=excluded.modified,hash=excluded.hash,protected=excluded.protected,approved=0,present=1,scanned_at=excluded.scanned_at",
+        params![entry.path_text, entry.size, entry.modified, entry.hash, is_protected as i64, now],
+    )
+    .map_err(|e| e.to_string())?;
+    connection.execute(
+        "DELETE FROM photo_fingerprints WHERE file_id=(SELECT id FROM files WHERE path=?1)",
+        params![entry.path_text],
+    )
+    .map_err(|e| e.to_string())?;
+    let file_id: i64 = connection
+        .query_row(
+            "SELECT id FROM files WHERE path=?1",
+            params![entry.path_text],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if let Some(photo) = entry.photo {
+        let parts = fingerprint_parts(photo);
+        connection.execute(
+            "INSERT INTO photo_fingerprints(file_id,dhash,part_a,part_b,part_c,part_d,part_e) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![file_id, photo as i64, parts[0], parts[1], parts[2], parts[3], parts[4]],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if let Some((simhash, token_count)) = entry.document {
+        connection.execute(
+            "INSERT INTO document_fingerprints(file_id,simhash,token_count) VALUES(?1,?2,?3) ON CONFLICT(file_id) DO UPDATE SET simhash=excluded.simhash,token_count=excluded.token_count",
+            params![file_id, simhash as i64, token_count],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(outcome)
+}
+
+/// Parallel scan pipeline for one root: a walker thread feeds hashing workers
+/// through a channel; the caller thread is the single database writer.
+fn run_parallel_scan(
+    connection: &Connection,
+    database: &Path,
+    root: &Path,
+    trash: &Path,
+    protect: &[String],
+    counters: &mut ScanCounters,
+    cancelled: &(dyn Fn() -> bool + Send + Sync),
+    progress: &(dyn Fn(u64, u64) + Send + Sync),
+    total: u64,
+) -> Result<(), String> {
+    use std::sync::mpsc::{self, TryRecvError};
+
+    let worker_count = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(2)
+        .min(4);
+    let (work_tx, work_rx) = mpsc::channel::<PathBuf>();
+    let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
+    let (result_tx, result_rx) = mpsc::channel::<WorkResult>();
+
+    std::thread::scope(|scope| -> Result<(), String> {
+        let walker = {
+            let work_tx = work_tx.clone();
+            let result_tx = result_tx.clone();
+            scope.spawn(move || {
+                walk_root(database, root, trash, &work_tx, &result_tx, cancelled)
+            })
+        };
+        drop(work_tx);
+        for _ in 0..worker_count {
+            let work_rx = work_rx.clone();
+            let result_tx = result_tx.clone();
+            scope.spawn(move || loop {
+                if cancelled() {
+                    break;
+                }
+                let item = match work_rx.lock() {
+                    Ok(guard) => guard.try_recv(),
+                    Err(_) => break,
+                };
+                match item {
+                    Ok(path) => {
+                        let _ = result_tx.send(process_file(path));
+                    }
+                    Err(TryRecvError::Empty) => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(TryRecvError::Disconnected) => break,
+                }
+            });
+        }
+        drop(result_tx);
+        for result in result_rx {
+            match result {
+                WorkResult::Unchanged(path_text) => {
+                    connection.execute(
+                        "UPDATE files SET present=1, scanned_at=?2 WHERE path=?1",
+                        params![path_text, now_seconds()?],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    counters.unchanged += 1;
+                }
+                WorkResult::Skipped => counters.skipped += 1,
+                WorkResult::WalkError(path) => {
+                    eprintln!("warning: unreadable directory skipped: {path}");
+                    counters.errors += 1;
+                }
+                WorkResult::Processed(Ok(entry)) => match write_entry(connection, &entry, protect)? {
+                    IndexOutcome::New => counters.new += 1,
+                    IndexOutcome::Updated => counters.updated += 1,
+                    IndexOutcome::Unchanged => counters.unchanged += 1,
+                },
+                WorkResult::Processed(Err((path, error))) => {
+                    eprintln!("warning: {path}: {error}");
                     counters.errors += 1;
                 }
             }
@@ -401,7 +637,8 @@ fn scan_directory(
                 total,
             );
         }
-    }
+        walker.join().map_err(|_| "scan worker panicked".to_string())?
+    })?;
     Ok(())
 }
 
@@ -420,97 +657,6 @@ enum IndexOutcome {
     New,
     Unchanged,
     Updated,
-}
-
-fn index_file(
-    connection: &Connection,
-    path: &Path,
-    protect: &[String],
-) -> Result<IndexOutcome, String> {
-    let metadata = fs::metadata(path).map_err(|e| e.to_string())?;
-    let size = i64::try_from(metadata.len()).map_err(|_| "file is too large".to_string())?;
-    let modified = unix_seconds(metadata.modified().map_err(|e| e.to_string())?)?;
-    let path_text = absolute_path(path)?.to_string_lossy().into_owned();
-    let current: Option<(i64, i64)> = connection
-        .query_row(
-            "SELECT size, modified FROM files WHERE path=?1",
-            params![path_text],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?;
-    if current == Some((size, modified)) {
-        connection
-            .execute(
-                "UPDATE files SET present=1, scanned_at=?2 WHERE path=?1",
-                params![path_text, now_seconds()?],
-            )
-            .map_err(|e| e.to_string())?;
-        save_photo_fingerprint(connection, &path_text, path)?;
-        return Ok(IndexOutcome::Unchanged);
-    }
-    let hash = hash_file(path)?;
-    let after = fs::metadata(path).map_err(|e| e.to_string())?;
-    if after.len() != metadata.len()
-        || unix_seconds(after.modified().map_err(|e| e.to_string())?)? != modified
-    {
-        return Err("file changed while hashing; retry on next scan".to_string());
-    }
-    let is_protected = protect.iter().any(|rule| path_text.contains(rule));
-    let now = now_seconds()?;
-    let outcome = if current.is_some() {
-        IndexOutcome::Updated
-    } else {
-        IndexOutcome::New
-    };
-    connection.execute(
-        "INSERT INTO files(path,size,modified,hash,protected,approved,present,scanned_at) VALUES(?1,?2,?3,?4,?5,0,1,?6)
-         ON CONFLICT(path) DO UPDATE SET size=excluded.size,modified=excluded.modified,hash=excluded.hash,protected=excluded.protected,approved=0,present=1,scanned_at=excluded.scanned_at",
-        params![path_text, size, modified, hash, is_protected as i64, now],
-    ).map_err(|e| e.to_string())?;
-    connection
-        .execute(
-            "DELETE FROM photo_fingerprints WHERE file_id=(SELECT id FROM files WHERE path=?1)",
-            params![path_text],
-        )
-        .map_err(|e| e.to_string())?;
-    save_photo_fingerprint(connection, &path_text, path)?;
-    save_document_fingerprint(connection, &path_text, path)?;
-    Ok(outcome)
-}
-
-fn save_photo_fingerprint(
-    connection: &Connection,
-    path_text: &str,
-    path: &Path,
-) -> Result<(), String> {
-    let file_id: i64 = connection
-        .query_row(
-            "SELECT id FROM files WHERE path=?1",
-            params![path_text],
-            |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())?;
-    let existing: Option<i64> = connection
-        .query_row(
-            "SELECT 1 FROM photo_fingerprints WHERE file_id=?1",
-            params![file_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?;
-    if existing.is_some() {
-        return Ok(());
-    }
-    let Some(hash) = perceptual_hash(path) else {
-        return Ok(());
-    };
-    let parts = fingerprint_parts(hash);
-    connection.execute(
-        "INSERT INTO photo_fingerprints(file_id,dhash,part_a,part_b,part_c,part_d,part_e) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-        params![file_id, hash as i64, parts[0], parts[1], parts[2], parts[3], parts[4]],
-    ).map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 fn hash_file(path: &Path) -> Result<String, String> {
@@ -551,25 +697,6 @@ fn fingerprint_parts(hash: u64) -> [i64; 5] {
         ((hash >> 12) & 0x1fff) as i64,
         (hash & 0x0fff) as i64,
     ]
-}
-
-fn save_document_fingerprint(
-    connection: &Connection,
-    path_text: &str,
-    path: &Path,
-) -> Result<(), String> {
-    let file_id: i64 = connection
-        .query_row(
-            "SELECT id FROM files WHERE path=?1",
-            params![path_text],
-            |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())?;
-    let Some((hash, count)) = document_simhash(path) else {
-        return Ok(());
-    };
-    connection.execute("INSERT INTO document_fingerprints(file_id,simhash,token_count) VALUES(?1,?2,?3) ON CONFLICT(file_id) DO UPDATE SET simhash=excluded.simhash,token_count=excluded.token_count", params![file_id, hash as i64, count]).map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 fn document_simhash(path: &Path) -> Option<(u64, i64)> {

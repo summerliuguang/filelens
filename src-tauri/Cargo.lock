@@ -1129,6 +1129,7 @@ name = "filelens-desktop"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "blake3",
  "filelens",
  "image",
  "rusqlite",
