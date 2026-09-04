@@ -226,15 +226,17 @@ pub fn scan_with_control(
         scanned_roots.push(root.clone());
     }
     let removed = mark_missing_absent(&connection, &scanned_roots, scan_started)?;
+    let pruned = prune_expired_trash_with(&connection, now_seconds()?)?;
     set_setting(&connection, "last_scan_at", &now_seconds()?.to_string())?;
     println!(
-        "Scanned: {} new, {} unchanged, {} updated, {} skipped, {} errors, {} missing.",
+        "Scanned: {} new, {} unchanged, {} updated, {} skipped, {} errors, {} missing, {} expired recycled.",
         counters.new,
         counters.unchanged,
         counters.updated,
         counters.skipped,
         counters.errors,
-        removed
+        removed,
+        pruned
     );
     if !failed_roots.is_empty() {
         println!("Skipped missing roots: {}", failed_roots.join(", "));
@@ -932,6 +934,10 @@ pub fn delete_direct(database: &Path, file_id: i64) -> Result<(), String> {
 pub fn delete_trash(database: &Path, operation_id: i64) -> Result<(), String> {
     let connection = open_database(database)?;
     ensure_initialized(&connection)?;
+    delete_trash_with(&connection, operation_id)
+}
+
+fn delete_trash_with(connection: &Connection, operation_id: i64) -> Result<(), String> {
     let record: Option<(String, String)> = connection
         .query_row(
             "SELECT trash_path,state FROM operations WHERE id=?1",
@@ -950,7 +956,7 @@ pub fn delete_trash(database: &Path, operation_id: i64) -> Result<(), String> {
     if trashed_path.exists() {
         fs::remove_file(&trashed_path).map_err(|e| format!("delete recycled file: {e}"))?;
     }
-    let trash_root = PathBuf::from(required_setting(&connection, "trash_path")?);
+    let trash_root = PathBuf::from(required_setting(connection, "trash_path")?);
     cleanup_empty_parents(&trashed_path, &trash_root);
     connection
         .execute(
@@ -960,6 +966,52 @@ pub fn delete_trash(database: &Path, operation_id: i64) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     println!("Deleted permanently: {trashed}");
     Ok(())
+}
+
+/// Recycle-bin retention in days from settings; 0 disables auto-pruning.
+pub fn trash_retention_days(connection: &Connection) -> i64 {
+    connection
+        .query_row(
+            "SELECT value FROM settings WHERE key='trash_retention_days'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|days| *days >= 0)
+        .unwrap_or(30)
+}
+
+/// Permanently delete recycled files older than the configured retention.
+pub fn prune_expired_trash(database: &Path) -> Result<u64, String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    prune_expired_trash_with(&connection, now_seconds()?)
+}
+
+fn prune_expired_trash_with(connection: &Connection, now: i64) -> Result<u64, String> {
+    let days = trash_retention_days(connection);
+    if days <= 0 {
+        return Ok(0);
+    }
+    let cutoff = now.saturating_sub(days.saturating_mul(86_400));
+    let mut statement = connection
+        .prepare("SELECT id FROM operations WHERE state='trashed' AND created_at < ?1")
+        .map_err(|e| e.to_string())?;
+    let ids = statement
+        .query_map(params![cutoff], |row| row.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    drop(statement);
+    let mut pruned = 0;
+    for id in ids {
+        match delete_trash_with(connection, id) {
+            Ok(()) => pruned += 1,
+            Err(error) => eprintln!("warning: could not prune operation {id}: {error}"),
+        }
+    }
+    Ok(pruned)
 }
 
 fn cleanup_empty_parents(start: &Path, stop_at: &Path) {
@@ -1371,6 +1423,83 @@ mod tests {
             .unwrap();
         assert_eq!(state, "deleted");
         assert_eq!(present, 0);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn expired_recycle_items_are_pruned_after_retention() {
+        let directory = test_directory("retention");
+        let source = directory.join("source");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("a.txt"), b"same content").unwrap();
+        fs::write(source.join("b.txt"), b"same content").unwrap();
+        let database = directory.join("index.db");
+
+        init(&database, &recycle).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        let connection = open_database(&database).unwrap();
+        let b_id: i64 = connection
+            .query_row(
+                "SELECT id FROM files WHERE path LIKE '%b.txt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(connection);
+        set_approval(&database, b_id, true).unwrap();
+        trash(&database, b_id).unwrap();
+
+        // Backdate the operation beyond the default 30-day retention.
+        let connection = open_database(&database).unwrap();
+        let operation_id: i64 = connection
+            .query_row(
+                "SELECT id FROM operations WHERE state='trashed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trash_retention_days(&connection), 30);
+        connection
+            .execute(
+                "UPDATE operations SET created_at = created_at - 40*86400 WHERE id=?1",
+                params![operation_id],
+            )
+            .unwrap();
+        // Retention disabled: nothing is pruned.
+        connection
+            .execute(
+                "INSERT INTO settings(key,value) VALUES('trash_retention_days','0')
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(prune_expired_trash(&database).unwrap(), 0);
+
+        // Retention enabled: the expired item is removed and marked deleted.
+        let connection = open_database(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE settings SET value='30' WHERE key='trash_retention_days'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(prune_expired_trash(&database).unwrap(), 1);
+        assert!(
+            !recycle.join("files").exists(),
+            "pruned file and its now-empty directories should be gone"
+        );
+        let connection = open_database(&database).unwrap();
+        let state: String = connection
+            .query_row(
+                "SELECT state FROM operations WHERE id=?1",
+                params![operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "deleted");
         let _ = fs::remove_dir_all(directory);
     }
 

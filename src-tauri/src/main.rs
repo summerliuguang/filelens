@@ -69,6 +69,17 @@ struct TrashItem {
     created_at: i64,
     source_path: String,
     trash_path: String,
+    expired: bool,
+}
+
+#[derive(Serialize)]
+struct HistoryItem {
+    id: i64,
+    created_at: i64,
+    source_path: String,
+    trash_path: String,
+    state: String,
+    restored_at: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -84,6 +95,8 @@ struct ProjectState {
     trash_path: String,
     roots: Vec<String>,
     protect_rules: Vec<String>,
+    trash_retention_days: i64,
+    auto_scan: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -126,6 +139,22 @@ fn write_project_pointer(app: &tauri::AppHandle, database: &str) -> Result<(), S
         .map_err(|error| format!("save project pointer: {error}"))
 }
 
+fn setting_value(connection: &Connection, key: &str) -> Option<String> {
+    connection
+        .query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .ok()
+}
+
+fn setting_flag(connection: &Connection, key: &str, default: bool) -> bool {
+    setting_value(connection, key)
+        .map(|value| value == "1")
+        .unwrap_or(default)
+}
+
 #[tauri::command]
 fn open_project(app: tauri::AppHandle) -> Result<ProjectState, String> {
     let data_dir = app
@@ -160,6 +189,8 @@ fn open_project(app: tauri::AppHandle) -> Result<ProjectState, String> {
         trash_path: trash.to_string_lossy().into_owned(),
         roots: setting_list(&connection, "roots")?,
         protect_rules: setting_list(&connection, "protect_rules")?,
+        trash_retention_days: filelens::trash_retention_days(&connection),
+        auto_scan: setting_flag(&connection, "auto_scan_on_start", true),
     })
 }
 
@@ -791,19 +822,100 @@ fn detector_status() -> Vec<DetectorStatus> {
 #[tauri::command]
 fn trash_list(database: String) -> Result<Vec<TrashItem>, String> {
     let connection = open_database(&database)?;
+    let retention = filelens::trash_retention_days(&connection);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs() as i64)
+        .unwrap_or(0);
     let mut statement = connection.prepare("SELECT id,created_at,source_path,trash_path FROM operations WHERE state='trashed' ORDER BY created_at DESC").map_err(|error| error.to_string())?;
     statement
         .query_map([], |row| {
+            let created_at: i64 = row.get(1)?;
             Ok(TrashItem {
                 id: row.get(0)?,
-                created_at: row.get(1)?,
+                created_at,
                 source_path: row.get(2)?,
                 trash_path: row.get(3)?,
+                expired: retention > 0 && now.saturating_sub(created_at) > retention * 86_400,
             })
         })
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn history(
+    database: String,
+    offset: Option<i64>,
+    limit: Option<i64>,
+) -> Result<Vec<HistoryItem>, String> {
+    let limit = limit.unwrap_or(100).clamp(1, 500);
+    let offset = offset.unwrap_or(0).max(0);
+    let connection = open_database(&database)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id,created_at,source_path,trash_path,state,restored_at \
+             FROM operations ORDER BY created_at DESC, id DESC LIMIT ?1 OFFSET ?2",
+        )
+        .map_err(|error| error.to_string())?;
+    statement
+        .query_map(params![limit, offset], |row| {
+            Ok(HistoryItem {
+                id: row.get(0)?,
+                created_at: row.get(1)?,
+                source_path: row.get(2)?,
+                trash_path: row.get(3)?,
+                state: row.get(4)?,
+                restored_at: row.get(5)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn trash_prune_expired(database: String) -> Result<String, String> {
+    filelens::prune_expired_trash(&PathBuf::from(database))
+        .map(|count| format!("已清理 {count} 个过期回收文件。"))
+}
+
+#[tauri::command]
+fn set_trash_retention(database: String, days: i64) -> Result<String, String> {
+    if !(0..=3650).contains(&days) {
+        return Err("保留天数需在 0 到 3650 之间（0 表示不自动清理）".into());
+    }
+    let connection = open_database(&database)?;
+    connection
+        .execute(
+            "INSERT INTO settings(key,value) VALUES('trash_retention_days',?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![days.to_string()],
+        )
+        .map_err(|error| error.to_string())?;
+    if days == 0 {
+        Ok("已关闭回收站自动清理。".into())
+    } else {
+        Ok(format!("回收站文件将保留 {days} 天，超期后在下一次扫描时自动清理。"))
+    }
+}
+
+#[tauri::command]
+fn set_auto_scan(database: String, enabled: bool) -> Result<String, String> {
+    let connection = open_database(&database)?;
+    connection
+        .execute(
+            "INSERT INTO settings(key,value) VALUES('auto_scan_on_start',?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![if enabled { "1" } else { "0" }],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(if enabled {
+        "已开启：启动时将自动进行增量扫描。".into()
+    } else {
+        "已关闭启动自动扫描。".into()
+    })
 }
 
 fn main() {
@@ -833,6 +945,10 @@ fn main() {
             delete_direct,
             delete_direct_batch,
             delete_paths,
+            trash_prune_expired,
+            history,
+            set_trash_retention,
+            set_auto_scan,
             open_file,
             image_preview,
             image_thumbnail,

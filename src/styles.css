@@ -734,6 +734,58 @@ h3 {
   font-size: 0.75rem;
   margin-top: 3px;
 }
+.deleted {
+  padding: 4px 7px;
+  border-radius: 99px;
+  font-size: 0.69rem;
+  font-weight: 800;
+  white-space: nowrap;
+  color: #f3dedb;
+  background: #6e3a34;
+}
+.history-page {
+  min-height: 500px;
+}
+.history-empty {
+  padding: 40px 0;
+  text-align: center;
+  color: #a7ada2;
+}
+.field-hint {
+  color: #8f9789;
+  font-weight: 400;
+  font-size: 0.72rem;
+  line-height: 1.5;
+}
+.toggle-row {
+  display: flex !important;
+  align-items: flex-start;
+  gap: 10px;
+  grid-template-columns: none !important;
+  cursor: pointer;
+}
+.toggle-row input[type="checkbox"] {
+  width: 17px;
+  height: 17px;
+  margin-top: 2px;
+  padding: 0;
+  accent-color: #d8d267;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.toggle-row span {
+  display: grid;
+  gap: 3px;
+  color: #b9c0b4;
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+.toggle-row small {
+  color: #8f9789;
+  font-weight: 400;
+  font-size: 0.72rem;
+  line-height: 1.5;
+}
 footer {
   min-height: 48px;
   padding: 22px 3px 0;

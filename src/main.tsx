@@ -4,7 +4,16 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
 
-type Page = "overview" | "sources" | "review" | "similar" | "documents" | "detectors" | "trash" | "settings";
+type Page =
+  | "overview"
+  | "sources"
+  | "review"
+  | "similar"
+  | "documents"
+  | "detectors"
+  | "trash"
+  | "history"
+  | "settings";
 type GroupFile = {
   id: number;
   path: string;
@@ -24,13 +33,26 @@ type TrashItem = {
   created_at: number;
   source_path: string;
   trash_path: string;
+  expired: boolean;
+};
+type HistoryItem = {
+  id: number;
+  created_at: number;
+  source_path: string;
+  trash_path: string;
+  state: "trashed" | "restored" | "deleted" | string;
+  restored_at: number | null;
 };
 type ProjectConfig = {
   trash_path: string;
   roots: string[];
   protect_rules: string[];
 };
-type ProjectState = ProjectConfig & { database: string };
+type ProjectState = ProjectConfig & {
+  database: string;
+  trashRetentionDays: number;
+  autoScan: boolean;
+};
 type ScanState = {
   state: "idle" | "running" | "completed" | "cancelled" | "failed";
   processed: number;
@@ -65,6 +87,7 @@ const nav: { id: Page; icon: string; label: string; caption: string }[] = [
   { id: "documents", icon: "≡", label: "相似文档", caption: "SIMILAR DOCUMENTS" },
   { id: "detectors", icon: "◉", label: "检测能力", caption: "DETECTORS" },
   { id: "trash", icon: "↶", label: "应用回收站", caption: "RECOVERY" },
+  { id: "history", icon: "⧗", label: "操作历史", caption: "OPERATION LOG" },
   { id: "settings", icon: "⚙", label: "项目设置", caption: "PROJECT SETTINGS" },
 ];
 
@@ -76,6 +99,8 @@ function App() {
   const [trash, setTrash] = useState("");
   const [roots, setRoots] = useState<string[]>([]);
   const [protectRules, setProtectRules] = useState<string[]>([]);
+  const [retentionDays, setRetentionDays] = useState(30);
+  const [autoScan, setAutoScan] = useState(true);
   const [rootInput, setRootInput] = useState("");
   const [status, setStatus] = useState<Status | null>(null);
   const [groups, setGroups] = useState<Group[]>([]);
@@ -101,7 +126,14 @@ function App() {
         setTrash(project.trash_path);
         setRoots(project.roots);
         setProtectRules(project.protect_rules);
-        void refresh(project.database);
+        setRetentionDays(project.trashRetentionDays);
+        setAutoScan(project.autoScan);
+        if (project.autoScan && project.roots.length > 0) {
+          void startScan(project.database, project.roots, project.protect_rules);
+        } else {
+          setMessage("本地项目已打开。");
+          void refresh(project.database);
+        }
       })
       .catch((error) => setMessage(`自动打开本地项目失败：${String(error)}`));
   }, []);
@@ -180,12 +212,16 @@ function App() {
     });
   }
 
-  async function scan() {
+  async function startScan(
+    targetDatabase: string,
+    targetRoots: string[],
+    targetRules: string[],
+  ) {
     await execute(async () => {
       const result = await invoke<string>("start_scan", {
-        database,
-        roots,
-        protectRules,
+        database: targetDatabase,
+        roots: targetRoots,
+        protectRules: targetRules,
       });
       setScanState({ state: "running", processed: 0, total: 0, message: result });
       return result;
@@ -300,7 +336,7 @@ function App() {
             setRootInput={setRootInput}
             addRoot={addRootPath}
             removeRoot={removeRootPath}
-            scan={scan}
+            scan={() => startScan(database, roots, protectRules)}
             disabled={busy || !database || scanState.state === "running"}
           />
         )}
@@ -335,15 +371,22 @@ function App() {
             refresh={refresh}
           />
         )}
+        {page === "history" && <History database={database} />}
         {page === "settings" && (
           <Settings
             database={database}
             trash={trash}
             protectRules={protectRules}
+            retentionDays={retentionDays}
+            autoScan={autoScan}
             setDatabase={setDatabase}
             setTrash={setTrash}
             setProtectRules={setProtectRules}
+            setRetentionDays={setRetentionDays}
+            setAutoScan={setAutoScan}
             initialize={initialize}
+            execute={execute}
+            notify={setMessage}
             busy={busy}
           />
         )}
@@ -1079,6 +1122,23 @@ function Trash({
         </div>
         <div className="head-actions">
           <span className="pill">{items.length} 个文件</span>
+          {items.some((item) => item.expired) && (
+            <button
+              className="secondary"
+              disabled={busy}
+              onClick={() =>
+                execute(async () => {
+                  const result = await invoke<string>("trash_prune_expired", {
+                    database,
+                  });
+                  await refresh();
+                  return result;
+                })
+              }
+            >
+              清理过期文件（{items.filter((item) => item.expired).length}）
+            </button>
+          )}
           {items.length > 0 && (
             <button
               className="danger"
@@ -1116,11 +1176,12 @@ function Trash({
             <article className="trash-item" key={item.id}>
               <span className="source-icon">↶</span>
               <div>
-                <b>{item.source_path.split(/[\\/]/).pop()}</b>
+                <b>{fileName(item.source_path)}</b>
                 <span>原位置：{item.source_path}</span>
                 <small>
                   移入时间：
                   {new Date(item.created_at * 1000).toLocaleString("zh-CN")}
+                  {item.expired && " · 已超过保留期，下次扫描将自动清理"}
                 </small>
               </div>
               <div className="trash-actions">
@@ -1170,26 +1231,181 @@ function Trash({
   );
 }
 
+const HISTORY_PAGE = 100;
+
+function History({ database }: { database: string }) {
+  const [items, setItems] = useState<HistoryItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [exhausted, setExhausted] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+
+  useEffect(() => {
+    if (!database) return;
+    setLoading(true);
+    invoke<HistoryItem[]>("history", { database, offset: 0, limit: HISTORY_PAGE })
+      .then((next) => {
+        setItems(next);
+        setExhausted(next.length < HISTORY_PAGE);
+      })
+      .catch((err) => setError(String(err)))
+      .finally(() => setLoading(false));
+  }, [database]);
+
+  function loadMore() {
+    if (loadingMore) return;
+    setLoadingMore(true);
+    invoke<HistoryItem[]>("history", {
+      database,
+      offset: items.length,
+      limit: HISTORY_PAGE,
+    })
+      .then((next) => {
+        setItems((current) => [...current, ...next]);
+        setExhausted(next.length < HISTORY_PAGE);
+      })
+      .catch((err) => setError(String(err)))
+      .finally(() => setLoadingMore(false));
+  }
+
+  const stateBadge: Record<string, { label: string; className: string }> = {
+    trashed: { label: "已入回收站", className: "protected" },
+    restored: { label: "已恢复", className: "approved" },
+    deleted: { label: "已永久删除", className: "deleted" },
+  };
+
+  return (
+    <section className="panel history-page">
+      <div className="section-head">
+        <div>
+          <h2>操作历史</h2>
+          <p>
+            每一次移入回收站、恢复和永久删除都有记录，按时间倒序显示，可供追溯核对。
+          </p>
+        </div>
+        <span className="pill">{items.length} 条记录</span>
+      </div>
+      {loading ? (
+        <div className="history-empty">正在加载...</div>
+      ) : error ? (
+        <div className="history-empty">{friendlyError(error)}</div>
+      ) : items.length === 0 ? (
+        <Empty
+          icon="⧗"
+          text="还没有操作记录"
+          detail="移入回收站、恢复或永久删除的每一步都会记录在这里。"
+        />
+      ) : (
+        <div className="trash-list">
+          {items.map((item) => {
+            const badge = stateBadge[item.state] ?? {
+              label: item.state,
+              className: "protected",
+            };
+            return (
+              <article className="trash-item" key={item.id}>
+                <span className="source-icon">⧗</span>
+                <div>
+                  <b>{fileName(item.source_path)}</b>
+                  <span title={item.source_path}>{item.source_path}</span>
+                  <small>
+                    {new Date(item.created_at * 1000).toLocaleString("zh-CN")}
+                    {item.state === "trashed" && item.trash_path
+                      ? ` · 现存于回收站（${item.trash_path}）`
+                      : ""}
+                    {item.state === "restored" && item.restored_at
+                      ? ` · 恢复于 ${new Date(item.restored_at * 1000).toLocaleString("zh-CN")}`
+                      : ""}
+                  </small>
+                </div>
+                <span className={badge.className}>{badge.label}</span>
+              </article>
+            );
+          })}
+          {!exhausted && (
+            <div className="load-more">
+              <button
+                className="secondary"
+                disabled={loadingMore}
+                onClick={loadMore}
+              >
+                {loadingMore ? "加载中..." : "加载更早的记录"}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function Settings({
   database,
   trash,
   protectRules,
+  retentionDays,
+  autoScan,
   setDatabase,
   setTrash,
   setProtectRules,
+  setRetentionDays,
+  setAutoScan,
   initialize,
+  execute,
+  notify,
   busy,
 }: {
   database: string;
   trash: string;
   protectRules: string[];
+  retentionDays: number;
+  autoScan: boolean;
   setDatabase: (value: string) => void;
   setTrash: (value: string) => void;
   setProtectRules: (value: string[]) => void;
+  setRetentionDays: (value: number) => void;
+  setAutoScan: (value: boolean) => void;
   initialize: () => Promise<void>;
+  execute: (action: () => Promise<string>) => Promise<void>;
+  notify: (message: string) => void;
   busy: boolean;
 }) {
   const [rule, setRule] = useState("");
+  const [retentionInput, setRetentionInput] = useState(String(retentionDays));
+
+  useEffect(() => {
+    setRetentionInput(String(retentionDays));
+  }, [retentionDays]);
+
+  function saveRetention() {
+    const days = Number.parseInt(retentionInput, 10);
+    if (Number.isNaN(days) || days < 0 || days > 3650) {
+      notify("保留天数需为 0 到 3650 之间的整数。");
+      setRetentionInput(String(retentionDays));
+      return;
+    }
+    if (days === retentionDays) return;
+    void execute(async () => {
+      const result = await invoke<string>("set_trash_retention", {
+        database,
+        days,
+      });
+      setRetentionDays(days);
+      return result;
+    });
+  }
+
+  function toggleAutoScan() {
+    const next = !autoScan;
+    void execute(async () => {
+      const result = await invoke<string>("set_auto_scan", {
+        database,
+        enabled: next,
+      });
+      setAutoScan(next);
+      return result;
+    });
+  }
   async function pickTrash() {
     const selected = await open({
       directory: true,
@@ -1261,6 +1477,34 @@ function Settings({
           </span>
         ))}
       </div>
+      <label>
+        回收站保留天数
+        <input
+          value={retentionInput}
+          onChange={(event) => setRetentionInput(event.target.value)}
+          onBlur={saveRetention}
+          onKeyDown={(event) => event.key === "Enter" && saveRetention()}
+          inputMode="numeric"
+          placeholder="30"
+        />
+        <small className="field-hint">
+          超过该天数仍未恢复的回收站文件，会在下一次扫描结束时自动永久清理；填
+          0 表示不自动清理。
+        </small>
+      </label>
+      <label className="toggle-row">
+        <input
+          type="checkbox"
+          checked={autoScan}
+          onChange={toggleAutoScan}
+        />
+        <span>
+          启动时自动增量扫描
+          <small>
+            打开应用后用已保存的扫描目录自动更新索引；扫描只读取文件，可随时取消。
+          </small>
+        </span>
+      </label>
       <button disabled={busy || !database || !trash} onClick={initialize}>
         保存并打开项目
       </button>
