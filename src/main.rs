@@ -895,6 +895,39 @@ pub fn restore(database: &Path, operation_id: i64) -> Result<(), String> {
     Ok(())
 }
 
+/// Permanently delete one approved duplicate instead of moving it to the
+/// recycle bin. Safety checks mirror `trash`.
+pub fn delete_direct(database: &Path, file_id: i64) -> Result<(), String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    let file =
+        file_by_id(&connection, file_id)?.ok_or_else(|| format!("unknown file id {file_id}"))?;
+    if file.protected || !file.approved || !is_exact_duplicate(&connection, &file)? {
+        return Err(
+            "file must be an approved, unprotected member of an exact duplicate group".to_string(),
+        );
+    }
+    let source = PathBuf::from(&file.path);
+    if hash_file(&source)? != file.hash {
+        return Err("source no longer matches indexed hash; scan again".to_string());
+    }
+    fs::remove_file(&source).map_err(|e| format!("delete file: {e}"))?;
+    connection
+        .execute(
+            "INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at) VALUES(?1,?2,'',?3,'deleted',?4)",
+            params![file.id, file.path, file.hash, now_seconds()?],
+        )
+        .map_err(|e| e.to_string())?;
+    connection
+        .execute(
+            "UPDATE files SET present=0, approved=0 WHERE id=?1",
+            params![file.id],
+        )
+        .map_err(|e| e.to_string())?;
+    println!("Deleted permanently: {}", source.display());
+    Ok(())
+}
+
 /// Permanently delete one file from the application recycle bin.
 pub fn delete_trash(database: &Path, operation_id: i64) -> Result<(), String> {
     let connection = open_database(database)?;
@@ -1293,6 +1326,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(trashed, 0);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn approved_duplicates_can_be_deleted_directly() {
+        let directory = test_directory("direct-delete");
+        let source = directory.join("source");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("a.txt"), b"same content").unwrap();
+        fs::write(source.join("b.txt"), b"same content").unwrap();
+        let database = directory.join("index.db");
+
+        init(&database, &recycle).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        let connection = open_database(&database).unwrap();
+        let b_id: i64 = connection
+            .query_row(
+                "SELECT id FROM files WHERE path LIKE '%b.txt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(connection);
+
+        // Not approved yet: direct delete must refuse.
+        assert!(delete_direct(&database, b_id).is_err());
+        set_approval(&database, b_id, true).unwrap();
+        delete_direct(&database, b_id).unwrap();
+        assert!(!source.join("b.txt").exists());
+        assert!(
+            !recycle.join("files").exists(),
+            "direct delete must not touch the recycle bin"
+        );
+
+        let connection = open_database(&database).unwrap();
+        let (state, present): (String, i64) = connection
+            .query_row(
+                "SELECT o.state, f.present FROM operations o JOIN files f ON f.id=o.file_id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "deleted");
+        assert_eq!(present, 0);
         let _ = fs::remove_dir_all(directory);
     }
 

@@ -594,6 +594,146 @@ h3 {
   padding: 6px 10px;
   font-size: 0.75rem;
 }
+.thumbnail-button {
+  padding: 0;
+  background: none;
+  border-radius: 5px;
+  overflow: hidden;
+  flex: 0 0 auto;
+}
+.thumbnail-button .thumbnail {
+  display: block;
+  transition: transform 0.15s ease;
+}
+.thumbnail-button:hover .thumbnail {
+  transform: scale(1.06);
+}
+.file-meta {
+  color: #8f9789;
+  font-size: 0.7rem;
+  margin-top: 4px;
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 30px;
+  background: rgba(10, 12, 9, 0.78);
+}
+.modal {
+  display: grid;
+  gap: 14px;
+  max-width: min(1100px, 92vw);
+  max-height: 90vh;
+  overflow: auto;
+  padding: 22px;
+  border: 1px solid #4a543e;
+  border-radius: 14px;
+  background: #20251f;
+}
+.modal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 18px;
+}
+.modal-head b {
+  display: block;
+}
+.modal-head span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #9ca398;
+  font-size: 0.75rem;
+  margin-top: 3px;
+  max-width: 560px;
+}
+.modal-actions {
+  display: flex;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+.modal-actions button {
+  padding: 7px 10px;
+  font-size: 0.75rem;
+}
+.preview-image {
+  max-width: 100%;
+  max-height: 66vh;
+  border-radius: 9px;
+  background: #161915;
+  object-fit: contain;
+}
+.preview-loading,
+.preview-fallback {
+  display: grid;
+  place-content: center;
+  gap: 8px;
+  min-height: 220px;
+  color: #a7ada2;
+  text-align: center;
+}
+.modal-confirm {
+  max-width: 460px;
+}
+.modal-confirm h3 {
+  margin-top: 0;
+}
+.modal-confirm p {
+  color: #aeb4a7;
+  line-height: 1.6;
+}
+.modal-note {
+  padding: 11px 13px;
+  border-left: 3px solid #d8a167;
+  background: #2f2a20;
+  color: #e0c9a8 !important;
+}
+.modal-actions-row {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+.photo-slot {
+  position: relative;
+  display: grid;
+}
+.photo-check {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: rgba(16, 19, 14, 0.82);
+}
+.photo-check input {
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  accent-color: #d8d267;
+  cursor: pointer;
+}
+.photo-info {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #a8afa1;
+  font-size: 0.75rem;
+  margin-top: 3px;
+}
 footer {
   min-height: 48px;
   padding: 22px 3px 0;

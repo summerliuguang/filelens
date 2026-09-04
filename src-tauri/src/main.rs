@@ -28,6 +28,7 @@ struct GroupFile {
     path: String,
     protected: bool,
     approved: bool,
+    modified: i64,
 }
 #[derive(Serialize)]
 struct Group {
@@ -41,12 +42,20 @@ struct SimilarPhoto {
     first_path: String,
     second_path: String,
     distance: u32,
+    first_size: i64,
+    first_modified: i64,
+    second_size: i64,
+    second_modified: i64,
 }
 #[derive(Serialize)]
 struct SimilarDocument {
     first_path: String,
     second_path: String,
     distance: u32,
+    first_size: i64,
+    first_modified: i64,
+    second_size: i64,
+    second_modified: i64,
 }
 #[derive(Serialize)]
 struct DetectorStatus {
@@ -349,6 +358,68 @@ fn trash_approved(database: String, file_ids: Vec<i64>) -> Result<String, String
 }
 
 #[tauri::command]
+fn delete_direct(database: String, file_id: i64) -> Result<String, String> {
+    filelens::delete_direct(&PathBuf::from(database), file_id)
+        .map(|_| "文件已永久删除。".into())
+}
+
+#[tauri::command]
+fn delete_direct_batch(database: String, file_ids: Vec<i64>) -> Result<String, String> {
+    let mut deleted = 0;
+    let mut failed: Vec<String> = Vec::new();
+    for file_id in file_ids {
+        match filelens::delete_direct(&PathBuf::from(&database), file_id) {
+            Ok(()) => deleted += 1,
+            Err(error) => failed.push(format!("文件 #{file_id}：{error}")),
+        }
+    }
+    if failed.is_empty() {
+        Ok(format!("已永久删除 {deleted} 个文件。"))
+    } else {
+        Ok(format!(
+            "已删除 {deleted} 个，{} 个失败：{}",
+            failed.len(),
+            failed.join("；")
+        ))
+    }
+}
+
+/// Direct deletion of user-selected similar candidates (not exact
+/// duplicates). Marks the rows absent so groups disappear after refresh.
+#[tauri::command]
+fn delete_paths(database: String, paths: Vec<String>) -> Result<String, String> {
+    let connection = open_database(&database)?;
+    let mut deleted = 0;
+    let mut failed: Vec<String> = Vec::new();
+    for path in paths {
+        let target = PathBuf::from(&path);
+        if !target.is_file() {
+            failed.push(format!("{path}：文件不存在"));
+            continue;
+        }
+        match fs::remove_file(&target) {
+            Ok(()) => {
+                let _ = connection.execute(
+                    "UPDATE files SET present=0, approved=0 WHERE path=?1",
+                    params![path],
+                );
+                deleted += 1;
+            }
+            Err(error) => failed.push(format!("{path}：{error}")),
+        }
+    }
+    if failed.is_empty() {
+        Ok(format!("已永久删除 {deleted} 个文件。"))
+    } else {
+        Ok(format!(
+            "已删除 {deleted} 个，{} 个失败：{}",
+            failed.len(),
+            failed.join("；")
+        ))
+    }
+}
+
+#[tauri::command]
 fn trash_delete(database: String, operation_id: i64) -> Result<String, String> {
     filelens::delete_trash(&PathBuf::from(database), operation_id)
         .map(|_| "文件已永久删除。".into())
@@ -374,25 +445,31 @@ fn thumbnail_cache_key(path: &Path) -> String {
         .to_string()
 }
 
-#[tauri::command]
-async fn image_thumbnail(
-    app: tauri::AppHandle,
-    path: String,
+/// Decode an image, apply EXIF orientation, downscale and return base64 PNG.
+/// Results are cached on disk keyed by path/mtime/size; a full or read-only
+/// cache disk must not break previews, so cache errors are ignored.
+fn render_image(
+    app: &tauri::AppHandle,
+    source: &Path,
+    cache_prefix: &str,
+    max_dimension: u32,
 ) -> Result<Option<String>, String> {
-    let source = PathBuf::from(&path);
     let cache_dir = app
         .path()
         .app_cache_dir()
         .map_err(|error| error.to_string())?
         .join("thumbnails");
-    let cached = cache_dir.join(format!("{}.png", thumbnail_cache_key(&source)));
+    let cached = cache_dir.join(format!(
+        "{cache_prefix}-{}.png",
+        thumbnail_cache_key(source)
+    ));
     if let Ok(bytes) = fs::read(&cached) {
         return Ok(Some(format!(
             "data:image/png;base64,{}",
             STANDARD.encode(bytes)
         )));
     }
-    let reader = match image::ImageReader::open(&source) {
+    let reader = match image::ImageReader::open(source) {
         Ok(reader) => reader,
         Err(_) => return Ok(None),
     };
@@ -408,13 +485,12 @@ async fn image_thumbnail(
         Err(_) => return Ok(None),
     };
     image.apply_orientation(orientation);
-    let thumbnail = image.thumbnail(320, 240);
+    let thumbnail = image.thumbnail(max_dimension, max_dimension);
     let mut output = std::io::Cursor::new(Vec::new());
     let bytes = match thumbnail.write_to(&mut output, image::ImageFormat::Png) {
         Ok(()) => output.into_inner(),
         Err(_) => return Ok(None),
     };
-    // Best-effort cache: a full or read-only disk must not break previews.
     let _ = fs::create_dir_all(&cache_dir);
     let temporary = cached.with_extension("tmp");
     if fs::write(&temporary, &bytes).is_ok() {
@@ -424,6 +500,45 @@ async fn image_thumbnail(
         "data:image/png;base64,{}",
         STANDARD.encode(bytes)
     )))
+}
+
+#[tauri::command]
+async fn image_thumbnail(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<Option<String>, String> {
+    let source = PathBuf::from(&path);
+    tauri::async_runtime::spawn_blocking(move || render_image(&app, &source, "t", 320))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn image_preview(app: tauri::AppHandle, path: String) -> Result<Option<String>, String> {
+    let source = PathBuf::from(&path);
+    tauri::async_runtime::spawn_blocking(move || render_image(&app, &source, "l", 1400))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn open_file(path: String) -> Result<String, String> {
+    let path = PathBuf::from(&path);
+    if !path.is_file() {
+        return Err("文件不存在或已删除".into());
+    }
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("cmd")
+        .args(["/C", "start", ""])
+        .arg(&path)
+        .spawn();
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(&path).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = std::process::Command::new("xdg-open").arg(&path).spawn();
+    result
+        .map(|_| "已调用系统默认程序打开文件。".into())
+        .map_err(|error| format!("打开文件失败：{error}"))
 }
 
 #[tauri::command]
@@ -486,7 +601,7 @@ fn groups(
     let mut result = Vec::new();
     for key in keys {
         let (hash, size) = key.map_err(|error| error.to_string())?;
-        let mut members = connection.prepare("SELECT id,path,protected,approved FROM files WHERE present=1 AND hash=?1 AND size=?2 ORDER BY path").map_err(|error| error.to_string())?;
+        let mut members = connection.prepare("SELECT id,path,protected,approved,modified FROM files WHERE present=1 AND hash=?1 AND size=?2 ORDER BY path").map_err(|error| error.to_string())?;
         let files = members
             .query_map(params![hash, size], |row| {
                 Ok(GroupFile {
@@ -494,6 +609,7 @@ fn groups(
                     path: row.get(1)?,
                     protected: row.get::<_, i64>(2)? != 0,
                     approved: row.get::<_, i64>(3)? != 0,
+                    modified: row.get(4)?,
                 })
             })
             .map_err(|error| error.to_string())?
@@ -508,6 +624,8 @@ struct FingerprintEntry {
     path: String,
     hash: String,
     value: u64,
+    size: i64,
+    modified: i64,
 }
 
 /// Disjoint 64-bit chunks used for candidate bucketing. Pigeonhole: with N
@@ -540,7 +658,7 @@ fn load_fingerprints(
 ) -> Result<Vec<FingerprintEntry>, String> {
     let mut statement = connection
         .prepare(&format!(
-            "SELECT a.path, a.hash, f.{column} FROM {table} f \
+            "SELECT a.path, a.hash, f.{column}, a.size, a.modified FROM {table} f \
              JOIN files a ON a.id = f.file_id WHERE a.present = 1"
         ))
         .map_err(|e| e.to_string())?;
@@ -550,6 +668,8 @@ fn load_fingerprints(
                 path: row.get(0)?,
                 hash: row.get(1)?,
                 value: row.get::<_, i64>(2)? as u64,
+                size: row.get(3)?,
+                modified: row.get(4)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -616,6 +736,10 @@ fn similar_photos(database: String) -> Result<Vec<SimilarPhoto>, String> {
             first_path: entries[a].path.clone(),
             second_path: entries[b].path.clone(),
             distance,
+            first_size: entries[a].size,
+            first_modified: entries[a].modified,
+            second_size: entries[b].size,
+            second_modified: entries[b].modified,
         })
         .collect())
 }
@@ -630,6 +754,10 @@ fn similar_documents(database: String) -> Result<Vec<SimilarDocument>, String> {
             first_path: entries[a].path.clone(),
             second_path: entries[b].path.clone(),
             distance,
+            first_size: entries[a].size,
+            first_modified: entries[a].modified,
+            second_size: entries[b].size,
+            second_modified: entries[b].modified,
         })
         .collect())
 }
@@ -702,6 +830,11 @@ fn main() {
             trash_approved,
             trash_delete,
             trash_empty,
+            delete_direct,
+            delete_direct_batch,
+            delete_paths,
+            open_file,
+            image_preview,
             image_thumbnail,
             restore,
             trash_list

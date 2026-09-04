@@ -10,6 +10,7 @@ type GroupFile = {
   path: string;
   protected: boolean;
   approved: boolean;
+  modified: number;
 };
 type Group = { hash: string; size: number; files: GroupFile[] };
 type Status = {
@@ -36,8 +37,24 @@ type ScanState = {
   total: number;
   message: string;
 };
-type SimilarPhoto = { first_path: string; second_path: string; distance: number };
-type SimilarDocument = { first_path: string; second_path: string; distance: number };
+type SimilarPhoto = {
+  first_path: string;
+  second_path: string;
+  distance: number;
+  first_size: number;
+  first_modified: number;
+  second_size: number;
+  second_modified: number;
+};
+type SimilarDocument = {
+  first_path: string;
+  second_path: string;
+  distance: number;
+  first_size: number;
+  first_modified: number;
+  second_size: number;
+  second_modified: number;
+};
 type DetectorStatus = { name: string; available: boolean; detail: string };
 
 const nav: { id: Page; icon: string; label: string; caption: string }[] = [
@@ -298,7 +315,15 @@ function App() {
             onLoadMore={loadMoreGroups}
           />
         )}
-        {page === "similar" && <SimilarPhotos photos={similarPhotos} />}
+        {page === "similar" && (
+          <SimilarPhotos
+            database={database}
+            photos={similarPhotos}
+            busy={busy}
+            execute={execute}
+            refresh={refresh}
+          />
+        )}
         {page === "documents" && <SimilarDocuments documents={similarDocuments} />}
         {page === "detectors" && <Detectors detectors={detectors} />}
         {page === "trash" && (
@@ -583,12 +608,44 @@ function Review({
   hasMore: boolean;
   onLoadMore: () => Promise<void>;
 }) {
+  const [previewPath, setPreviewPath] = useState<string | null>(null);
+  const [pendingRemove, setPendingRemove] = useState<GroupFile | null>(null);
+  const [pendingBatch, setPendingBatch] = useState<Group | null>(null);
+
+  // mode: "trash" recycles (recoverable), "delete" removes permanently.
+  function confirmRemoval(file: GroupFile, mode: "trash" | "delete") {
+    void execute(async () => {
+      const result =
+        mode === "trash"
+          ? await invoke<string>("trash", { database, fileId: file.id })
+          : await invoke<string>("delete_direct", { database, fileId: file.id });
+      await refresh();
+      return result;
+    });
+  }
+
+  function confirmBatch(target: Group, mode: "trash" | "delete") {
+    void execute(async () => {
+      const fileIds = target.files
+        .filter((file) => file.approved)
+        .map((file) => file.id);
+      const result =
+        mode === "trash"
+          ? await invoke<string>("trash_approved", { database, fileIds })
+          : await invoke<string>("delete_direct_batch", { database, fileIds });
+      await refresh();
+      return result;
+    });
+  }
+
   return (
     <section className="panel review-page">
       <div className="section-head">
         <div>
           <h2>精确重复审核</h2>
-          <p>仅显示完整 BLAKE3 哈希一致的文件。请保留至少一个副本。</p>
+          <p>
+            仅显示完整 BLAKE3 哈希一致的文件。每组至少保留一个副本；点击文件可放大预览。
+          </p>
         </div>
         <span className="pill">{groups.length} 个组</span>
       </div>
@@ -615,17 +672,26 @@ function Review({
               <div className="hash">BLAKE3 {group.hash}</div>
               {group.files.map((file) => (
                 <div className="file-row" key={file.id}>
-                  <Thumbnail path={file.path} />
-                  <div className="file-index">#{file.id}</div>
+                  <button
+                    className="thumbnail-button"
+                    title="点击放大预览"
+                    onClick={() => setPreviewPath(file.path)}
+                  >
+                    <Thumbnail path={file.path} />
+                  </button>
                   <div className="file-path">
-                    <b>{file.path.split(/[\\/]/).pop()}</b>
-                    <span>{file.path}</span>
+                    <b>{fileName(file.path)}</b>
+                    <span title={file.path}>{file.path}</span>
+                    <small className="file-meta">
+                      修改于 {formatFileTime(file.modified)} ·{" "}
+                      {formatBytes(group.size)} · 所在位置 {fileFolder(file.path)}
+                    </small>
                   </div>
                   {file.protected && <span className="protected">受保护</span>}
                   <div className="file-actions">
                     {file.approved ? (
                       <>
-                        <span className="approved">已确认</span>
+                        <span className="approved">待删除</span>
                         <button
                           className="secondary"
                           disabled={busy}
@@ -636,27 +702,18 @@ function Review({
                                 fileId: file.id,
                               });
                               await refresh();
-                              return result;
+                              return "已取消删除标记，该副本将保留。";
                             })
                           }
                         >
-                          取消
+                          取消标记
                         </button>
                         <button
                           className="danger"
                           disabled={busy}
-                          onClick={() =>
-                            execute(async () => {
-                              const result = await invoke<string>("trash", {
-                                database,
-                                fileId: file.id,
-                              });
-                              await refresh();
-                              return result;
-                            })
-                          }
+                          onClick={() => setPendingRemove(file)}
                         >
-                          移入回收站
+                          删除此副本
                         </button>
                       </>
                     ) : (
@@ -670,11 +727,11 @@ function Review({
                               fileId: file.id,
                             });
                             await refresh();
-                            return result;
+                            return "已标记删除该副本，确认后才会执行。";
                           })
                         }
                       >
-                        确认副本
+                        标记删除
                       </button>
                     )}
                   </div>
@@ -685,20 +742,9 @@ function Review({
                   <button
                     className="danger"
                     disabled={busy}
-                    onClick={() =>
-                      execute(async () => {
-                        const result = await invoke<string>("trash_approved", {
-                          database,
-                          fileIds: group.files
-                            .filter((file) => file.approved)
-                            .map((file) => file.id),
-                        });
-                        await refresh();
-                        return result;
-                      })
-                    }
+                    onClick={() => setPendingBatch(group)}
                   >
-                    移入本组全部已确认副本
+                    处理本组已标记副本（{group.files.filter((f) => f.approved).length} 个）
                   </button>
                 </div>
               )}
@@ -717,8 +763,100 @@ function Review({
           )}
         </div>
       )}
+      {previewPath && (
+        <PreviewModal path={previewPath} onClose={() => setPreviewPath(null)} />
+      )}
+      {pendingRemove && (
+        <div className="modal-backdrop" onClick={() => setPendingRemove(null)}>
+          <div className="modal modal-confirm" onClick={(event) => event.stopPropagation()}>
+            <h3>选择删除方式</h3>
+            <p>
+              {fileName(pendingRemove.path)} · {formatBytes(groupSizeOf(pendingRemove, groups))}
+            </p>
+            {groupSizeOf(pendingRemove, groups) >= LARGE_FILE_THRESHOLD && (
+              <p className="modal-note">
+                该文件超过 1 GB：移入回收站会先复制一份（耗时且占双倍空间），大文件建议直接删除。
+              </p>
+            )}
+            <div className="modal-actions-row">
+              <button
+                className="secondary"
+                disabled={busy}
+                onClick={() => {
+                  const file = pendingRemove;
+                  setPendingRemove(null);
+                  confirmRemoval(file, "trash");
+                }}
+              >
+                移入回收站（可恢复）
+              </button>
+              <button
+                className="danger"
+                disabled={busy}
+                onClick={() => {
+                  const file = pendingRemove;
+                  setPendingRemove(null);
+                  confirmRemoval(file, "delete");
+                }}
+              >
+                直接永久删除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {pendingBatch && (
+        <div className="modal-backdrop" onClick={() => setPendingBatch(null)}>
+          <div className="modal modal-confirm" onClick={(event) => event.stopPropagation()}>
+            <h3>处理 {pendingBatch.files.filter((f) => f.approved).length} 个已标记副本</h3>
+            <p>
+              每个副本 {formatBytes(pendingBatch.size)}，共可释放{" "}
+              {formatBytes(
+                pendingBatch.size * pendingBatch.files.filter((f) => f.approved).length,
+              )}
+              。
+            </p>
+            {pendingBatch.size >= LARGE_FILE_THRESHOLD && (
+              <p className="modal-note">
+                该组包含超过 1 GB 的大文件：移入回收站会先复制一份（耗时且占双倍空间），大文件建议直接删除。
+              </p>
+            )}
+            <div className="modal-actions-row">
+              <button
+                className="secondary"
+                disabled={busy}
+                onClick={() => {
+                  const target = pendingBatch;
+                  setPendingBatch(null);
+                  confirmBatch(target, "trash");
+                }}
+              >
+                全部移入回收站（可恢复）
+              </button>
+              <button
+                className="danger"
+                disabled={busy}
+                onClick={() => {
+                  const target = pendingBatch;
+                  setPendingBatch(null);
+                  confirmBatch(target, "delete");
+                }}
+              >
+                全部直接永久删除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   );
+}
+
+function groupSizeOf(file: GroupFile, groups: Group[]) {
+  const group = groups.find((candidate) =>
+    candidate.files.some((member) => member.id === file.id),
+  );
+  return group?.size ?? 0;
 }
 
 function Thumbnail({ path }: { path: string }) {
@@ -739,25 +877,105 @@ function Thumbnail({ path }: { path: string }) {
   );
 }
 
-function SimilarPhotos({ photos }: { photos: SimilarPhoto[] }) {
+function SimilarPhotos({
+  database,
+  photos,
+  busy,
+  execute,
+  refresh,
+}: {
+  database: string;
+  photos: SimilarPhoto[];
+  busy: boolean;
+  execute: (action: () => Promise<string>) => Promise<void>;
+  refresh: () => Promise<void>;
+}) {
   const [visible, setVisible] = useState(60);
+  const [previewPath, setPreviewPath] = useState<string | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
   const shown = photos.slice(0, visible);
+
+  function toggleSelection(path: string) {
+    setSelected((current) => {
+      const next = new Set(current);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  }
+
+  function deleteSelected() {
+    const paths = [...selected];
+    if (
+      !window.confirm(
+        `确定永久删除选中的 ${paths.length} 个文件吗？此操作不经过回收站，无法恢复。`,
+      )
+    ) {
+      return;
+    }
+    void execute(async () => {
+      const result = await invoke<string>("delete_paths", { database, paths });
+      setSelected(new Set());
+      await refresh();
+      return result;
+    });
+  }
+
   return (
     <section className="panel review-page">
       <div className="section-head">
         <div>
           <h2>高置信度相似照片</h2>
-          <p>仅供人工查看。结果来自本地 dHash 感知指纹，不会出现在自动处理队列。</p>
+          <p>仅供人工查看。点击照片放大预览，勾选后可批量永久删除。</p>
         </div>
-        <span className="pill">{photos.length} 对</span>
+        <div className="head-actions">
+          {selected.size > 0 && (
+            <span className="pill">已选 {selected.size} 个</span>
+          )}
+          {selected.size > 0 && (
+            <button className="danger" disabled={busy} onClick={deleteSelected}>
+              删除选中文件
+            </button>
+          )}
+          <span className="pill">{photos.length} 对</span>
+        </div>
       </div>
-      {photos.length === 0 ? <Empty icon="◒" text="没有高置信度相似照片" detail="完成扫描后，这里会显示重压缩或缩放后的同源照片候选。" /> : (
+      {photos.length === 0 ? (
+        <Empty
+          icon="◒"
+          text="没有高置信度相似照片"
+          detail="完成扫描后，这里会显示重压缩或缩放后的同源照片候选。"
+        />
+      ) : (
         <div className="similar-list">
-          {shown.map((photo, index) => <article className="similar-pair" key={`${photo.first_path}-${photo.second_path}`}>
-            <div className="similar-photos"><Thumbnail path={photo.first_path} /><Thumbnail path={photo.second_path} /></div>
-            <div><b>候选 {index + 1}</b><span>{photo.first_path}</span><span>{photo.second_path}</span></div>
-            <small>dHash 差异 {photo.distance}/64</small>
-          </article>)}
+          {shown.map((photo, index) => (
+            <article className="similar-pair" key={`${photo.first_path}-${photo.second_path}`}>
+              <div className="similar-photos">
+                <PhotoSlot
+                  photo={photo}
+                  side="first"
+                  previewPath={previewPath}
+                  onPreview={setPreviewPath}
+                  selected={selected}
+                  onToggle={toggleSelection}
+                />
+                <PhotoSlot
+                  photo={photo}
+                  side="second"
+                  previewPath={previewPath}
+                  onPreview={setPreviewPath}
+                  selected={selected}
+                  onToggle={toggleSelection}
+                />
+              </div>
+              <div>
+                <b>候选 {index + 1}</b>
+                <PhotoInfo path={photo.first_path} size={photo.first_size} modified={photo.first_modified} />
+                <PhotoInfo path={photo.second_path} size={photo.second_size} modified={photo.second_modified} />
+              </div>
+              <small>dHash 差异 {photo.distance}/64</small>
+            </article>
+          ))}
           {visible < photos.length && (
             <div className="load-more">
               <button
@@ -770,14 +988,69 @@ function SimilarPhotos({ photos }: { photos: SimilarPhoto[] }) {
           )}
         </div>
       )}
+      {previewPath && (
+        <PreviewModal path={previewPath} onClose={() => setPreviewPath(null)} />
+      )}
     </section>
+  );
+}
+
+function PhotoSlot({
+  photo,
+  side,
+  previewPath,
+  onPreview,
+  selected,
+  onToggle,
+}: {
+  photo: SimilarPhoto;
+  side: "first" | "second";
+  previewPath: string | null;
+  onPreview: (path: string) => void;
+  selected: Set<string>;
+  onToggle: (path: string) => void;
+}) {
+  const path = side === "first" ? photo.first_path : photo.second_path;
+  return (
+    <div className="photo-slot">
+      <label className="photo-check">
+        <input
+          type="checkbox"
+          checked={selected.has(path)}
+          onChange={() => onToggle(path)}
+        />
+      </label>
+      <button
+        className="thumbnail-button"
+        title="点击放大预览"
+        onClick={() => onPreview(path)}
+      >
+        <Thumbnail path={path} />
+      </button>
+    </div>
+  );
+}
+
+function PhotoInfo({
+  path,
+  size,
+  modified,
+}: {
+  path: string;
+  size: number;
+  modified: number;
+}) {
+  return (
+    <span className="photo-info" title={path}>
+      {fileName(path)} · {formatBytes(size)} · {formatFileTime(modified)}
+    </span>
   );
 }
 
 function SimilarDocuments({ documents }: { documents: SimilarDocument[] }) {
   const [visible, setVisible] = useState(60);
   const shown = documents.slice(0, visible);
-  return <section className="panel review-page"><div className="section-head"><div><h2>相似文档</h2><p>文本近似仅供人工查看，不能作为自动处理依据。</p></div><span className="pill">{documents.length} 对</span></div>{documents.length === 0 ? <Empty icon="≡" text="没有高置信度相似文档" detail="扫描 TXT、Markdown、CSV、JSON、XML 或 HTML 后会显示候选。" /> : <div className="similar-list">{shown.map((document, index) => <article className="similar-pair" key={`${document.first_path}-${document.second_path}`}><div><b>候选 {index + 1}</b><span>{document.first_path}</span><span>{document.second_path}</span></div><small>SimHash 差异 {document.distance}/64</small></article>)}{visible < documents.length && (<div className="load-more"><button className="secondary" onClick={() => setVisible((count) => count + 120)}>显示更多（还有 {documents.length - visible} 对）</button></div>)}</div>}</section>;
+  return <section className="panel review-page"><div className="section-head"><div><h2>相似文档</h2><p>文本近似仅供人工查看，不能作为自动处理依据。</p></div><span className="pill">{documents.length} 对</span></div>{documents.length === 0 ? <Empty icon="≡" text="没有高置信度相似文档" detail="扫描 TXT、Markdown、CSV、JSON、XML 或 HTML 后会显示候选。" /> : <div className="similar-list">{shown.map((document, index) => <article className="similar-pair" key={`${document.first_path}-${document.second_path}`}><div><b>候选 {index + 1}</b><PhotoInfo path={document.first_path} size={document.first_size} modified={document.first_modified} /><PhotoInfo path={document.second_path} size={document.second_size} modified={document.second_modified} /></div><small>SimHash 差异 {document.distance}/64</small></article>)}{visible < documents.length && (<div className="load-more"><button className="secondary" onClick={() => setVisible((count) => count + 120)}>显示更多（还有 {documents.length - visible} 对）</button></div>)}</div>}</section>;
 }
 
 function Detectors({ detectors }: { detectors: DetectorStatus[] }) {
@@ -1029,6 +1302,83 @@ function formatBytes(bytes: number) {
     unit++;
   }
   return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unit]}`;
+}
+
+function formatFileTime(unixSeconds: number) {
+  return new Date(unixSeconds * 1000).toLocaleString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+const LARGE_FILE_THRESHOLD = 1024 * 1024 * 1024;
+
+function fileFolder(path: string) {
+  const parts = path.split(/[\\/]/);
+  return parts.slice(0, -1).join("/");
+}
+
+function fileName(path: string) {
+  return path.split(/[\\/]/).pop() ?? path;
+}
+
+function PreviewModal({
+  path,
+  onClose,
+}: {
+  path: string;
+  onClose: () => void;
+}) {
+  const [image, setImage] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    setImage(null);
+    setFailed(false);
+    void invoke<string | null>("image_preview", { path })
+      .then((result) => {
+        if (result) setImage(result);
+        else setFailed(true);
+      })
+      .catch(() => setFailed(true));
+  }, [path]);
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(event) => event.stopPropagation()}>
+        <div className="modal-head">
+          <div>
+            <b>{fileName(path)}</b>
+            <span>{fileFolder(path)}</span>
+          </div>
+          <div className="modal-actions">
+            <button
+              className="secondary"
+              onClick={() => void executeInvoke("open_file", { path })}
+            >
+              用系统程序打开
+            </button>
+            <button className="secondary" onClick={onClose}>
+              关闭
+            </button>
+          </div>
+        </div>
+        {image && <img className="preview-image" src={image} alt={fileName(path)} />}
+        {failed && (
+          <div className="preview-fallback">
+            <b>此文件无法预览</b>
+            <span>只有图片支持应用内预览，其他类型请用系统程序打开。</span>
+          </div>
+        )}
+        {!image && !failed && <div className="preview-loading">正在加载预览...</div>}
+      </div>
+    </div>
+  );
+}
+
+async function executeInvoke<T>(command: string, args: Record<string, unknown>): Promise<T> {
+  return invoke<T>(command, args);
 }
 
 function friendlyError(error: unknown) {
