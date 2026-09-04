@@ -25,8 +25,9 @@ type Group = { hash: string; size: number; files: GroupFile[] };
 type Status = {
   files: number;
   duplicates: number;
-  inTrash: number;
-  lastScanAt: number | null;
+  in_trash: number;
+  last_scan_at: number | null;
+  groups: number;
 };
 type TrashItem = {
   id: number;
@@ -50,8 +51,8 @@ type ProjectConfig = {
 };
 type ProjectState = ProjectConfig & {
   database: string;
-  trashRetentionDays: number;
-  autoScan: boolean;
+  trash_retention_days: number;
+  auto_scan: boolean;
 };
 type ScanState = {
   state: "idle" | "running" | "completed" | "cancelled" | "failed";
@@ -126,9 +127,9 @@ function App() {
         setTrash(project.trash_path);
         setRoots(project.roots);
         setProtectRules(project.protect_rules);
-        setRetentionDays(project.trashRetentionDays);
-        setAutoScan(project.autoScan);
-        if (project.autoScan && project.roots.length > 0) {
+        setRetentionDays(project.trash_retention_days);
+        setAutoScan(project.auto_scan);
+        if (project.auto_scan && project.roots.length > 0) {
           void startScan(project.database, project.roots, project.protect_rules);
         } else {
           setMessage("本地项目已打开。");
@@ -344,6 +345,7 @@ function App() {
           <Review
             database={database}
             groups={groups}
+            totalGroups={status ? status.groups : groups.length}
             busy={busy}
             execute={execute}
             refresh={refresh}
@@ -474,8 +476,8 @@ function Overview({
       <section className="hero">
         <div>
           <span className="signal">
-            {status?.lastScanAt
-              ? `● 上次扫描：${new Date(status.lastScanAt * 1000).toLocaleString("zh-CN")}`
+            {status?.last_scan_at
+              ? `● 上次扫描：${new Date(status.last_scan_at * 1000).toLocaleString("zh-CN")}`
               : "● 等待首次扫描"}
           </span>
           <h2>
@@ -508,7 +510,7 @@ function Overview({
         />
         <Metric value={selected} label="已确认处理" detail="等待移入回收站" />
         <Metric
-          value={status?.inTrash ?? "-"}
+          value={status?.in_trash ?? "-"}
           label="回收站文件"
           detail="可安全恢复"
         />
@@ -637,6 +639,7 @@ function Sources({
 function Review({
   database,
   groups,
+  totalGroups,
   busy,
   execute,
   refresh,
@@ -645,6 +648,7 @@ function Review({
 }: {
   database: string;
   groups: Group[];
+  totalGroups: number;
   busy: boolean;
   execute: (action: () => Promise<string>) => Promise<void>;
   refresh: () => Promise<void>;
@@ -690,7 +694,7 @@ function Review({
             仅显示完整 BLAKE3 哈希一致的文件。每组至少保留一个副本；点击文件可放大预览。
           </p>
         </div>
-        <span className="pill">{groups.length} 个组</span>
+        <span className="pill">{totalGroups} 个组</span>
       </div>
       {groups.length === 0 ? (
         <Empty

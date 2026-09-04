@@ -21,6 +21,7 @@ struct Status {
     duplicates: i64,
     in_trash: i64,
     last_scan_at: Option<i64>,
+    groups: i64,
 }
 #[derive(Serialize)]
 struct GroupFile {
@@ -601,11 +602,20 @@ fn status(database: String) -> Result<Status, String> {
         )
         .ok()
         .and_then(|value| value.parse::<i64>().ok());
+    let groups = connection
+        .query_row(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM files WHERE present=1 \
+             GROUP BY hash,size HAVING COUNT(*) > 1)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
     Ok(Status {
         files,
         duplicates,
         in_trash,
         last_scan_at,
+        groups,
     })
 }
 
