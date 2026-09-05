@@ -77,8 +77,16 @@ struct ProjectState {
     trash_path: String,
     roots: Vec<String>,
     protect_rules: Vec<String>,
+    exclude_rules: Vec<String>,
+    min_file_size: i64,
     trash_retention_days: i64,
     auto_scan: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct ScanErrorSample {
+    path: String,
+    error: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -87,11 +95,15 @@ struct ScanState {
     processed: u64,
     total: u64,
     message: String,
+    current_path: Option<String>,
+    errors_total: u64,
+    recent_errors: Vec<ScanErrorSample>,
 }
 
 struct ScanTask {
     cancelled: Arc<AtomicBool>,
     state: Arc<Mutex<ScanState>>,
+    errors: Arc<filelens::ScanErrorLog>,
 }
 
 fn open_database(path: &str) -> Result<Connection, String> {
@@ -165,6 +177,10 @@ fn open_project(app: tauri::AppHandle) -> Result<ProjectState, String> {
         trash_path: trash.to_string_lossy().into_owned(),
         roots: setting_list(&connection, "roots")?,
         protect_rules: setting_list(&connection, "protect_rules")?,
+        exclude_rules: setting_list(&connection, "exclude_rules")?,
+        min_file_size: setting_value(&connection, "min_file_size")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
         trash_retention_days: filelens::trash_retention_days(&connection),
         auto_scan: setting_flag(&connection, "auto_scan_on_start", true),
     })
@@ -177,11 +193,22 @@ fn save_project_config(
     trash: String,
     roots: Vec<String>,
     protect_rules: Vec<String>,
+    exclude_rules: Vec<String>,
+    min_file_size: i64,
 ) -> Result<String, String> {
     filelens::init(&PathBuf::from(&database), &PathBuf::from(&trash))?;
     let connection = open_database(&database)?;
     save_setting_list(&connection, "roots", &roots)?;
     save_setting_list(&connection, "protect_rules", &protect_rules)?;
+    save_setting_list(&connection, "exclude_rules", &exclude_rules)?;
+    let min_size = min_file_size.max(0).to_string();
+    connection
+        .execute(
+            "INSERT INTO settings(key,value) VALUES('min_file_size',?1) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![min_size],
+        )
+        .map_err(|error| error.to_string())?;
     write_project_pointer(&app, &database)?;
     Ok("项目设置已保存。".into())
 }
@@ -204,6 +231,8 @@ fn start_scan(
     database: String,
     roots: Vec<String>,
     protect_rules: Vec<String>,
+    exclude_rules: Vec<String>,
+    min_file_size: i64,
 ) -> Result<String, String> {
     let mut task = task.lock().map_err(|_| "scan task lock failed")?;
     if task.is_some() {
@@ -213,6 +242,7 @@ fn start_scan(
         let connection = open_database(&database)?;
         save_setting_list(&connection, "roots", &roots)?;
         save_setting_list(&connection, "protect_rules", &protect_rules)?;
+        save_setting_list(&connection, "exclude_rules", &exclude_rules)?;
     }
     let roots = roots.into_iter().map(PathBuf::from).collect::<Vec<_>>();
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -221,22 +251,32 @@ fn start_scan(
         processed: 0,
         total: 0,
         message: "正在准备扫描...".into(),
+        current_path: None,
+        errors_total: 0,
+        recent_errors: Vec::new(),
     }));
+    let errors = Arc::new(filelens::ScanErrorLog::new());
     let worker_cancelled = cancelled.clone();
     let worker_state = state.clone();
+    let worker_errors = errors.clone();
     std::thread::spawn(move || {
         let progress_state = worker_state.clone();
         let result = filelens::scan_with_control(
             &PathBuf::from(database),
             &roots,
             &protect_rules,
+            &exclude_rules,
+            min_file_size.max(0) as u64,
+            true,
             &|| worker_cancelled.load(Ordering::Relaxed),
-            &|processed, total| {
+            &|processed, total, current_path| {
                 if let Ok(mut current) = progress_state.lock() {
                     current.processed = processed;
                     current.total = total;
+                    current.current_path = current_path.map(str::to_string);
                 }
             },
+            Some(&worker_errors),
         );
         if let Ok(mut current) = worker_state.lock() {
             match result {
@@ -255,6 +295,12 @@ fn start_scan(
                             summary.failed_roots.len()
                         ));
                     }
+                    if summary.errors > 0 {
+                        message.push_str(&format!(
+                            " {} 个条目处理失败，可在历史进度或日志中查看。",
+                            summary.errors
+                        ));
+                    }
                     current.message = message;
                 }
                 Err(error) if error == "scan cancelled" => {
@@ -268,7 +314,7 @@ fn start_scan(
             }
         }
     });
-    *task = Some(ScanTask { cancelled, state });
+    *task = Some(ScanTask { cancelled, state, errors });
     Ok("扫描任务已在后台启动。".into())
 }
 
@@ -281,13 +327,22 @@ fn scan_state(task: tauri::State<'_, Mutex<Option<ScanTask>>>) -> Result<ScanSta
             processed: 0,
             total: 0,
             message: "没有正在运行的扫描任务。".into(),
+            current_path: None,
+            errors_total: 0,
+            recent_errors: Vec::new(),
         });
     };
-    let state = current
+    let mut state = current
         .state
         .lock()
         .map_err(|_| "scan state lock failed")?
         .clone();
+    let (errors_total, recent) = current.errors.snapshot();
+    state.errors_total = errors_total;
+    state.recent_errors = recent
+        .into_iter()
+        .map(|(path, error)| ScanErrorSample { path, error })
+        .collect();
     if state.state != "running" {
         *task = None;
     }
@@ -540,6 +595,50 @@ fn open_file(path: String) -> Result<String, String> {
 #[tauri::command]
 fn restore(database: String, operation_id: i64) -> Result<String, String> {
     filelens::restore(&PathBuf::from(database), operation_id).map(|_| "文件已恢复至原位置。".into())
+}
+
+#[derive(Serialize)]
+struct ThumbnailCacheStats {
+    files: u64,
+    bytes: u64,
+}
+
+fn thumbnail_cache_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    let cache_root = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("resolve app cache directory: {error}"))?;
+    Ok(cache_root.join("thumbnails"))
+}
+
+// Pure reporting/cleanup over the cache directory; no business logic, so it
+// lives in the command layer like the thumbnail writer itself.
+#[tauri::command]
+fn thumbnail_cache_stats(app: tauri::AppHandle) -> Result<ThumbnailCacheStats, String> {
+    let directory = thumbnail_cache_dir(&app)?;
+    let mut files = 0_u64;
+    let mut bytes = 0_u64;
+    if let Ok(entries) = fs::read_dir(&directory) {
+        for entry in entries.flatten() {
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.is_file() {
+                    files += 1;
+                    bytes += metadata.len();
+                }
+            }
+        }
+    }
+    Ok(ThumbnailCacheStats { files, bytes })
+}
+
+#[tauri::command]
+fn thumbnail_cache_clear(app: tauri::AppHandle) -> Result<String, String> {
+    let directory = thumbnail_cache_dir(&app)?;
+    if directory.exists() {
+        fs::remove_dir_all(&directory).map_err(|error| format!("清理缓存失败：{error}"))?;
+    }
+    fs::create_dir_all(&directory).map_err(|error| format!("重建缓存目录失败：{error}"))?;
+    Ok("缩略图与预览缓存已清理，重新浏览图片时会自动重建。".into())
 }
 
 #[tauri::command]
@@ -919,6 +1018,8 @@ fn main() {
             open_file,
             image_preview,
             image_thumbnail,
+            thumbnail_cache_stats,
+            thumbnail_cache_clear,
             restore,
             trash_list
         ])

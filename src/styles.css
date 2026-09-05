@@ -594,6 +594,65 @@ h3 {
   padding: 6px 10px;
   font-size: 0.75rem;
 }
+.scan-current {
+  margin-top: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #a8afa1;
+  font-size: 0.75rem;
+}
+.scan-errors {
+  margin-top: 8px;
+  font-size: 0.78rem;
+  color: #e0a75b;
+}
+.scan-errors summary {
+  cursor: pointer;
+  user-select: none;
+}
+.scan-errors ul {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 4px;
+  max-height: 160px;
+  overflow-y: auto;
+}
+.scan-errors li span {
+  color: #e5e7e0;
+}
+.scan-errors li small {
+  display: block;
+  color: #a8afa1;
+}
+.scan-errors-hint {
+  display: block;
+  margin-top: 6px;
+  color: #a8afa1;
+}
+.page-layer {
+  display: none;
+}
+.page-layer.page-active {
+  display: block;
+}
+.cache-panel {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px;
+  background: #282e25;
+  border-radius: 8px;
+}
+.cache-panel b {
+  flex: 0 0 auto;
+}
+.cache-panel span {
+  flex: 1;
+  color: #a8afa1;
+  font-size: 0.8rem;
+}
 .thumbnail-button {
   padding: 0;
   background: none;

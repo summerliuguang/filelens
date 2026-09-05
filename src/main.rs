@@ -3,6 +3,7 @@ use std::{
     fs::{self, File},
     io::{self, Read},
     path::{Path, PathBuf},
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -35,6 +36,12 @@ enum Command {
         /// Mark matching source paths protected from recycle operations.
         #[arg(long)]
         protect: Vec<String>,
+        /// Skip directories whose normalized path contains one of these rules.
+        #[arg(long)]
+        exclude: Vec<String>,
+        /// Ignore files smaller than this many bytes.
+        #[arg(long, default_value_t = 0)]
+        min_size: u64,
     },
     /// Print exact duplicate groups and their review state.
     Groups { database: PathBuf },
@@ -92,7 +99,12 @@ fn run() -> Result<(), String> {
             database,
             roots,
             protect,
-        } => scan(&database, &roots, &protect),
+            exclude,
+            min_size,
+        } => {
+            scan_with_options(&database, &roots, &protect, &exclude, min_size, false)?;
+            Ok(())
+        }
         Command::Groups { database } => groups(&database),
         Command::Approve { database, file_id } => set_approval(&database, file_id, true),
         Command::Unapprove { database, file_id } => set_approval(&database, file_id, false),
@@ -178,7 +190,32 @@ pub fn init(database: &Path, trash: &Path) -> Result<(), String> {
 }
 
 pub fn scan(database: &Path, roots: &[PathBuf], protect: &[String]) -> Result<(), String> {
-    scan_with_control(database, roots, protect, &|| false, &|_, _| {}).map(|_| ())
+    scan_with_options(database, roots, protect, &[], 0, false).map(|_| ())
+}
+
+/// Scan with user-configured directory exclusions and a minimum file size.
+/// Exclusions reuse the protection-rule matching semantics (substring on the
+/// normalized path, case-insensitive on Windows): over-excluding only hides
+/// files, while a false-negative would put noise back into the report.
+pub fn scan_with_options(
+    database: &Path,
+    roots: &[PathBuf],
+    protect: &[String],
+    exclude: &[String],
+    min_file_size: u64,
+    silent: bool,
+) -> Result<ScanSummary, String> {
+    scan_with_control(
+        database,
+        roots,
+        protect,
+        exclude,
+        min_file_size,
+        silent,
+        &|| false,
+        &|_, _, _| {},
+        None,
+    )
 }
 
 /// Aggregated outcome of one scan run: counters for the CLI report plus the
@@ -195,12 +232,64 @@ pub struct ScanSummary {
     pub failed_roots: Vec<String>,
 }
 
+/// How many per-file failure samples the scan keeps for the GUI; the full
+/// count keeps accumulating so the UI can say "N failed" after wrap-around.
+const SCAN_ERROR_SAMPLES: usize = 20;
+
+/// Ring buffer of recent per-file scan failures, shared between the scan
+/// pipeline and the GUI task slot. Pushed from the hashing workers' results,
+/// read from the `scan_state` poller; a poisoned lock degrades to best-effort
+/// access instead of failing the scan.
+#[derive(Default)]
+pub struct ScanErrorLog {
+    inner: Mutex<ScanErrorLogInner>,
+}
+
+#[derive(Default)]
+struct ScanErrorLogInner {
+    total: u64,
+    recent: std::collections::VecDeque<(String, String)>,
+}
+
+impl ScanErrorLog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record(&self, path: &str, error: &str) {
+        let mut inner = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        inner.total += 1;
+        if inner.recent.len() >= SCAN_ERROR_SAMPLES {
+            inner.recent.pop_front();
+        }
+        inner
+            .recent
+            .push_back((path.to_string(), error.to_string()));
+    }
+
+    /// (total failures, most recent samples in recording order)
+    pub fn snapshot(&self) -> (u64, Vec<(String, String)>) {
+        let inner = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        (inner.total, inner.recent.iter().cloned().collect())
+    }
+}
+
 pub fn scan_with_control(
     database: &Path,
     roots: &[PathBuf],
     protect: &[String],
+    exclude: &[String],
+    min_file_size: u64,
+    silent: bool,
     cancelled: &(dyn Fn() -> bool + Send + Sync),
-    progress: &(dyn Fn(u64, u64) + Send + Sync),
+    progress: &(dyn Fn(u64, u64, Option<&str>) + Send + Sync),
+    errors: Option<&ScanErrorLog>,
 ) -> Result<ScanSummary, String> {
     let connection = open_database(database)?;
     ensure_initialized(&connection)?;
@@ -213,8 +302,8 @@ pub fn scan_with_control(
         .collect::<Result<Vec<_>, _>>()?;
     let mut scanned_roots = Vec::new();
     let mut failed_roots = Vec::new();
-    let total = count_entries(&absolute_roots, &trash, cancelled)?;
-    progress(0, total);
+    let total = count_entries(&absolute_roots, &trash, exclude, cancelled)?;
+    progress(0, total, None);
     for root in &absolute_roots {
         if cancelled() {
             return Err("scan cancelled".to_string());
@@ -233,9 +322,12 @@ pub fn scan_with_control(
             root,
             &trash,
             protect,
+            exclude,
+            min_file_size,
             &mut counters,
             cancelled,
             progress,
+            errors,
             total,
         )?;
         scanned_roots.push(root.clone());
@@ -243,18 +335,20 @@ pub fn scan_with_control(
     let removed = mark_missing_absent(&connection, &scanned_roots, scan_started)?;
     let pruned = prune_expired_trash_with(&connection, now_seconds()?)?;
     set_setting(&connection, "last_scan_at", &now_seconds()?.to_string())?;
-    println!(
-        "Scanned: {} new, {} unchanged, {} updated, {} skipped, {} errors, {} missing, {} expired recycled.",
-        counters.new,
-        counters.unchanged,
-        counters.updated,
-        counters.skipped,
-        counters.errors,
-        removed,
-        pruned
-    );
-    if !failed_roots.is_empty() {
-        println!("Skipped missing roots: {}", failed_roots.join(", "));
+    if !silent {
+        println!(
+            "Scanned: {} new, {} unchanged, {} updated, {} skipped, {} errors, {} missing, {} expired recycled.",
+            counters.new,
+            counters.unchanged,
+            counters.updated,
+            counters.skipped,
+            counters.errors,
+            removed,
+            pruned
+        );
+        if !failed_roots.is_empty() {
+            println!("Skipped missing roots: {}", failed_roots.join(", "));
+        }
     }
     Ok(ScanSummary {
         new: counters.new,
@@ -275,6 +369,7 @@ pub fn scan_with_control(
 fn count_entries(
     roots: &[PathBuf],
     trash: &Path,
+    exclude: &[String],
     cancelled: &dyn Fn() -> bool,
 ) -> Result<u64, String> {
     let mut total = 0_u64;
@@ -301,7 +396,7 @@ fn count_entries(
             let path = entry.path();
             match entry.file_type() {
                 Ok(file_type) if file_type.is_dir() && !file_type.is_symlink() => {
-                    if is_excluded(&path, trash) {
+                    if is_excluded(&path, trash, exclude) {
                         total += 1;
                     } else {
                         directories.push(path);
@@ -419,6 +514,8 @@ fn walk_root(
     database: &Path,
     root: &Path,
     trash: &Path,
+    exclude: &[String],
+    min_file_size: u64,
     work_tx: &std::sync::mpsc::Sender<PathBuf>,
     result_tx: &std::sync::mpsc::Sender<WorkResult>,
     cancelled: &dyn Fn() -> bool,
@@ -453,16 +550,29 @@ fn walk_root(
                 continue;
             }
             if file_type.is_dir() {
-                if is_excluded(&path, trash) {
+                if is_excluded(&path, trash, exclude) {
                     let _ = result_tx.send(WorkResult::Skipped);
                 } else {
                     directories.push(path);
                 }
                 continue;
             }
-            if !file_type.is_file() || is_excluded(&path, trash) {
+            if !file_type.is_file() || is_excluded(&path, trash, exclude) {
                 let _ = result_tx.send(WorkResult::Skipped);
                 continue;
+            }
+            // Below-threshold files are dropped from the report entirely:
+            // they are skipped here (not marked seen), so a previous index
+            // row is marked absent by mark_missing_absent after the scan.
+            if min_file_size > 0 {
+                let too_small = entry
+                    .metadata()
+                    .map(|metadata| metadata.len() < min_file_size)
+                    .unwrap_or(false);
+                if too_small {
+                    let _ = result_tx.send(WorkResult::Skipped);
+                    continue;
+                }
             }
             if is_unchanged(&connection, &path) {
                 let _ = result_tx.send(WorkResult::Unchanged(
@@ -591,9 +701,12 @@ fn run_parallel_scan(
     root: &Path,
     trash: &Path,
     protect: &[String],
+    exclude: &[String],
+    min_file_size: u64,
     counters: &mut ScanCounters,
     cancelled: &(dyn Fn() -> bool + Send + Sync),
-    progress: &(dyn Fn(u64, u64) + Send + Sync),
+    progress: &(dyn Fn(u64, u64, Option<&str>) + Send + Sync),
+    errors: Option<&ScanErrorLog>,
     total: u64,
 ) -> Result<(), String> {
     use std::sync::mpsc::{self, TryRecvError};
@@ -611,7 +724,16 @@ fn run_parallel_scan(
             let work_tx = work_tx.clone();
             let result_tx = result_tx.clone();
             scope.spawn(move || {
-                walk_root(database, root, trash, &work_tx, &result_tx, cancelled)
+                walk_root(
+                    database,
+                    root,
+                    trash,
+                    exclude,
+                    min_file_size,
+                    &work_tx,
+                    &result_tx,
+                    cancelled,
+                )
             })
         };
         drop(work_tx);
@@ -639,6 +761,13 @@ fn run_parallel_scan(
         }
         drop(result_tx);
         for result in result_rx {
+            let current: Option<String> = match &result {
+                WorkResult::Unchanged(path_text) => Some(path_text.clone()),
+                WorkResult::WalkError(path) => Some(path.clone()),
+                WorkResult::Processed(Ok(entry)) => Some(entry.path_text.clone()),
+                WorkResult::Processed(Err((path, _))) => Some(path.clone()),
+                WorkResult::Skipped => None,
+            };
             match result {
                 WorkResult::Unchanged(path_text) => {
                     connection.execute(
@@ -652,6 +781,9 @@ fn run_parallel_scan(
                 WorkResult::WalkError(path) => {
                     eprintln!("warning: unreadable directory skipped: {path}");
                     counters.errors += 1;
+                    if let Some(log) = errors {
+                        log.record(&path, "directory unreadable");
+                    }
                 }
                 WorkResult::Processed(Ok(entry)) => match write_entry(connection, &entry, protect)? {
                     IndexOutcome::New => counters.new += 1,
@@ -661,6 +793,9 @@ fn run_parallel_scan(
                 WorkResult::Processed(Err((path, error))) => {
                     eprintln!("warning: {path}: {error}");
                     counters.errors += 1;
+                    if let Some(log) = errors {
+                        log.record(&path, &error);
+                    }
                 }
             }
             progress(
@@ -670,6 +805,7 @@ fn run_parallel_scan(
                     + counters.skipped
                     + counters.errors,
                 total,
+                current.as_deref(),
             );
         }
         walker.join().map_err(|_| "scan worker panicked".to_string())?
@@ -677,7 +813,7 @@ fn run_parallel_scan(
     Ok(())
 }
 
-fn is_excluded(path: &Path, trash: &Path) -> bool {
+fn is_excluded(path: &Path, trash: &Path, exclude: &[String]) -> bool {
     let value = path.to_string_lossy();
     path.starts_with(trash)
         || value.contains("/.git/")
@@ -686,6 +822,13 @@ fn is_excluded(path: &Path, trash: &Path) -> bool {
         || value.contains("\\node_modules\\")
         || value.contains("/$RECYCLE.BIN/")
         || value.contains("\\$RECYCLE.BIN\\")
+        || exclude
+            .iter()
+            .any(|rule| !rule.trim().is_empty() && contains_normalized(&value, rule))
+}
+
+fn contains_normalized(path_text: &str, rule: &str) -> bool {
+    normalize_path_text(path_text).contains(&normalize_path_text(rule))
 }
 
 enum IndexOutcome {
@@ -1506,6 +1649,23 @@ mod tests {
     }
 
     #[test]
+    fn scan_error_log_keeps_recent_samples_and_total() {
+        let log = ScanErrorLog::new();
+        for index in 0..25 {
+            log.record(&format!("/data/file-{index}.bin"), "permission denied");
+        }
+        let (total, recent) = log.snapshot();
+        assert_eq!(total, 25);
+        assert_eq!(recent.len(), 20);
+        // The ring keeps the newest entries after wrapping past the cap.
+        assert_eq!(recent.last().unwrap(), &("/data/file-24.bin".to_string(), "permission denied".to_string()));
+        assert_eq!(recent.first().unwrap().0, "/data/file-5.bin");
+
+        let empty = ScanErrorLog::new();
+        assert_eq!(empty.snapshot(), (0, Vec::new()));
+    }
+
+    #[test]
     fn scan_approve_trash_and_restore_are_safe() {
         let directory = test_directory("lifecycle");
         let source = directory.join("source");
@@ -1910,6 +2070,82 @@ mod tests {
     }
 
     #[test]
+    fn scan_honors_exclude_rules_and_min_file_size() {
+        let directory = test_directory("exclude-min-size");
+        let source = directory.join("source");
+        let cache = source.join("cache");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&cache).unwrap();
+        // A duplicate pair inside a directory matching the exclude rule and a
+        // duplicate pair below the size threshold: neither may be reported.
+        fs::write(cache.join("a.txt"), b"cached pair").unwrap();
+        fs::write(cache.join("b.txt"), b"cached pair").unwrap();
+        fs::write(source.join("tiny-a.txt"), b"9 bytes!!").unwrap();
+        fs::write(source.join("tiny-b.txt"), b"9 bytes!!").unwrap();
+        // Above the threshold, not excluded: must be reported.
+        fs::write(source.join("keep-a.txt"), b"report me please").unwrap();
+        fs::write(source.join("keep-b.txt"), b"report me please").unwrap();
+        let database = directory.join("index.db");
+
+        init(&database, &recycle).unwrap();
+        let summary = scan_with_options(
+            &database,
+            std::slice::from_ref(&source),
+            &[],
+            &["cache".to_string()],
+            12,
+            true,
+        )
+        .unwrap();
+        assert_eq!(summary.new, 2);
+
+        let connection = open_database(&database).unwrap();
+        let cached: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path LIKE '%/cache/%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // Excluded files never get a row.
+        assert_eq!(cached, 0);
+        // Below-threshold files are not seen by the scan, so any row from a
+        // previous (threshold-free) run would be marked absent; here they
+        // simply have no row at all.
+        let tiny: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path LIKE '%tiny-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tiny, 0);
+        let keep: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path LIKE '%keep-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(keep, 2);
+        drop(connection);
+
+        let groups = query_groups(
+            &database,
+            &GroupQuery {
+                min_size: 0,
+                path_contains: None,
+                sort: GroupSort::Size,
+                offset: 0,
+                limit: 50,
+            },
+        )
+        .unwrap();
+        assert_eq!(groups.groups.len(), 1);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn scan_summary_reports_expired_prune_count() {
         let directory = test_directory("summary-prune");
         let source = directory.join("source");
@@ -1946,8 +2182,12 @@ mod tests {
             &database,
             std::slice::from_ref(&source),
             &[],
+            &[],
+            0,
+            true,
             &|| false,
-            &|_, _| {},
+            &|_, _, _| {},
+            None,
         )
         .unwrap();
         assert_eq!(summary.pruned, 1);

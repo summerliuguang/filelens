@@ -2,92 +2,39 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import {
+  ConfirmDialog,
+  Empty,
+  PreviewModal,
+  ScanProgress,
+} from "./ui/components";
+import {
+  LARGE_FILE_THRESHOLD,
+  fileFolder,
+  fileName,
+  formatBytes,
+  formatFileTime,
+  friendlyError,
+} from "./lib/format";
+import type {
+  DetectorStatus,
+  Group,
+  GroupFile,
+  GroupFilters,
+  GroupsPage,
+  HistoryItem,
+  Page,
+  ProjectConfig,
+  ProjectState,
+  ScanState,
+  SimilarDocument,
+  SimilarPhoto,
+  Status,
+  ThumbnailCacheStats,
+  Toast,
+  TrashItem,
+} from "./lib/types";
 import "./styles.css";
-
-type Page =
-  | "overview"
-  | "sources"
-  | "review"
-  | "similar"
-  | "documents"
-  | "detectors"
-  | "trash"
-  | "history"
-  | "settings";
-type GroupFile = {
-  id: number;
-  path: string;
-  protected: boolean;
-  approved: boolean;
-  modified: number;
-};
-type Group = { hash: string; size: number; files: GroupFile[] };
-type GroupsPage = { total: number; groups: Group[] };
-type GroupFilters = {
-  search: string;
-  minSize: number;
-  sort: "size" | "members" | "path";
-};
-type Toast = { id: number; kind: "ok" | "error"; text: string };
-type Status = {
-  files: number;
-  duplicates: number;
-  approved: number;
-  in_trash: number;
-  last_scan_at: number | null;
-  groups: number;
-  recoverable_bytes: number;
-};
-type TrashItem = {
-  id: number;
-  created_at: number;
-  source_path: string;
-  trash_path: string;
-  expired: boolean;
-};
-type HistoryItem = {
-  id: number;
-  created_at: number;
-  source_path: string;
-  trash_path: string;
-  state: "trashed" | "restored" | "deleted" | string;
-  restored_at: number | null;
-};
-type ProjectConfig = {
-  trash_path: string;
-  roots: string[];
-  protect_rules: string[];
-};
-type ProjectState = ProjectConfig & {
-  database: string;
-  trash_retention_days: number;
-  auto_scan: boolean;
-};
-type ScanState = {
-  state: "idle" | "running" | "completed" | "cancelled" | "failed";
-  processed: number;
-  total: number;
-  message: string;
-};
-type SimilarPhoto = {
-  first_path: string;
-  second_path: string;
-  distance: number;
-  first_size: number;
-  first_modified: number;
-  second_size: number;
-  second_modified: number;
-};
-type SimilarDocument = {
-  first_path: string;
-  second_path: string;
-  distance: number;
-  first_size: number;
-  first_modified: number;
-  second_size: number;
-  second_modified: number;
-};
-type DetectorStatus = { name: string; available: boolean; detail: string };
 
 const nav: { id: Page; icon: string; label: string; caption: string }[] = [
   { id: "overview", icon: "◌", label: "概览", caption: "ARCHIVE HEALTH" },
@@ -109,6 +56,8 @@ function App() {
   const [trash, setTrash] = useState("");
   const [roots, setRoots] = useState<string[]>([]);
   const [protectRules, setProtectRules] = useState<string[]>([]);
+  const [excludeRules, setExcludeRules] = useState<string[]>([]);
+  const [minFileSize, setMinFileSize] = useState(0);
   const [retentionDays, setRetentionDays] = useState(30);
   const [autoScan, setAutoScan] = useState(true);
   const [rootInput, setRootInput] = useState("");
@@ -127,15 +76,30 @@ function App() {
   const [detectors, setDetectors] = useState<DetectorStatus[]>([]);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [booting, setBooting] = useState(true);
-  const [busy, setBusy] = useState(false);
+  const [busyKeys, setBusyKeys] = useState<ReadonlySet<string>>(new Set());
   const [scanState, setScanState] = useState<ScanState>({
     state: "idle",
     processed: 0,
     total: 0,
     message: "",
+    current_path: null,
+    errors_total: 0,
+    recent_errors: [],
   });
   const progressHistory = useRef<{ t: number; processed: number }[]>([]);
   const toastSeq = useRef(0);
+  // Global busy = any tracked action in flight; per-section keys let each
+  // button disable only for its own operation.
+  const busy = busyKeys.size > 0;
+
+  function setKeyBusy(key: string, on: boolean) {
+    setBusyKeys((current) => {
+      const next = new Set(current);
+      if (on) next.add(key);
+      else next.delete(key);
+      return next;
+    });
+  }
 
   function notify(kind: Toast["kind"], text: string) {
     const id = ++toastSeq.current;
@@ -157,6 +121,8 @@ function App() {
         setTrash(project.trash_path);
         setRoots(project.roots);
         setProtectRules(project.protect_rules);
+        setExcludeRules(project.exclude_rules);
+        setMinFileSize(project.min_file_size);
         setRetentionDays(project.trash_retention_days);
         setAutoScan(project.auto_scan);
         if (project.auto_scan && project.roots.length > 0) {
@@ -194,6 +160,9 @@ function App() {
             processed: 0,
             total: 0,
             message: String(error),
+            current_path: null,
+            errors_total: 0,
+            recent_errors: [],
           }),
         );
     }, 500);
@@ -201,14 +170,14 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scanState.state]);
 
-  async function execute(action: () => Promise<string>) {
-    setBusy(true);
+  async function execute(action: () => Promise<string>, key = "app") {
+    setKeyBusy(key, true);
     try {
       notify("ok", await action());
     } catch (error) {
       notify("error", friendlyError(error));
     } finally {
-      setBusy(false);
+      setKeyBusy(key, false);
     }
   }
 
@@ -251,7 +220,7 @@ function App() {
   async function applyGroupFilters(next: GroupFilters) {
     if (!database) return;
     setGroupFilters(next);
-    setBusy(true);
+    setKeyBusy("groups", true);
     try {
       const page = await invoke<GroupsPage>("groups", {
         database,
@@ -267,7 +236,7 @@ function App() {
     } catch (error) {
       notify("error", friendlyError(error));
     } finally {
-      setBusy(false);
+      setKeyBusy("groups", false);
     }
   }
 
@@ -278,10 +247,12 @@ function App() {
         trash,
         roots,
         protectRules,
+        excludeRules,
+        minFileSize,
       });
       await refresh(database);
       return result;
-    });
+    }, "init");
   }
 
   async function startScan(
@@ -294,15 +265,25 @@ function App() {
         database: targetDatabase,
         roots: targetRoots,
         protectRules: targetRules,
+        excludeRules,
+        minFileSize,
       });
-      setScanState({ state: "running", processed: 0, total: 0, message: result });
+      setScanState({
+        state: "running",
+        processed: 0,
+        total: 0,
+        message: result,
+        current_path: null,
+        errors_total: 0,
+        recent_errors: [],
+      });
       return result;
-    });
+    }, "scan");
   }
 
   async function loadMoreGroups() {
     if (!database) return;
-    setBusy(true);
+    setKeyBusy("groups", true);
     try {
       const page = await invoke<GroupsPage>(
         "groups",
@@ -314,7 +295,7 @@ function App() {
     } catch (error) {
       notify("error", friendlyError(error));
     } finally {
-      setBusy(false);
+      setKeyBusy("groups", false);
     }
   }
 
@@ -414,26 +395,28 @@ function App() {
                 disabled={busy}
               />
             )}
-            {page === "overview" && (
+            {/* Every page stays mounted so filters, selections and scroll
+                positions survive switching; CSS hides inactive layers. */}
+            <div className={page === "overview" ? "page-layer page-active" : "page-layer"}>
               <Overview
                 status={status}
                 groups={groups}
                 selected={selected}
                 onNavigate={setPage}
               />
-            )}
-            {page === "sources" && (
+            </div>
+            <div className={page === "sources" ? "page-layer page-active" : "page-layer"}>
               <Sources
                 roots={roots}
                 rootInput={rootInput}
                 setRootInput={setRootInput}
                 addRoot={addRootPath}
                 removeRoot={removeRootPath}
-            scan={() => startScan(database, roots, protectRules)}
-            disabled={busy || !database || scanState.state === "running"}
-          />
-        )}
-            {page === "review" && (
+                scan={() => startScan(database, roots, protectRules)}
+                disabled={busy || !database || scanState.state === "running"}
+              />
+            </div>
+            <div className={page === "review" ? "page-layer page-active" : "page-layer"}>
               <Review
                 database={database}
                 groups={groups}
@@ -441,6 +424,7 @@ function App() {
                 filters={groupFilters}
                 onFilters={(next) => void applyGroupFilters(next)}
                 busy={busy}
+                busyKeys={busyKeys}
                 execute={execute}
                 refresh={refresh}
                 hasMore={!groupsExhausted}
@@ -448,48 +432,59 @@ function App() {
                 indexedFiles={status?.files ?? 0}
                 onNavigate={setPage}
               />
-            )}
-        {page === "similar" && (
-          <SimilarPhotos
-            database={database}
-            photos={similarPhotos}
-            busy={busy}
-            execute={execute}
-            refresh={refresh}
-          />
-        )}
-        {page === "documents" && (
-          <SimilarDocuments documents={similarDocuments} execute={execute} />
-        )}
-        {page === "detectors" && <Detectors detectors={detectors} />}
-        {page === "trash" && (
-          <Trash
-            database={database}
-            items={trashItems}
-            busy={busy}
-            execute={execute}
-            refresh={refresh}
-          />
-        )}
-        {page === "history" && <History database={database} />}
-        {page === "settings" && (
-          <Settings
-            database={database}
-            trash={trash}
-            protectRules={protectRules}
-            retentionDays={retentionDays}
-            autoScan={autoScan}
-            setDatabase={setDatabase}
-            setTrash={setTrash}
-            setProtectRules={setProtectRules}
-            setRetentionDays={setRetentionDays}
-            setAutoScan={setAutoScan}
-            initialize={initialize}
-            execute={execute}
-            notify={(text) => notify("error", text)}
-            busy={busy}
-          />
-        )}
+            </div>
+            <div className={page === "similar" ? "page-layer page-active" : "page-layer"}>
+              <SimilarPhotos
+                database={database}
+                photos={similarPhotos}
+                busy={busy}
+                busyKeys={busyKeys}
+                execute={execute}
+                refresh={refresh}
+              />
+            </div>
+            <div className={page === "documents" ? "page-layer page-active" : "page-layer"}>
+              <SimilarDocuments documents={similarDocuments} execute={execute} />
+            </div>
+            <div className={page === "detectors" ? "page-layer page-active" : "page-layer"}>
+              <Detectors detectors={detectors} />
+            </div>
+            <div className={page === "trash" ? "page-layer page-active" : "page-layer"}>
+              <Trash
+                database={database}
+                items={trashItems}
+                busy={busy}
+                busyKeys={busyKeys}
+                execute={execute}
+                refresh={refresh}
+              />
+            </div>
+            <div className={page === "history" ? "page-layer page-active" : "page-layer"}>
+              <History database={database} active={page === "history"} />
+            </div>
+            <div className={page === "settings" ? "page-layer page-active" : "page-layer"}>
+              <Settings
+                database={database}
+                trash={trash}
+                protectRules={protectRules}
+                excludeRules={excludeRules}
+                minFileSize={minFileSize}
+                retentionDays={retentionDays}
+                autoScan={autoScan}
+                setDatabase={setDatabase}
+                setTrash={setTrash}
+                setProtectRules={setProtectRules}
+                setExcludeRules={setExcludeRules}
+                setMinFileSize={setMinFileSize}
+                setRetentionDays={setRetentionDays}
+                setAutoScan={setAutoScan}
+                initialize={initialize}
+                execute={execute}
+                notify={(text) => notify("error", text)}
+                busy={busy}
+                busyKeys={busyKeys}
+              />
+            </div>
           </>
         )}
         {(toasts.length > 0 || busy) && (
@@ -514,62 +509,6 @@ function App() {
         )}
       </main>
     </div>
-  );
-}
-
-function ScanProgress({
-  scanState,
-  history,
-  onCancel,
-  disabled,
-}: {
-  scanState: ScanState;
-  history: { t: number; processed: number }[];
-  onCancel: () => void;
-  disabled: boolean;
-}) {
-  const percent =
-    scanState.total > 0
-      ? Math.min(100, Math.round((scanState.processed / scanState.total) * 100))
-      : null;
-  let rate: number | null = null;
-  if (history.length >= 2) {
-    const seconds = (history[history.length - 1].t - history[0].t) / 1000;
-    const delta = history[history.length - 1].processed - history[0].processed;
-    if (seconds > 0 && delta > 0) rate = delta / seconds;
-  }
-  const etaSeconds =
-    rate !== null && scanState.total > scanState.processed
-      ? (scanState.total - scanState.processed) / rate
-      : null;
-  return (
-    <section className="scan-progress">
-      <div className="scan-progress-head">
-        <b>后台扫描中</b>
-        <span>
-          已处理 {scanState.processed.toLocaleString()}
-          {scanState.total > 0
-            ? ` / ${scanState.total.toLocaleString()} 个条目`
-            : " 个条目"}
-          {rate !== null && ` · ${formatRate(rate)}`}
-          {etaSeconds !== null && ` · ${formatEta(etaSeconds)}`}
-        </span>
-      </div>
-      <div className="progress-track">
-        <i
-          className={percent === null ? "indeterminate" : ""}
-          style={percent === null ? undefined : { width: `${percent}%` }}
-        />
-      </div>
-      <div className="scan-progress-foot">
-        <span>
-          {percent === null ? "正在统计文件数量..." : `${percent}%`}
-        </span>
-        <button className="secondary" disabled={disabled} onClick={onCancel}>
-          取消扫描
-        </button>
-      </div>
-    </section>
   );
 }
 
@@ -792,6 +731,7 @@ function Review({
   filters,
   onFilters,
   busy,
+  busyKeys,
   execute,
   refresh,
   hasMore,
@@ -805,7 +745,8 @@ function Review({
   filters: GroupFilters;
   onFilters: (next: GroupFilters) => void;
   busy: boolean;
-  execute: (action: () => Promise<string>) => Promise<void>;
+  busyKeys: ReadonlySet<string>;
+  execute: (action: () => Promise<string>, key?: string) => Promise<void>;
   refresh: () => Promise<void>;
   hasMore: boolean;
   onLoadMore: () => Promise<void>;
@@ -838,7 +779,7 @@ function Review({
       }
       await refresh();
       return `已按「${label}」标记 ${targets.length} 个副本，确认后可整组处理。`;
-    });
+    }, "smart");
   }
 
   // mode: "trash" recycles (recoverable), "delete" removes permanently.
@@ -850,7 +791,7 @@ function Review({
           : await invoke<string>("delete_direct", { database, fileId: file.id });
       await refresh();
       return result;
-    });
+    }, "process");
   }
 
   function confirmBatch(target: Group, mode: "trash" | "delete") {
@@ -864,7 +805,7 @@ function Review({
           : await invoke<string>("delete_direct_batch", { database, fileIds });
       await refresh();
       return result;
-    });
+    }, "batch");
   }
 
   return (
@@ -961,21 +902,21 @@ function Review({
                   <span>智能标记：</span>
                   <button
                     className="text-button"
-                    disabled={busy}
+                    disabled={busyKeys.has("smart")}
                     onClick={() => smartMark(group, "newest")}
                   >
                     保留最新
                   </button>
                   <button
                     className="text-button"
-                    disabled={busy}
+                    disabled={busyKeys.has("smart")}
                     onClick={() => smartMark(group, "oldest")}
                   >
                     保留最旧
                   </button>
                   <button
                     className="text-button"
-                    disabled={busy}
+                    disabled={busyKeys.has("smart")}
                     onClick={() => smartMark(group, "shortest")}
                   >
                     保留最短路径
@@ -1006,7 +947,7 @@ function Review({
                         <span className="approved">待删除</span>
                         <button
                           className="secondary"
-                          disabled={busy}
+                          disabled={busyKeys.has("unapprove")}
                           onClick={() =>
                             execute(async () => {
                               const result = await invoke<string>("unapprove", {
@@ -1015,7 +956,7 @@ function Review({
                               });
                               await refresh();
                               return "已取消删除标记，该副本将保留。";
-                            })
+                            }, "unapprove")
                           }
                         >
                           取消标记
@@ -1031,7 +972,7 @@ function Review({
                     ) : (
                       <button
                         className="secondary"
-                        disabled={busy || file.protected}
+                        disabled={busyKeys.has("approve") || file.protected}
                         onClick={() =>
                           execute(async () => {
                             const result = await invoke<string>("approve", {
@@ -1040,7 +981,7 @@ function Review({
                             });
                             await refresh();
                             return "已标记删除该副本，确认后才会执行。";
-                          })
+                          }, "approve")
                         }
                       >
                         标记删除
@@ -1188,13 +1129,15 @@ function SimilarPhotos({
   database,
   photos,
   busy,
+  busyKeys,
   execute,
   refresh,
 }: {
   database: string;
   photos: SimilarPhoto[];
   busy: boolean;
-  execute: (action: () => Promise<string>) => Promise<void>;
+  busyKeys: ReadonlySet<string>;
+  execute: (action: () => Promise<string>, key?: string) => Promise<void>;
   refresh: () => Promise<void>;
 }) {
   const [visible, setVisible] = useState(60);
@@ -1220,7 +1163,7 @@ function SimilarPhotos({
       setSelected(new Set());
       await refresh();
       return result;
-    });
+    }, "similar");
   }
 
   return (
@@ -1235,7 +1178,11 @@ function SimilarPhotos({
             <span className="pill">已选 {selected.size} 个</span>
           )}
           {selected.size > 0 && (
-            <button className="danger" disabled={busy} onClick={() => setPendingDelete(true)}>
+            <button
+              className="danger"
+              disabled={busyKeys.has("similar")}
+              onClick={() => setPendingDelete(true)}
+            >
               删除选中文件
             </button>
           )}
@@ -1412,14 +1359,16 @@ function DocumentInfo({
   path: string;
   size: number;
   modified: number;
-  execute: (action: () => Promise<string>) => Promise<void>;
+  execute: (action: () => Promise<string>, key?: string) => Promise<void>;
 }) {
   return (
     <div className="document-info">
       <PhotoInfo path={path} size={size} modified={modified} />
       <button
         className="secondary"
-        onClick={() => void execute(() => invoke<string>("open_file", { path }))}
+        onClick={() =>
+          void execute(() => invoke<string>("open_file", { path }), "open-doc")
+        }
       >
         打开
       </button>
@@ -1500,13 +1449,15 @@ function Trash({
   database,
   items,
   busy,
+  busyKeys,
   execute,
   refresh,
 }: {
   database: string;
   items: TrashItem[];
   busy: boolean;
-  execute: (action: () => Promise<string>) => Promise<void>;
+  busyKeys: ReadonlySet<string>;
+  execute: (action: () => Promise<string>, key?: string) => Promise<void>;
   refresh: () => Promise<void>;
 }) {
   const [pendingEmpty, setPendingEmpty] = useState(false);
@@ -1564,7 +1515,7 @@ function Trash({
               </div>
               <div className="trash-actions">
                 <button
-                  disabled={busy}
+                  disabled={busyKeys.has("restore")}
                   onClick={() =>
                     execute(async () => {
                       const result = await invoke<string>("restore", {
@@ -1573,7 +1524,7 @@ function Trash({
                       });
                       await refresh();
                       return result;
-                    })
+                    }, "restore")
                   }
                 >
                   恢复原位置
@@ -1608,7 +1559,7 @@ function Trash({
                   });
                   await refresh();
                   return result;
-                });
+                }, "prune");
               },
             },
           ]}
@@ -1632,7 +1583,7 @@ function Trash({
                   });
                   await refresh();
                   return result;
-                });
+                }, "empty");
               },
             },
           ]}
@@ -1665,7 +1616,7 @@ function Trash({
                   });
                   await refresh();
                   return result;
-                });
+                }, "trash-delete");
               },
             },
           ]}
@@ -1677,15 +1628,17 @@ function Trash({
 
 const HISTORY_PAGE = 100;
 
-function History({ database }: { database: string }) {
+function History({ database, active }: { database: string; active: boolean }) {
   const [items, setItems] = useState<HistoryItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [exhausted, setExhausted] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
 
+  // Reload only while the page is visible: the component stays mounted so
+  // scroll position and loaded pages survive switching away and back.
   useEffect(() => {
-    if (!database) return;
+    if (!active || !database) return;
     setLoading(true);
     invoke<HistoryItem[]>("history", { database, offset: 0, limit: HISTORY_PAGE })
       .then((next) => {
@@ -1694,7 +1647,7 @@ function History({ database }: { database: string }) {
       })
       .catch((err) => setError(String(err)))
       .finally(() => setLoading(false));
-  }, [database]);
+  }, [database, active]);
 
   function loadMore() {
     if (loadingMore) return;
@@ -1787,35 +1740,67 @@ function Settings({
   database,
   trash,
   protectRules,
+  excludeRules,
+  minFileSize,
   retentionDays,
   autoScan,
   setDatabase,
   setTrash,
   setProtectRules,
+  setExcludeRules,
+  setMinFileSize,
   setRetentionDays,
   setAutoScan,
   initialize,
   execute,
   notify,
   busy,
+  busyKeys,
 }: {
   database: string;
   trash: string;
   protectRules: string[];
+  excludeRules: string[];
+  minFileSize: number;
   retentionDays: number;
   autoScan: boolean;
   setDatabase: (value: string) => void;
   setTrash: (value: string) => void;
   setProtectRules: (value: string[]) => void;
+  setExcludeRules: (value: string[]) => void;
+  setMinFileSize: (value: number) => void;
   setRetentionDays: (value: number) => void;
   setAutoScan: (value: boolean) => void;
   initialize: () => Promise<void>;
-  execute: (action: () => Promise<string>) => Promise<void>;
+  execute: (action: () => Promise<string>, key?: string) => Promise<void>;
   notify: (message: string) => void;
   busy: boolean;
+  busyKeys: ReadonlySet<string>;
 }) {
   const [rule, setRule] = useState("");
+  const [excludeInput, setExcludeInput] = useState("");
+  const [minSizeInput, setMinSizeInput] = useState(
+    minFileSize ? String(Math.round(minFileSize / (1024 * 1024))) : "",
+  );
   const [retentionInput, setRetentionInput] = useState(String(retentionDays));
+  const [cacheStats, setCacheStats] = useState<ThumbnailCacheStats | null>(null);
+
+  // The cache panel loads lazily (one directory walk) and refreshes after a
+  // clear; failures leave the panel blank instead of disturbing the user.
+  useEffect(() => {
+    if (cacheStats) return;
+    invoke<ThumbnailCacheStats>("thumbnail_cache_stats")
+      .then(setCacheStats)
+      .catch(() => setCacheStats(null));
+  }, [cacheStats]);
+
+  function clearThumbnailCache() {
+    void execute(async () => {
+      const result = await invoke<string>("thumbnail_cache_clear");
+      setCacheStats(null);
+      return result;
+    }, "cache-clear");
+  }
 
   useEffect(() => {
     setRetentionInput(String(retentionDays));
@@ -1836,7 +1821,7 @@ function Settings({
       });
       setRetentionDays(days);
       return result;
-    });
+    }, "retention");
   }
 
   function toggleAutoScan() {
@@ -1848,7 +1833,19 @@ function Settings({
       });
       setAutoScan(next);
       return result;
-    });
+    }, "auto-scan");
+  }
+
+  // The input is in MB for readability; the setting stores bytes.
+  function saveMinSize() {
+    const trimmed = minSizeInput.trim();
+    const megabytes = trimmed === "" ? 0 : Number.parseInt(trimmed, 10);
+    if (Number.isNaN(megabytes) || megabytes < 0 || megabytes > 1024 * 1024) {
+      notify("最小文件大小需为 0 到 1048576 之间的整数（MB）。");
+      setMinSizeInput(minFileSize ? String(Math.round(minFileSize / (1024 * 1024))) : "");
+      return;
+    }
+    setMinFileSize(megabytes * 1024 * 1024);
   }
   async function pickTrash() {
     const selected = await open({
@@ -1922,6 +1919,66 @@ function Settings({
         ))}
       </div>
       <label>
+        排除目录规则
+        <div className="input-action">
+          <input
+            value={excludeInput}
+            onChange={(event) => setExcludeInput(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                const trimmed = excludeInput.trim();
+                if (trimmed && !excludeRules.includes(trimmed))
+                  setExcludeRules([...excludeRules, trimmed]);
+                setExcludeInput("");
+              }
+            }}
+            placeholder="例如 node_modules"
+          />
+          <button
+            className="secondary"
+            onClick={() => {
+              const trimmed = excludeInput.trim();
+              if (trimmed && !excludeRules.includes(trimmed))
+                setExcludeRules([...excludeRules, trimmed]);
+              setExcludeInput("");
+            }}
+          >
+            添加
+          </button>
+        </div>
+        <small className="field-hint">
+          路径包含任一规则的目录与文件将被扫描跳过；下次扫描生效。
+        </small>
+      </label>
+      <div className="rules">
+        {excludeRules.map((item) => (
+          <span className="chip" key={item}>
+            {item}
+            <button
+              onClick={() =>
+                setExcludeRules(excludeRules.filter((value) => value !== item))
+              }
+            >
+              ×
+            </button>
+          </span>
+        ))}
+      </div>
+      <label>
+        最小文件大小（MB）
+        <input
+          value={minSizeInput}
+          onChange={(event) => setMinSizeInput(event.target.value)}
+          onBlur={saveMinSize}
+          onKeyDown={(event) => event.key === "Enter" && saveMinSize()}
+          inputMode="numeric"
+          placeholder="0"
+        />
+        <small className="field-hint">
+          小于该大小的文件不参与重复检测；填 0 或留空表示不过滤。下次扫描生效。
+        </small>
+      </label>
+      <label>
         回收站保留天数
         <input
           value={retentionInput}
@@ -1949,9 +2006,27 @@ function Settings({
           </small>
         </span>
       </label>
-      <button disabled={busy || !database || !trash} onClick={initialize}>
+      <button
+        disabled={busyKeys.has("app") || busyKeys.has("init") || !database || !trash}
+        onClick={() => void initialize()}
+      >
         保存并打开项目
       </button>
+      <div className="cache-panel">
+        <b>预览缓存</b>
+        <span>
+          {cacheStats
+            ? `缩略图与预览缓存占用 ${formatBytes(cacheStats.bytes)}（${cacheStats.files} 个文件）。`
+            : "缓存统计不可用。"}
+        </span>
+        <button
+          className="secondary"
+          disabled={busyKeys.has("cache-clear") || !cacheStats || cacheStats.files === 0}
+          onClick={clearThumbnailCache}
+        >
+          清理缓存
+        </button>
+      </div>
       <div className="safety">
         <b>安全承诺</b>
         <span>
@@ -1961,229 +2036,6 @@ function Settings({
       </div>
     </section>
   );
-}
-
-function Empty({
-  icon,
-  text,
-  detail,
-  action,
-}: {
-  icon: string;
-  text: string;
-  detail: string;
-  action?: { label: string; onClick: () => void };
-}) {
-  return (
-    <div className="empty">
-      <span>{icon}</span>
-      <b>{text}</b>
-      <p>{detail}</p>
-      {action && (
-        <button className="secondary" onClick={action.onClick}>
-          {action.label}
-        </button>
-      )}
-    </div>
-  );
-}
-
-type ConfirmOption = {
-  label: string;
-  kind?: "primary" | "secondary" | "danger";
-  action: () => void;
-};
-
-// Unified confirmation dialog: explicit cancel button (the only exit in the
-// earlier review dialogs was clicking the backdrop), Escape to close, and
-// ARIA roles. All destructive flows go through this component.
-function ConfirmDialog({
-  title,
-  detail,
-  note,
-  options,
-  busy,
-  onClose,
-}: {
-  title: string;
-  detail?: ReactNode;
-  note?: string;
-  options: ConfirmOption[];
-  busy: boolean;
-  onClose: () => void;
-}) {
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-  return (
-    <div className="modal-backdrop" onClick={onClose} role="presentation">
-      <div
-        className="modal modal-confirm"
-        role="dialog"
-        aria-modal="true"
-        aria-label={title}
-        onClick={(event) => event.stopPropagation()}
-      >
-        <h3>{title}</h3>
-        {detail && <p>{detail}</p>}
-        {note && <p className="modal-note">{note}</p>}
-        <div className="modal-actions-row">
-          {options.map((option) => (
-            <button
-              key={option.label}
-              className={option.kind ?? "secondary"}
-              disabled={busy}
-              onClick={option.action}
-            >
-              {option.label}
-            </button>
-          ))}
-          <button
-            className="text-button modal-cancel"
-            disabled={busy}
-            onClick={onClose}
-          >
-            取消
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-function formatBytes(bytes: number) {
-  if (bytes < 1024) return `${bytes} B`;
-  const units = ["KB", "MB", "GB", "TB"];
-  let value = bytes / 1024;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit++;
-  }
-  return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unit]}`;
-}
-
-function formatFileTime(unixSeconds: number) {
-  return new Date(unixSeconds * 1000).toLocaleString("zh-CN", {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-const LARGE_FILE_THRESHOLD = 1024 * 1024 * 1024;
-
-function fileFolder(path: string) {
-  const parts = path.split(/[\\/]/);
-  return parts.slice(0, -1).join("/");
-}
-
-function fileName(path: string) {
-  return path.split(/[\\/]/).pop() ?? path;
-}
-
-function PreviewModal({
-  path,
-  onClose,
-}: {
-  path: string;
-  onClose: () => void;
-}) {
-  const [image, setImage] = useState<string | null>(null);
-  const [failed, setFailed] = useState(false);
-  useEffect(() => {
-    setImage(null);
-    setFailed(false);
-    void invoke<string | null>("image_preview", { path })
-      .then((result) => {
-        if (result) setImage(result);
-        else setFailed(true);
-      })
-      .catch(() => setFailed(true));
-  }, [path]);
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-  return (
-    <div className="modal-backdrop" onClick={onClose} role="presentation">
-      <div
-        className="modal"
-        role="dialog"
-        aria-modal="true"
-        aria-label={`预览 ${fileName(path)}`}
-        onClick={(event) => event.stopPropagation()}
-      >
-        <div className="modal-head">
-          <div>
-            <b>{fileName(path)}</b>
-            <span>{fileFolder(path)}</span>
-          </div>
-          <div className="modal-actions">
-            <button
-              className="secondary"
-              onClick={() =>
-                void invoke("open_file", { path }).catch((error) =>
-                  console.error("open_file failed:", error),
-                )
-              }
-            >
-              用系统程序打开
-            </button>
-            <button className="secondary" onClick={onClose}>
-              关闭
-            </button>
-          </div>
-        </div>
-        {image && <img className="preview-image" src={image} alt={fileName(path)} />}
-        {failed && (
-          <div className="preview-fallback">
-            <b>此文件无法预览</b>
-            <span>只有图片支持应用内预览，其他类型请用系统程序打开。</span>
-          </div>
-        )}
-        {!image && !failed && <div className="preview-loading">正在加载预览...</div>}
-      </div>
-    </div>
-  );
-}
-
-function friendlyError(error: unknown) {
-  const raw = String(error);
-  const rules: [RegExp, string][] = [
-    [/permission denied|access is denied/i, "没有访问权限，请检查文件或目录的读取权限。"],
-    [/database is locked|database table is locked/i, "数据库正被其他操作占用，请稍后重试。"],
-    [/no such file|os error 2/i, "文件或目录不存在，可能已被移动或删除。"],
-    [/no longer matches indexed hash/, "文件内容与索引记录不一致，请重新扫描后再试。"],
-    [/file changed while hashing/, "扫描期间文件内容发生了变化，将在下次扫描时重试。"],
-    [/must be an approved/, "只有已确认的精确重复副本才能移入回收站。"],
-    [/is not a directory/, "扫描目录无效或已不存在，请重新添加。"],
-    [/restore refused/, "原位置已存在文件，恢复被拒绝以避免覆盖。"],
-    [/unknown file id/, "该文件已不在索引中，请刷新后重试。"],
-  ];
-  for (const [pattern, text] of rules) {
-    if (pattern.test(raw)) return text;
-  }
-  return `操作失败：${raw}`;
-}
-
-function formatRate(rate: number) {
-  return `${rate.toLocaleString("zh-CN", { maximumFractionDigits: 0 })} 个/秒`;
-}
-
-function formatEta(seconds: number) {
-  if (seconds < 60) return `预计剩余 ${Math.ceil(seconds)} 秒`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `预计剩余 ${minutes} 分 ${Math.ceil(seconds % 60)} 秒`;
-  return `预计剩余 ${Math.floor(minutes / 60)} 时 ${minutes % 60} 分`;
 }
 
 createRoot(document.getElementById("root")!).render(<App />);
