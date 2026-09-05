@@ -3,6 +3,7 @@
 mod implementation;
 
 pub use implementation::{
-    delete_direct, delete_trash, empty_trash, init, prune_expired_trash, restore, scan,
-    scan_with_control, set_approval, trash, trash_list, trash_retention_days,
+    delete_direct, delete_paths, delete_trash, empty_trash, init, prune_expired_trash, restore,
+    scan, scan_with_control, set_approval, trash, trash_list, trash_paths, trash_retention_days,
+    BatchOutcome, ScanSummary,
 };

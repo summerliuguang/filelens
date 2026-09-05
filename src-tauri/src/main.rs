@@ -19,9 +19,11 @@ use tauri::Manager;
 struct Status {
     files: i64,
     duplicates: i64,
+    approved: i64,
     in_trash: i64,
     last_scan_at: Option<i64>,
     groups: i64,
+    recoverable_bytes: i64,
 }
 #[derive(Serialize)]
 struct GroupFile {
@@ -282,9 +284,22 @@ fn start_scan(
         );
         if let Ok(mut current) = worker_state.lock() {
             match result {
-                Ok(()) => {
+                Ok(summary) => {
                     current.state = "completed".into();
-                    current.message = "扫描完成，索引已更新。".into();
+                    let mut message = "扫描完成，索引已更新。".to_string();
+                    if summary.pruned > 0 {
+                        message.push_str(&format!(
+                            " 已清理 {} 个超期回收文件。",
+                            summary.pruned
+                        ));
+                    }
+                    if !summary.failed_roots.is_empty() {
+                        message.push_str(&format!(
+                            " 跳过 {} 个无效扫描目录。",
+                            summary.failed_roots.len()
+                        ));
+                    }
+                    current.message = message;
                 }
                 Err(error) if error == "scan cancelled" => {
                     current.state = "cancelled".into();
@@ -416,38 +431,32 @@ fn delete_direct_batch(database: String, file_ids: Vec<i64>) -> Result<String, S
     }
 }
 
-/// Direct deletion of user-selected similar candidates (not exact
-/// duplicates). Marks the rows absent so groups disappear after refresh.
+/// Recycle user-selected similar candidates (not exact duplicates) after the
+/// core-library safety chain verifies each path against the index.
+#[tauri::command]
+fn trash_paths(database: String, paths: Vec<String>) -> Result<String, String> {
+    let outcome = filelens::trash_paths(&PathBuf::from(&database), &paths)?;
+    Ok(format_batch_outcome("已移入回收站", outcome))
+}
+
+/// Permanently delete user-selected similar candidates behind the same
+/// safety chain (index lookup, protection check, hash re-verification).
 #[tauri::command]
 fn delete_paths(database: String, paths: Vec<String>) -> Result<String, String> {
-    let connection = open_database(&database)?;
-    let mut deleted = 0;
-    let mut failed: Vec<String> = Vec::new();
-    for path in paths {
-        let target = PathBuf::from(&path);
-        if !target.is_file() {
-            failed.push(format!("{path}：文件不存在"));
-            continue;
-        }
-        match fs::remove_file(&target) {
-            Ok(()) => {
-                let _ = connection.execute(
-                    "UPDATE files SET present=0, approved=0 WHERE path=?1",
-                    params![path],
-                );
-                deleted += 1;
-            }
-            Err(error) => failed.push(format!("{path}：{error}")),
-        }
-    }
-    if failed.is_empty() {
-        Ok(format!("已永久删除 {deleted} 个文件。"))
+    let outcome = filelens::delete_paths(&PathBuf::from(&database), &paths)?;
+    Ok(format_batch_outcome("已永久删除", outcome))
+}
+
+fn format_batch_outcome(verb: &str, outcome: filelens::BatchOutcome) -> String {
+    if outcome.failures.is_empty() {
+        format!("{verb} {} 个文件。", outcome.succeeded)
     } else {
-        Ok(format!(
-            "已删除 {deleted} 个，{} 个失败：{}",
-            failed.len(),
-            failed.join("；")
-        ))
+        format!(
+            "{verb} {} 个，{} 个失败：{}",
+            outcome.succeeded,
+            outcome.failures.len(),
+            outcome.failures.join("；")
+        )
     }
 }
 
@@ -587,6 +596,14 @@ fn status(database: String) -> Result<Status, String> {
         })
         .map_err(|error| error.to_string())?;
     let duplicates = connection.query_row("SELECT COALESCE(SUM(n - 1),0) FROM (SELECT COUNT(*) n FROM files WHERE present=1 GROUP BY hash,size HAVING n > 1)", [], |row| row.get(0)).map_err(|error| error.to_string())?;
+    let approved = connection
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE present=1 AND approved=1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let recoverable_bytes = connection.query_row("SELECT COALESCE(SUM((n - 1) * size),0) FROM (SELECT COUNT(*) AS n, size FROM files WHERE present=1 GROUP BY hash,size HAVING n > 1)", [], |row| row.get(0)).map_err(|error| error.to_string())?;
     let in_trash = connection
         .query_row(
             "SELECT COUNT(*) FROM operations WHERE state='trashed'",
@@ -613,9 +630,11 @@ fn status(database: String) -> Result<Status, String> {
     Ok(Status {
         files,
         duplicates,
+        approved,
         in_trash,
         last_scan_at,
         groups,
+        recoverable_bytes,
     })
 }
 
@@ -955,6 +974,7 @@ fn main() {
             delete_direct,
             delete_direct_batch,
             delete_paths,
+            trash_paths,
             trash_prune_expired,
             history,
             set_trash_retention,

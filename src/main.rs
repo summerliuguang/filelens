@@ -177,7 +177,21 @@ pub fn init(database: &Path, trash: &Path) -> Result<(), String> {
 }
 
 pub fn scan(database: &Path, roots: &[PathBuf], protect: &[String]) -> Result<(), String> {
-    scan_with_control(database, roots, protect, &|| false, &|_, _| {})
+    scan_with_control(database, roots, protect, &|| false, &|_, _| {}).map(|_| ())
+}
+
+/// Aggregated outcome of one scan run: counters for the CLI report plus the
+/// expired-recycle cleanup count and skipped roots for the GUI completion
+/// message.
+pub struct ScanSummary {
+    pub new: u64,
+    pub unchanged: u64,
+    pub updated: u64,
+    pub skipped: u64,
+    pub errors: u64,
+    pub missing: u64,
+    pub pruned: u64,
+    pub failed_roots: Vec<String>,
 }
 
 pub fn scan_with_control(
@@ -186,7 +200,7 @@ pub fn scan_with_control(
     protect: &[String],
     cancelled: &(dyn Fn() -> bool + Send + Sync),
     progress: &(dyn Fn(u64, u64) + Send + Sync),
-) -> Result<(), String> {
+) -> Result<ScanSummary, String> {
     let connection = open_database(database)?;
     ensure_initialized(&connection)?;
     let trash = PathBuf::from(required_setting(&connection, "trash_path")?);
@@ -241,7 +255,16 @@ pub fn scan_with_control(
     if !failed_roots.is_empty() {
         println!("Skipped missing roots: {}", failed_roots.join(", "));
     }
-    Ok(())
+    Ok(ScanSummary {
+        new: counters.new,
+        unchanged: counters.unchanged,
+        updated: counters.updated,
+        skipped: counters.skipped,
+        errors: counters.errors,
+        missing: removed,
+        pruned,
+        failed_roots,
+    })
 }
 
 /// Pre-walk the roots counting the entries the scan will report, so progress
@@ -546,6 +569,15 @@ fn write_entry(
             params![file_id, simhash as i64, token_count],
         )
         .map_err(|e| e.to_string())?;
+    } else {
+        // The file no longer parses as a document (non-UTF-8 content, changed
+        // extension); drop the stale fingerprint so it stops pairing.
+        connection
+            .execute(
+                "DELETE FROM document_fingerprints WHERE file_id=?1",
+                params![file_id],
+            )
+            .map_err(|e| e.to_string())?;
     }
     Ok(outcome)
 }
@@ -820,16 +852,7 @@ pub fn trash(database: &Path, file_id: i64) -> Result<(), String> {
     if hash_file(&source)? != file.hash {
         return Err("source no longer matches indexed hash; scan again".to_string());
     }
-    let trash_root = PathBuf::from(required_setting(&connection, "trash_path")?);
-    let batch = format!("{}-{}", now_seconds()?, file.id);
-    let destination = trash_root
-        .join(batch)
-        .join("files")
-        .join(file.id.to_string())
-        .join(source.file_name().ok_or("source has no file name")?);
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("create recycle directory: {e}"))?;
-    }
+    let destination = recycle_destination(&connection, file.id, &source)?;
     move_verified(&source, &destination, &file.hash)?;
     connection.execute("INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at) VALUES(?1,?2,?3,?4,'trashed',?5)", params![file.id, file.path, destination.to_string_lossy(), file.hash, now_seconds()?]).map_err(|e| e.to_string())?;
     connection
@@ -927,6 +950,90 @@ pub fn delete_direct(database: &Path, file_id: i64) -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
     println!("Deleted permanently: {}", source.display());
+    Ok(())
+}
+
+/// Outcome of removing user-picked paths: partial success is allowed and the
+/// failures carry per-path reasons for the UI to display verbatim.
+pub struct BatchOutcome {
+    pub succeeded: usize,
+    pub failures: Vec<String>,
+}
+
+fn remove_paths(database: &Path, paths: &[String], to_trash: bool) -> Result<BatchOutcome, String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    let mut outcome = BatchOutcome {
+        succeeded: 0,
+        failures: Vec::new(),
+    };
+    for path in paths {
+        match remove_indexed_path(&connection, path, to_trash) {
+            Ok(()) => outcome.succeeded += 1,
+            Err(error) => outcome.failures.push(format!("{path}：{error}")),
+        }
+    }
+    Ok(outcome)
+}
+
+/// Move user-picked paths (e.g. similar-photo candidates) to the recycle bin.
+/// There is no approval step like the exact-duplicate flow, but every path
+/// must be indexed, unprotected, and still hash-match the index before it is
+/// touched; every move is recorded in operations.
+pub fn trash_paths(database: &Path, paths: &[String]) -> Result<BatchOutcome, String> {
+    remove_paths(database, paths, true)
+}
+
+/// Permanently delete user-picked paths behind the same safety chain as
+/// `trash_paths`.
+pub fn delete_paths(database: &Path, paths: &[String]) -> Result<BatchOutcome, String> {
+    remove_paths(database, paths, false)
+}
+
+fn remove_indexed_path(connection: &Connection, path: &str, to_trash: bool) -> Result<(), String> {
+    let row: Option<(i64, String, i64, i64)> = connection
+        .query_row(
+            "SELECT id,hash,protected,present FROM files WHERE path=?1",
+            params![path],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some((file_id, hash, protected, present)) = row else {
+        return Err("文件不在索引中，请先扫描".to_string());
+    };
+    if present == 0 {
+        return Err("文件已被标记为不存在，请刷新后重试".to_string());
+    }
+    if protected == 1 {
+        return Err("受保护规则覆盖，已拒绝删除".to_string());
+    }
+    let source = PathBuf::from(path);
+    if !source.is_file() {
+        return Err("文件不存在或已被删除".to_string());
+    }
+    if hash_file(&source)? != hash {
+        return Err("文件内容与索引记录不一致，请重新扫描后再试".to_string());
+    }
+    if to_trash {
+        let destination = recycle_destination(connection, file_id, &source)?;
+        move_verified(&source, &destination, &hash)?;
+        connection.execute("INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at) VALUES(?1,?2,?3,?4,'trashed',?5)", params![file_id, path, destination.to_string_lossy(), hash, now_seconds()?]).map_err(|e| e.to_string())?;
+    } else {
+        fs::remove_file(&source).map_err(|e| format!("删除文件失败：{e}"))?;
+        connection
+            .execute(
+                "INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at) VALUES(?1,?2,'',?3,'deleted',?4)",
+                params![file_id, path, hash, now_seconds()?],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    connection
+        .execute(
+            "UPDATE files SET present=0, approved=0 WHERE id=?1",
+            params![file_id],
+        )
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1043,6 +1150,26 @@ pub fn empty_trash(database: &Path) -> Result<u64, String> {
     }
     println!("Recycle bin emptied: {} files", ids.len());
     Ok(ids.len() as u64)
+}
+
+/// Build the recycle-bin destination for one indexed file and create its
+/// parent directories: `<trash>/<timestamp>-<file_id>/files/<file_id>/<name>`.
+fn recycle_destination(
+    connection: &Connection,
+    file_id: i64,
+    source: &Path,
+) -> Result<PathBuf, String> {
+    let trash_root = PathBuf::from(required_setting(connection, "trash_path")?);
+    let batch = format!("{}-{}", now_seconds()?, file_id);
+    let destination = trash_root
+        .join(batch)
+        .join("files")
+        .join(file_id.to_string())
+        .join(source.file_name().ok_or("source has no file name")?);
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create recycle directory: {e}"))?;
+    }
+    Ok(destination)
 }
 
 fn move_verified(source: &Path, destination: &Path, expected_hash: &str) -> Result<(), String> {
@@ -1500,6 +1627,155 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "deleted");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn similar_path_trash_verifies_protection_and_hash() {
+        let directory = test_directory("similar-trash");
+        let source = directory.join("source");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("plain.txt"), b"photo candidate").unwrap();
+        fs::write(source.join("guarded.txt"), b"protected candidate").unwrap();
+        let database = directory.join("index.db");
+
+        init(&database, &recycle).unwrap();
+        scan(
+            &database,
+            std::slice::from_ref(&source),
+            &["guarded".to_string()],
+        )
+        .unwrap();
+
+        // Protected paths are refused and left untouched.
+        let outcome = trash_paths(
+            &database,
+            &[source.join("guarded.txt").to_string_lossy().into_owned()],
+        )
+        .unwrap();
+        assert_eq!(outcome.succeeded, 0);
+        assert_eq!(outcome.failures.len(), 1);
+        assert!(outcome.failures[0].contains("受保护"));
+        assert!(source.join("guarded.txt").exists());
+
+        // Paths missing from the index are refused too.
+        let stray = directory.join("stray.txt");
+        fs::write(&stray, b"never scanned").unwrap();
+        let outcome = trash_paths(&database, &[stray.to_string_lossy().into_owned()]).unwrap();
+        assert_eq!(outcome.succeeded, 0);
+        assert!(stray.exists());
+
+        // A file whose content drifted from the index is refused.
+        fs::write(source.join("plain.txt"), b"modified content").unwrap();
+        let outcome = trash_paths(
+            &database,
+            &[source.join("plain.txt").to_string_lossy().into_owned()],
+        )
+        .unwrap();
+        assert_eq!(outcome.succeeded, 0);
+        assert!(source.join("plain.txt").exists());
+
+        // An intact path moves through the recycle bin with an operations record.
+        fs::write(source.join("plain.txt"), b"photo candidate").unwrap();
+        let outcome = trash_paths(
+            &database,
+            &[source.join("plain.txt").to_string_lossy().into_owned()],
+        )
+        .unwrap();
+        assert_eq!(outcome.succeeded, 1);
+        assert!(outcome.failures.is_empty());
+        assert!(!source.join("plain.txt").exists());
+        let connection = open_database(&database).unwrap();
+        let (state, trash_path): (String, String) = connection
+            .query_row(
+                "SELECT state,trash_path FROM operations",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(state, "trashed");
+        assert!(PathBuf::from(&trash_path).exists());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn similar_path_delete_records_operations() {
+        let directory = test_directory("similar-delete");
+        let source = directory.join("source");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("solo.txt"), b"unique content").unwrap();
+        let database = directory.join("index.db");
+
+        init(&database, &recycle).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        let outcome = delete_paths(
+            &database,
+            &[source.join("solo.txt").to_string_lossy().into_owned()],
+        )
+        .unwrap();
+        assert_eq!(outcome.succeeded, 1);
+        assert!(outcome.failures.is_empty());
+        assert!(!source.join("solo.txt").exists());
+        let connection = open_database(&database).unwrap();
+        let (state, present): (String, i64) = connection
+            .query_row(
+                "SELECT state,present FROM operations JOIN files ON files.id=operations.file_id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(state, "deleted");
+        assert_eq!(present, 0);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn scan_summary_reports_expired_prune_count() {
+        let directory = test_directory("summary-prune");
+        let source = directory.join("source");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("a.txt"), b"same content").unwrap();
+        fs::write(source.join("b.txt"), b"same content").unwrap();
+        let database = directory.join("index.db");
+
+        init(&database, &recycle).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        let connection = open_database(&database).unwrap();
+        let b_id: i64 = connection
+            .query_row(
+                "SELECT id FROM files WHERE path LIKE '%b.txt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(connection);
+        set_approval(&database, b_id, true).unwrap();
+        trash(&database, b_id).unwrap();
+        // Backdate beyond the 30-day retention so the next scan prunes it.
+        let connection = open_database(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE operations SET created_at = created_at - 40*86400",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let summary = scan_with_control(
+            &database,
+            std::slice::from_ref(&source),
+            &[],
+            &|| false,
+            &|_, _| {},
+        )
+        .unwrap();
+        assert_eq!(summary.pruned, 1);
+        assert!(summary.failed_roots.is_empty());
         let _ = fs::remove_dir_all(directory);
     }
 

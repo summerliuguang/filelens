@@ -700,7 +700,18 @@ h3 {
 .modal-actions-row {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
   gap: 10px;
+}
+.modal-cancel {
+  margin-left: auto;
+  color: #939a8e;
+}
+.modal-cancel:hover {
+  color: #c5ca5f;
+}
+.modal-confirm button:hover {
+  filter: brightness(1.12);
 }
 .photo-slot {
   position: relative;

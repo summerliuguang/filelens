@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -25,9 +25,11 @@ type Group = { hash: string; size: number; files: GroupFile[] };
 type Status = {
   files: number;
   duplicates: number;
+  approved: number;
   in_trash: number;
   last_scan_at: number | null;
   groups: number;
+  recoverable_bytes: number;
 };
 type TrashItem = {
   id: number;
@@ -196,7 +198,7 @@ function App() {
       setSimilarPhotos(nextSimilarPhotos);
       setSimilarDocuments(nextDocuments);
       setDetectors(nextDetectors);
-      return `索引已更新：${nextGroups.length} 个精确重复组待审核。`;
+      return `索引已更新：${nextStatus.groups} 个精确重复组待审核。`;
     });
   }
 
@@ -297,6 +299,9 @@ function App() {
               {item.label}
               {item.id === "review" && status && status.duplicates > 0 && (
                 <em>{status.duplicates}</em>
+              )}
+              {item.id === "trash" && trashItems.length > 0 && (
+                <em>{trashItems.length}</em>
               )}
             </button>
           ))}
@@ -467,10 +472,6 @@ function Overview({
   selected: number;
   onNavigate: (page: Page) => void;
 }) {
-  const recoverable = groups.reduce(
-    (total, group) => total + Math.max(0, group.files.length - 1) * group.size,
-    0,
-  );
   return (
     <>
       <section className="hero">
@@ -494,7 +495,7 @@ function Overview({
         <div className="hero-orbit">
           <strong>{status?.duplicates ?? "-"}</strong>
           <span>待审核副本</span>
-          <small>{formatBytes(recoverable)} 可释放空间</small>
+          <small>{formatBytes(status?.recoverable_bytes ?? 0)} 可释放空间</small>
         </div>
       </section>
       <section className="metrics">
@@ -508,7 +509,11 @@ function Overview({
           label="重复副本"
           detail="完整哈希确认"
         />
-        <Metric value={selected} label="已确认处理" detail="等待移入回收站" />
+        <Metric
+          value={status?.approved ?? selected}
+          label="已确认处理"
+          detail="等待移入回收站"
+        />
         <Metric
           value={status?.in_trash ?? "-"}
           label="回收站文件"
@@ -574,6 +579,7 @@ function Sources({
   scan: () => void;
   disabled: boolean;
 }) {
+  const [pendingRemoveRoot, setPendingRemoveRoot] = useState<string | null>(null);
   async function pickDirectory() {
     const selected = await open({
       directory: true,
@@ -625,13 +631,43 @@ function Sources({
                 <b>{root}</b>
                 <small>本地来源 · 全局比较已启用</small>
               </div>
-              <button className="text-button" onClick={() => removeRoot(root)}>
+              <button
+                className="text-button"
+                onClick={() => setPendingRemoveRoot(root)}
+              >
                 移除
               </button>
             </article>
           ))
         )}
       </div>
+      {pendingRemoveRoot && (
+        <ConfirmDialog
+          title="移除扫描目录"
+          detail={
+            <>
+              {pendingRemoveRoot}
+              <br />
+              <small>
+                该目录不再参与后续扫描，已索引的记录会保留；其中的文件不会受到任何影响。
+              </small>
+            </>
+          }
+          busy={false}
+          onClose={() => setPendingRemoveRoot(null)}
+          options={[
+            {
+              label: "移除",
+              kind: "danger",
+              action: () => {
+                const root = pendingRemoveRoot;
+                setPendingRemoveRoot(null);
+                removeRoot(root);
+              },
+            },
+          ]}
+        />
+      )}
     </section>
   );
 }
@@ -814,86 +850,81 @@ function Review({
         <PreviewModal path={previewPath} onClose={() => setPreviewPath(null)} />
       )}
       {pendingRemove && (
-        <div className="modal-backdrop" onClick={() => setPendingRemove(null)}>
-          <div className="modal modal-confirm" onClick={(event) => event.stopPropagation()}>
-            <h3>选择删除方式</h3>
-            <p>
-              {fileName(pendingRemove.path)} · {formatBytes(groupSizeOf(pendingRemove, groups))}
-            </p>
-            {groupSizeOf(pendingRemove, groups) >= LARGE_FILE_THRESHOLD && (
-              <p className="modal-note">
-                该文件超过 1 GB：移入回收站会先复制一份（耗时且占双倍空间），大文件建议直接删除。
-              </p>
-            )}
-            <div className="modal-actions-row">
-              <button
-                className="secondary"
-                disabled={busy}
-                onClick={() => {
-                  const file = pendingRemove;
-                  setPendingRemove(null);
-                  confirmRemoval(file, "trash");
-                }}
-              >
-                移入回收站（可恢复）
-              </button>
-              <button
-                className="danger"
-                disabled={busy}
-                onClick={() => {
-                  const file = pendingRemove;
-                  setPendingRemove(null);
-                  confirmRemoval(file, "delete");
-                }}
-              >
-                直接永久删除
-              </button>
-            </div>
-          </div>
-        </div>
+        <ConfirmDialog
+          title="选择删除方式"
+          detail={
+            <>
+              {fileName(pendingRemove.path)} ·{" "}
+              {formatBytes(groupSizeOf(pendingRemove, groups))}
+            </>
+          }
+          note={
+            groupSizeOf(pendingRemove, groups) >= LARGE_FILE_THRESHOLD
+              ? "该文件超过 1 GB：移入回收站会先复制一份（耗时且占双倍空间），大文件建议直接删除。"
+              : undefined
+          }
+          busy={busy}
+          onClose={() => setPendingRemove(null)}
+          options={[
+            {
+              label: "移入回收站（可恢复）",
+              action: () => {
+                const file = pendingRemove;
+                setPendingRemove(null);
+                confirmRemoval(file, "trash");
+              },
+            },
+            {
+              label: "直接永久删除",
+              kind: "danger",
+              action: () => {
+                const file = pendingRemove;
+                setPendingRemove(null);
+                confirmRemoval(file, "delete");
+              },
+            },
+          ]}
+        />
       )}
       {pendingBatch && (
-        <div className="modal-backdrop" onClick={() => setPendingBatch(null)}>
-          <div className="modal modal-confirm" onClick={(event) => event.stopPropagation()}>
-            <h3>处理 {pendingBatch.files.filter((f) => f.approved).length} 个已标记副本</h3>
-            <p>
+        <ConfirmDialog
+          title={`处理 ${pendingBatch.files.filter((f) => f.approved).length} 个已标记副本`}
+          detail={
+            <>
               每个副本 {formatBytes(pendingBatch.size)}，共可释放{" "}
               {formatBytes(
                 pendingBatch.size * pendingBatch.files.filter((f) => f.approved).length,
               )}
               。
-            </p>
-            {pendingBatch.size >= LARGE_FILE_THRESHOLD && (
-              <p className="modal-note">
-                该组包含超过 1 GB 的大文件：移入回收站会先复制一份（耗时且占双倍空间），大文件建议直接删除。
-              </p>
-            )}
-            <div className="modal-actions-row">
-              <button
-                className="secondary"
-                disabled={busy}
-                onClick={() => {
-                  const target = pendingBatch;
-                  setPendingBatch(null);
-                  confirmBatch(target, "trash");
-                }}
-              >
-                全部移入回收站（可恢复）
-              </button>
-              <button
-                className="danger"
-                disabled={busy}
-                onClick={() => {
-                  const target = pendingBatch;
-                  setPendingBatch(null);
-                  confirmBatch(target, "delete");
-                }}
-              >
-                全部直接永久删除
-              </button>
-            </div>
-          </div>
-        </div>
+            </>
+          }
+          note={
+            pendingBatch.size >= LARGE_FILE_THRESHOLD
+              ? "该组包含超过 1 GB 的大文件：移入回收站会先复制一份（耗时且占双倍空间），大文件建议直接删除。"
+              : undefined
+          }
+          busy={busy}
+          onClose={() => setPendingBatch(null)}
+          options={[
+            {
+              label: "全部移入回收站（可恢复）",
+              action: () => {
+                const target = pendingBatch;
+                setPendingBatch(null);
+                confirmBatch(target, "trash");
+              },
+            },
+            {
+              label: "全部直接永久删除",
+              kind: "danger",
+              action: () => {
+                const target = pendingBatch;
+                setPendingBatch(null);
+                confirmBatch(target, "delete");
+              },
+            },
+          ]}
+        />
       )}
     </section>
   );
@@ -940,6 +971,7 @@ function SimilarPhotos({
   const [visible, setVisible] = useState(60);
   const [previewPath, setPreviewPath] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [pendingDelete, setPendingDelete] = useState(false);
   const shown = photos.slice(0, visible);
 
   function toggleSelection(path: string) {
@@ -951,17 +983,11 @@ function SimilarPhotos({
     });
   }
 
-  function deleteSelected() {
+  function removeSelected(mode: "trash" | "delete") {
     const paths = [...selected];
-    if (
-      !window.confirm(
-        `确定永久删除选中的 ${paths.length} 个文件吗？此操作不经过回收站，无法恢复。`,
-      )
-    ) {
-      return;
-    }
     void execute(async () => {
-      const result = await invoke<string>("delete_paths", { database, paths });
+      const command = mode === "trash" ? "trash_paths" : "delete_paths";
+      const result = await invoke<string>(command, { database, paths });
       setSelected(new Set());
       await refresh();
       return result;
@@ -973,14 +999,14 @@ function SimilarPhotos({
       <div className="section-head">
         <div>
           <h2>高置信度相似照片</h2>
-          <p>仅供人工查看。点击照片放大预览，勾选后可批量永久删除。</p>
+          <p>仅供人工查看。点击照片放大预览，勾选后可批量移入回收站或删除。</p>
         </div>
         <div className="head-actions">
           {selected.size > 0 && (
             <span className="pill">已选 {selected.size} 个</span>
           )}
           {selected.size > 0 && (
-            <button className="danger" disabled={busy} onClick={deleteSelected}>
+            <button className="danger" disabled={busy} onClick={() => setPendingDelete(true)}>
               删除选中文件
             </button>
           )}
@@ -1037,6 +1063,31 @@ function SimilarPhotos({
       )}
       {previewPath && (
         <PreviewModal path={previewPath} onClose={() => setPreviewPath(null)} />
+      )}
+      {pendingDelete && (
+        <ConfirmDialog
+          title={`处理选中的 ${selected.size} 个文件`}
+          detail="相似照片是视觉判断，可能包含误报；建议先逐张预览确认。"
+          busy={busy}
+          onClose={() => setPendingDelete(false)}
+          options={[
+            {
+              label: "移入回收站（可恢复）",
+              action: () => {
+                setPendingDelete(false);
+                removeSelected("trash");
+              },
+            },
+            {
+              label: "直接永久删除",
+              kind: "danger",
+              action: () => {
+                setPendingDelete(false);
+                removeSelected("delete");
+              },
+            },
+          ]}
+        />
       )}
     </section>
   );
@@ -1117,6 +1168,10 @@ function Trash({
   execute: (action: () => Promise<string>) => Promise<void>;
   refresh: () => Promise<void>;
 }) {
+  const [pendingEmpty, setPendingEmpty] = useState(false);
+  const [pendingPrune, setPendingPrune] = useState(false);
+  const [pendingItem, setPendingItem] = useState<TrashItem | null>(null);
+  const expiredCount = items.filter((item) => item.expired).length;
   return (
     <section className="panel trash-page">
       <div className="section-head">
@@ -1126,42 +1181,20 @@ function Trash({
         </div>
         <div className="head-actions">
           <span className="pill">{items.length} 个文件</span>
-          {items.some((item) => item.expired) && (
+          {expiredCount > 0 && (
             <button
               className="secondary"
               disabled={busy}
-              onClick={() =>
-                execute(async () => {
-                  const result = await invoke<string>("trash_prune_expired", {
-                    database,
-                  });
-                  await refresh();
-                  return result;
-                })
-              }
+              onClick={() => setPendingPrune(true)}
             >
-              清理过期文件（{items.filter((item) => item.expired).length}）
+              清理过期文件（{expiredCount}）
             </button>
           )}
           {items.length > 0 && (
             <button
               className="danger"
               disabled={busy}
-              onClick={() => {
-                if (
-                  window.confirm(
-                    `确定永久删除回收站中的 ${items.length} 个文件吗？此操作不可恢复。`,
-                  )
-                ) {
-                  void execute(async () => {
-                    const result = await invoke<string>("trash_empty", {
-                      database,
-                    });
-                    await refresh();
-                    return result;
-                  });
-                }
-              }}
+              onClick={() => setPendingEmpty(true)}
             >
               清空回收站
             </button>
@@ -1185,7 +1218,7 @@ function Trash({
                 <small>
                   移入时间：
                   {new Date(item.created_at * 1000).toLocaleString("zh-CN")}
-                  {item.expired && " · 已超过保留期，下次扫描将自动清理"}
+                  {item.expired && " · 已超过保留期"}
                 </small>
               </div>
               <div className="trash-actions">
@@ -1207,22 +1240,7 @@ function Trash({
                 <button
                   className="danger"
                   disabled={busy}
-                  onClick={() => {
-                    if (
-                      window.confirm(
-                        "确定永久删除该文件吗？删除后将无法再恢复。",
-                      )
-                    ) {
-                      void execute(async () => {
-                        const result = await invoke<string>("trash_delete", {
-                          database,
-                          operationId: item.id,
-                        });
-                        await refresh();
-                        return result;
-                      });
-                    }
-                  }}
+                  onClick={() => setPendingItem(item)}
                 >
                   永久删除
                 </button>
@@ -1230,6 +1248,87 @@ function Trash({
             </article>
           ))}
         </div>
+      )}
+      {pendingPrune && (
+        <ConfirmDialog
+          title={`清理 ${expiredCount} 个超期回收文件`}
+          detail="这些文件已超过保留期，清理后将永久删除、无法恢复。"
+          busy={busy}
+          onClose={() => setPendingPrune(false)}
+          options={[
+            {
+              label: "确认清理",
+              kind: "danger",
+              action: () => {
+                setPendingPrune(false);
+                void execute(async () => {
+                  const result = await invoke<string>("trash_prune_expired", {
+                    database,
+                  });
+                  await refresh();
+                  return result;
+                });
+              },
+            },
+          ]}
+        />
+      )}
+      {pendingEmpty && (
+        <ConfirmDialog
+          title="清空回收站"
+          detail={`回收站中的 ${items.length} 个文件将被永久删除，此操作不可恢复。`}
+          busy={busy}
+          onClose={() => setPendingEmpty(false)}
+          options={[
+            {
+              label: "永久删除全部",
+              kind: "danger",
+              action: () => {
+                setPendingEmpty(false);
+                void execute(async () => {
+                  const result = await invoke<string>("trash_empty", {
+                    database,
+                  });
+                  await refresh();
+                  return result;
+                });
+              },
+            },
+          ]}
+        />
+      )}
+      {pendingItem && (
+        <ConfirmDialog
+          title="永久删除该文件"
+          detail={
+            <>
+              {fileName(pendingItem.source_path)}
+              <br />
+              <small>{pendingItem.source_path}</small>
+            </>
+          }
+          note="删除后将无法再恢复。"
+          busy={busy}
+          onClose={() => setPendingItem(null)}
+          options={[
+            {
+              label: "永久删除",
+              kind: "danger",
+              action: () => {
+                const target = pendingItem;
+                setPendingItem(null);
+                void execute(async () => {
+                  const result = await invoke<string>("trash_delete", {
+                    database,
+                    operationId: target.id,
+                  });
+                  await refresh();
+                  return result;
+                });
+              },
+            },
+          ]}
+        />
       )}
     </section>
   );
@@ -1540,6 +1639,73 @@ function Empty({
     </div>
   );
 }
+
+type ConfirmOption = {
+  label: string;
+  kind?: "primary" | "secondary" | "danger";
+  action: () => void;
+};
+
+// Unified confirmation dialog: explicit cancel button (the only exit in the
+// earlier review dialogs was clicking the backdrop), Escape to close, and
+// ARIA roles. All destructive flows go through this component.
+function ConfirmDialog({
+  title,
+  detail,
+  note,
+  options,
+  busy,
+  onClose,
+}: {
+  title: string;
+  detail?: ReactNode;
+  note?: string;
+  options: ConfirmOption[];
+  busy: boolean;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  return (
+    <div className="modal-backdrop" onClick={onClose} role="presentation">
+      <div
+        className="modal modal-confirm"
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <h3>{title}</h3>
+        {detail && <p>{detail}</p>}
+        {note && <p className="modal-note">{note}</p>}
+        <div className="modal-actions-row">
+          {options.map((option) => (
+            <button
+              key={option.label}
+              className={option.kind ?? "secondary"}
+              disabled={busy}
+              onClick={option.action}
+            >
+              {option.label}
+            </button>
+          ))}
+          <button
+            className="text-button modal-cancel"
+            disabled={busy}
+            onClick={onClose}
+          >
+            取消
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 function formatBytes(bytes: number) {
   if (bytes < 1024) return `${bytes} B`;
   const units = ["KB", "MB", "GB", "TB"];
@@ -1592,9 +1758,22 @@ function PreviewModal({
       })
       .catch(() => setFailed(true));
   }, [path]);
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal" onClick={(event) => event.stopPropagation()}>
+    <div className="modal-backdrop" onClick={onClose} role="presentation">
+      <div
+        className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`预览 ${fileName(path)}`}
+        onClick={(event) => event.stopPropagation()}
+      >
         <div className="modal-head">
           <div>
             <b>{fileName(path)}</b>
@@ -1603,7 +1782,11 @@ function PreviewModal({
           <div className="modal-actions">
             <button
               className="secondary"
-              onClick={() => void executeInvoke("open_file", { path })}
+              onClick={() =>
+                void invoke("open_file", { path }).catch((error) =>
+                  console.error("open_file failed:", error),
+                )
+              }
             >
               用系统程序打开
             </button>
@@ -1623,10 +1806,6 @@ function PreviewModal({
       </div>
     </div>
   );
-}
-
-async function executeInvoke<T>(command: string, args: Record<string, unknown>): Promise<T> {
-  return invoke<T>(command, args);
 }
 
 function friendlyError(error: unknown) {
