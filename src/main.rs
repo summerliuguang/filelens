@@ -309,6 +309,7 @@ impl ScanErrorLog {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn scan_with_control(
     database: &Path,
     roots: &[PathBuf],
@@ -552,6 +553,7 @@ fn process_file(path: PathBuf) -> WorkResult {
 
 /// Walk one root, sending unchanged files straight to the writer and the rest
 /// to the hashing workers. Uses its own read-only view of the database.
+#[allow(clippy::too_many_arguments)]
 fn walk_root(
     database: &Path,
     root: &Path,
@@ -737,6 +739,7 @@ fn write_entry(
 
 /// Parallel scan pipeline for one root: a walker thread feeds hashing workers
 /// through a channel; the caller thread is the single database writer.
+#[allow(clippy::too_many_arguments)]
 fn run_parallel_scan(
     connection: &Connection,
     database: &Path,
@@ -1743,11 +1746,10 @@ pub fn export_report(database: &Path, output: &Path) -> Result<usize, String> {
         ));
         count += 1;
     }
-    if let Some(parent) = output.parent() {
-        if !parent.as_os_str().is_empty() {
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).map_err(|e| format!("create output directory: {e}"))?;
         }
-    }
     fs::write(output, csv).map_err(|e| format!("write report: {e}"))?;
     Ok(count)
 }
@@ -1851,7 +1853,7 @@ fn absolute_path(path: &Path) -> Result<PathBuf, String> {
     // Canonicalize so scan-root prefixes keep matching stored paths across
     // sessions (links, `.`, `..`); dunce keeps Windows paths free of the
     // `\\?\` verbatim prefix, which would break LIKE prefix matching.
-    dunce::canonicalize(&resolved).or_else(|_| Ok(resolved))
+    dunce::canonicalize(&resolved).or(Ok(resolved))
 }
 fn unix_seconds(time: SystemTime) -> Result<i64, String> {
     i64::try_from(

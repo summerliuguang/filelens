@@ -20,6 +20,10 @@ jobs:
         run: npm ci
       - name: Core library tests
         run: cargo test --lib
+      - name: Clippy (core library)
+        run: cargo clippy --lib -- -D warnings
+      - name: Clippy (command layer)
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
       - name: Frontend type check
         run: npx tsc --noEmit
       - name: Command layer check
