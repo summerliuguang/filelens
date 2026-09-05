@@ -651,12 +651,11 @@ fn thumbnail_cache_stats(app: tauri::AppHandle) -> Result<ThumbnailCacheStats, S
     let mut bytes = 0_u64;
     if let Ok(entries) = fs::read_dir(&directory) {
         for entry in entries.flatten() {
-            if let Ok(metadata) = entry.metadata() {
-                if metadata.is_file() {
+            if let Ok(metadata) = entry.metadata()
+                && metadata.is_file() {
                     files += 1;
                     bytes += metadata.len();
                 }
-            }
         }
     }
     Ok(ThumbnailCacheStats { files, bytes })

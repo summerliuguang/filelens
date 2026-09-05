@@ -433,6 +433,12 @@ export function Review({
                 </div>
               </div>
               <div className="hash">BLAKE3 {group.hash}</div>
+              {group.files.filter((file) => file.hardlinked).length >= 2 && (
+                <div className="hardlink-note">
+                  本组包含互为硬链接的文件名（同一物理文件的多个名字）：删除其中一个副本
+                  <b>不会释放磁盘空间</b>，恢复时也只会还原一个名字。
+                </div>
+              )}
               {group.files.filter((file) => !file.protected).length > 1 && (
                 <div className="smart-row">
                   <span>智能标记：</span>
@@ -477,6 +483,7 @@ export function Review({
                     </small>
                   </div>
                   {file.protected && <span className="protected">受保护</span>}
+                  {file.hardlinked && <span className="hardlinked">硬链接</span>}
                   <div className="file-actions">
                     {file.approved ? (
                       <>

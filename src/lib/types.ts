@@ -19,6 +19,8 @@ export type GroupFile = {
   protected: boolean;
   approved: boolean;
   modified: number;
+  /** Another group member shares this file's (dev, inode): removing it frees no space. */
+  hardlinked: boolean;
 };
 
 export type Group = { hash: string; size: number; files: GroupFile[] };

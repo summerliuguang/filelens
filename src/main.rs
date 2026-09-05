@@ -13,7 +13,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// Latest schema version this build understands. Older databases are
 /// upgraded stepwise through MIGRATIONS on open; newer ones are rejected so a
 /// downgrade can never misread an unknown schema.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const COPY_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const QUICK_HASH_CHUNK: u64 = 64 * 1024;
 /// Files above this size get the two-stage hash: quick fingerprint first,
@@ -26,6 +26,10 @@ const MIGRATIONS: &[&str] = &[
     // v1 -> v2: quick fingerprint column for the two-stage large-file hash.
     "ALTER TABLE files ADD COLUMN quick_hash TEXT;
      CREATE INDEX IF NOT EXISTS files_size_quick_hash ON files(size, quick_hash);",
+    // v2 -> v3: device/inode pair for hardlink detection (0/0 on platforms
+    // without POSIX metadata, where the feature degrades to "unknown").
+    "ALTER TABLE files ADD COLUMN dev INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE files ADD COLUMN inode INTEGER NOT NULL DEFAULT 0;",
 ];
 
 fn create_schema_sql() -> &'static str {
@@ -40,7 +44,9 @@ fn create_schema_sql() -> &'static str {
        approved INTEGER NOT NULL DEFAULT 0,
        present INTEGER NOT NULL DEFAULT 1,
        scanned_at INTEGER NOT NULL,
-       quick_hash TEXT
+       quick_hash TEXT,
+       dev INTEGER NOT NULL DEFAULT 0,
+       inode INTEGER NOT NULL DEFAULT 0
      );
      CREATE INDEX IF NOT EXISTS files_hash_size_present ON files(hash, size, present);
      CREATE INDEX IF NOT EXISTS files_size_quick_hash ON files(size, quick_hash);
@@ -493,8 +499,28 @@ struct ProcessedEntry {
     /// above the quick threshold whose full hash was deferred; `hash` is then
     /// empty until the writer promotes the entry to a full hash.
     quick_hash: Option<String>,
+    /// POSIX device/inode pair identifying the physical file; (0, 0) where
+    /// the platform has no such metadata.
+    dev: i64,
+    inode: i64,
     photo: Option<u64>,
     document: Option<(u64, i64)>,
+}
+
+/// POSIX identity of a file for hardlink detection; (0, 0) on platforms
+/// without `MetadataExt`, where hardlink marking stays off.
+#[cfg(unix)]
+fn device_inode(metadata: &fs::Metadata) -> (i64, i64) {
+    use std::os::unix::fs::MetadataExt;
+    (
+        i64::try_from(metadata.dev()).unwrap_or(0),
+        i64::try_from(metadata.ino()).unwrap_or(0),
+    )
+}
+
+#[cfg(not(unix))]
+fn device_inode(_metadata: &fs::Metadata) -> (i64, i64) {
+    (0, 0)
 }
 
 enum WorkResult {
@@ -535,12 +561,15 @@ fn process_file(path: PathBuf) -> WorkResult {
         }
         let photo = perceptual_hash(&path);
         let document = document_simhash(&path);
+        let (dev, inode) = device_inode(&metadata);
         Ok(ProcessedEntry {
             path_text: path_text.clone(),
             size,
             modified,
             hash,
             quick_hash,
+            dev,
+            inode,
             photo,
             document,
         })
@@ -693,9 +722,9 @@ fn write_entry(
         IndexOutcome::New
     };
     connection.execute(
-        "INSERT INTO files(path,size,modified,hash,protected,approved,present,scanned_at,quick_hash) VALUES(?1,?2,?3,?4,?5,0,1,?6,?7)
-         ON CONFLICT(path) DO UPDATE SET size=excluded.size,modified=excluded.modified,hash=excluded.hash,protected=excluded.protected,approved=0,present=1,scanned_at=excluded.scanned_at,quick_hash=excluded.quick_hash",
-        params![entry.path_text, entry.size, entry.modified, entry.hash, is_protected as i64, now, entry.quick_hash],
+        "INSERT INTO files(path,size,modified,hash,protected,approved,present,scanned_at,quick_hash,dev,inode) VALUES(?1,?2,?3,?4,?5,0,1,?6,?7,?8,?9)
+         ON CONFLICT(path) DO UPDATE SET size=excluded.size,modified=excluded.modified,hash=excluded.hash,protected=excluded.protected,approved=0,present=1,scanned_at=excluded.scanned_at,quick_hash=excluded.quick_hash,dev=excluded.dev,inode=excluded.inode",
+        params![entry.path_text, entry.size, entry.modified, entry.hash, is_protected as i64, now, entry.quick_hash, entry.dev, entry.inode],
     )
     .map_err(|e| e.to_string())?;
     connection.execute(
@@ -1504,6 +1533,10 @@ pub struct GroupFile {
     pub protected: bool,
     pub approved: bool,
     pub modified: i64,
+    /// True when another member of the same group shares this file's
+    /// (device, inode): the "duplicate" is another name for the same physical
+    /// file, so removing it frees no space.
+    pub hardlinked: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -1568,7 +1601,9 @@ fn query_groups_with(connection: &Connection, query: &GroupQuery) -> Result<Grou
         .map_err(|e| e.to_string())?;
     drop(statement);
 
-    let mut members: HashMap<(String, i64), Vec<GroupFile>> = HashMap::new();
+    /// Group member plus its (device, inode) identity for hardlink marking.
+    type MemberRow = (GroupFile, i64, i64);
+    let mut members: HashMap<(String, i64), Vec<MemberRow>> = HashMap::new();
     if !keys.is_empty() {
         let mut conditions = String::new();
         let mut values: Vec<rusqlite::types::Value> = Vec::new();
@@ -1582,7 +1617,7 @@ fn query_groups_with(connection: &Connection, query: &GroupQuery) -> Result<Grou
         }
         let mut statement = connection
             .prepare(&format!(
-                "SELECT hash,size,id,path,protected,approved,modified FROM files \
+                "SELECT hash,size,id,path,protected,approved,modified,dev,inode FROM files \
                  WHERE present=1 AND ({conditions}) ORDER BY path"
             ))
             .map_err(|e| e.to_string())?;
@@ -1596,20 +1631,37 @@ fn query_groups_with(connection: &Connection, query: &GroupQuery) -> Result<Grou
                     protected: row.get::<_, i64>(4)? != 0,
                     approved: row.get::<_, i64>(5)? != 0,
                     modified: row.get(6)?,
+                    hardlinked: false,
                 };
-                Ok((hash, size, file))
+                Ok((hash, size, file, row.get::<_, i64>(7)?, row.get::<_, i64>(8)?))
             })
             .map_err(|e| e.to_string())?;
         for row in rows {
-            let (hash, size, file) = row.map_err(|e| e.to_string())?;
-            members.entry((hash, size)).or_default().push(file);
+            let (hash, size, file, dev, inode) = row.map_err(|e| e.to_string())?;
+            members.entry((hash, size)).or_default().push((file, dev, inode));
         }
     }
 
     let groups = keys
         .into_iter()
         .map(|(hash, size)| {
-            let files = members.remove(&(hash.clone(), size)).unwrap_or_default();
+            let members = members.remove(&(hash.clone(), size)).unwrap_or_default();
+            // A (dev, inode) pair appearing twice inside one group means two
+            // of the "duplicates" are names for the same physical file.
+            let mut identities: HashMap<(i64, i64), usize> = HashMap::new();
+            for (_, dev, inode) in &members {
+                if *dev != 0 || *inode != 0 {
+                    *identities.entry((*dev, *inode)).or_default() += 1;
+                }
+            }
+            let files = members
+                .into_iter()
+                .map(|(mut file, dev, inode)| {
+                    file.hardlinked =
+                        identities.get(&(dev, inode)).copied().unwrap_or(0) > 1;
+                    file
+                })
+                .collect();
             Group { hash, size, files }
         })
         .collect();
@@ -2379,7 +2431,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_database_migrates_to_v2_preserving_data() {
+    fn v1_database_migrates_to_current_preserving_data() {
         let directory = test_directory("migration-v1-v2");
         let database = directory.join("index.db");
         // Build a hand-rolled v1 database: pre-quick_hash schema with data.
@@ -2431,14 +2483,18 @@ mod tests {
         .unwrap();
 
         let connection = open_database(&database).unwrap();
-        let version: String = connection
+        let version: i64 = connection
             .query_row(
                 "SELECT value FROM settings WHERE key='schema_version'",
                 [],
-                |row| row.get(0),
+                |row| row.get::<_, String>(0),
             )
+            .unwrap()
+            .parse()
             .unwrap();
-        assert_eq!(version, "2");
+        // Stepwise migrations carry the old database all the way to the
+        // current schema version, not just the next one.
+        assert_eq!(version, SCHEMA_VERSION);
         let (rows, hashed): (i64, String) = connection
             .query_row(
                 "SELECT COUNT(*), COALESCE(MAX(hash),'') FROM files WHERE path='/data/keep.txt'",
@@ -2563,6 +2619,125 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(hash_of("pair,1.txt"), hash_of("pair,2.txt"));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn hardlinked_names_are_marked_in_groups() {
+        let directory = test_directory("hardlinks");
+        let source = directory.join("source");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&source).unwrap();
+        let database = directory.join("index.db");
+
+        // link-a/link-b are two names for one physical file; copy-a/copy-b
+        // are genuine duplicates sharing only content.
+        fs::write(source.join("link-a.txt"), b"same inode").unwrap();
+        fs::hard_link(source.join("link-a.txt"), source.join("link-b.txt")).unwrap();
+        fs::write(source.join("copy-a.txt"), b"same content").unwrap();
+        fs::write(source.join("copy-b.txt"), b"same content").unwrap();
+
+        init(&database, &recycle).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+
+        let groups = query_groups(
+            &database,
+            &GroupQuery {
+                min_size: 0,
+                path_contains: None,
+                sort: GroupSort::Path,
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(groups.groups.len(), 2);
+        let link_group = groups
+            .groups
+            .iter()
+            .find(|group| group.files[0].path.contains("link-a"))
+            .unwrap();
+        assert!(link_group.files.iter().all(|file| file.hardlinked));
+        let copy_group = groups
+            .groups
+            .iter()
+            .find(|group| group.files[0].path.contains("copy-a"))
+            .unwrap();
+        assert!(copy_group.files.iter().all(|file| !file.hardlinked));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn v2_database_migrates_to_v3_preserving_data() {
+        let directory = test_directory("migration-v2-v3");
+        let database = directory.join("index.db");
+        // Hand-rolled v2 database: pre-dev/inode schema with a data row.
+        let connection = open_database(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE files (
+                   id INTEGER PRIMARY KEY,
+                   path TEXT NOT NULL UNIQUE,
+                   size INTEGER NOT NULL,
+                   modified INTEGER NOT NULL,
+                   hash TEXT NOT NULL,
+                   protected INTEGER NOT NULL DEFAULT 0,
+                   approved INTEGER NOT NULL DEFAULT 0,
+                   present INTEGER NOT NULL DEFAULT 1,
+                   scanned_at INTEGER NOT NULL,
+                   quick_hash TEXT
+                 );
+                 CREATE TABLE operations (
+                   id INTEGER PRIMARY KEY,
+                   file_id INTEGER NOT NULL,
+                   source_path TEXT NOT NULL,
+                   trash_path TEXT NOT NULL,
+                   hash TEXT NOT NULL,
+                   state TEXT NOT NULL,
+                   created_at INTEGER NOT NULL,
+                   restored_at INTEGER
+                 );
+                 INSERT INTO settings(key,value) VALUES('schema_version','2');
+                 INSERT INTO settings(key,value) VALUES('trash_path','/tmp/recycle');
+                 INSERT INTO files(path,size,modified,hash,scanned_at)
+                   VALUES('/data/keep.txt',42,100,'deadbeef',100);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let _ = query_groups(
+            &database,
+            &GroupQuery {
+                min_size: 0,
+                path_contains: None,
+                sort: GroupSort::Size,
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .unwrap();
+
+        let connection = open_database(&database).unwrap();
+        let version: i64 = connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(version, 3);
+        let row: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE dev=0 AND inode=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(row, 1);
+        drop(connection);
         let _ = fs::remove_dir_all(directory);
     }
 
