@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   ConfirmDialog,
   Empty,
@@ -808,6 +808,19 @@ function Review({
     }, "batch");
   }
 
+  async function exportReport() {
+    const target = await save({
+      title: "导出重复文件报告",
+      defaultPath: "filelens-report.csv",
+      filters: [{ name: "CSV", extensions: ["csv"] }],
+    });
+    if (!target) return;
+    await execute(
+      () => invoke<string>("export_report", { database, path: target }),
+      "export",
+    );
+  }
+
   return (
     <section className="panel review-page">
       <div className="section-head">
@@ -819,6 +832,17 @@ function Review({
         </div>
         <span className="pill">{totalGroups} 个组</span>
       </div>
+      {totalGroups > 0 && (
+        <div className="report-bar">
+          <button
+            className="secondary"
+            disabled={busyKeys.has("export")}
+            onClick={() => void exportReport()}
+          >
+            导出报告（CSV）
+          </button>
+        </div>
+      )}
       <div className="filter-bar">
         <input
           value={searchInput}
@@ -1364,6 +1388,16 @@ function DocumentInfo({
   return (
     <div className="document-info">
       <PhotoInfo path={path} size={size} modified={modified} />
+      <button
+        className="secondary"
+        onClick={() =>
+          void invoke("reveal_in_manager", { path }).catch((error) =>
+            console.error("reveal_in_manager failed:", error),
+          )
+        }
+      >
+        定位
+      </button>
       <button
         className="secondary"
         onClick={() =>

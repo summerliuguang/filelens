@@ -146,6 +146,16 @@ export function PreviewModal({
             <button
               className="secondary"
               onClick={() =>
+                void invoke("reveal_in_manager", { path }).catch((error) =>
+                  console.error("reveal_in_manager failed:", error),
+                )
+              }
+            >
+              定位
+            </button>
+            <button
+              className="secondary"
+              onClick={() =>
                 void invoke("open_file", { path }).catch((error) =>
                   console.error("open_file failed:", error),
                 )

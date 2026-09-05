@@ -597,6 +597,37 @@ fn restore(database: String, operation_id: i64) -> Result<String, String> {
     filelens::restore(&PathBuf::from(database), operation_id).map(|_| "文件已恢复至原位置。".into())
 }
 
+#[tauri::command]
+fn export_report(database: String, path: String) -> Result<String, String> {
+    let rows = filelens::export_report(&PathBuf::from(&database), &PathBuf::from(&path))?;
+    Ok(format!("已导出 {rows} 条重复记录到 {}", path))
+}
+
+#[tauri::command]
+fn reveal_in_manager(path: String) -> Result<String, String> {
+    let target = PathBuf::from(&path);
+    if !target.exists() {
+        return Err("文件不存在或已删除".into());
+    }
+    #[cfg(target_os = "windows")]
+    let result = {
+        // explorer /select, expects backslash separators.
+        let windows_path = path.replace('/', "\\");
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{windows_path}"))
+            .spawn()
+    };
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").args(["-R", &path]).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = std::process::Command::new("xdg-open")
+        .arg(target.parent().unwrap_or(&target))
+        .spawn();
+    result
+        .map(|_| "已在文件管理器中定位。".into())
+        .map_err(|error| format!("打开文件管理器失败：{error}"))
+}
+
 #[derive(Serialize)]
 struct ThumbnailCacheStats {
     files: u64,
@@ -1020,6 +1051,8 @@ fn main() {
             image_thumbnail,
             thumbnail_cache_stats,
             thumbnail_cache_clear,
+            export_report,
+            reveal_in_manager,
             restore,
             trash_list
         ])

@@ -135,6 +135,11 @@ enum Command {
     Status { database: PathBuf },
     /// Print files currently available in the application recycle bin.
     TrashList { database: PathBuf },
+    /// Export the current duplicate groups as a CSV report.
+    Export {
+        database: PathBuf,
+        output: PathBuf,
+    },
 }
 
 #[derive(Debug)]
@@ -177,6 +182,11 @@ fn run() -> Result<(), String> {
         } => restore(&database, operation_id),
         Command::Status { database } => status(&database),
         Command::TrashList { database } => trash_list(&database),
+        Command::Export { database, output } => {
+            let rows = export_report(&database, &output)?;
+            println!("Exported {rows} rows to {}", output.display());
+            Ok(())
+        }
     }
 }
 
@@ -1692,8 +1702,68 @@ pub fn trash_list(database: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn file_by_id(connection: &Connection, id: i64) -> Result<Option<IndexedFile>, String> {
-    connection
+/// Export every member of the currently indexed duplicate groups as CSV for
+/// record keeping before a cleanup. Returns the number of data rows written.
+pub fn export_report(database: &Path, output: &Path) -> Result<usize, String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT f.hash, f.path, f.size, f.modified, f.approved \
+             FROM files f \
+             JOIN (SELECT hash, size FROM files WHERE present=1 GROUP BY hash, size HAVING COUNT(*) > 1) d \
+               ON d.hash = f.hash AND d.size = f.size \
+             WHERE f.present=1 \
+             ORDER BY f.hash, f.path",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)? != 0,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut csv = String::from("hash,path,size,modified,approved\n");
+    let mut count = 0_usize;
+    for row in rows {
+        let (hash, path, size, modified, approved) = row.map_err(|e| e.to_string())?;
+        csv.push_str(&format!(
+            "{},{},{},{},{}\n",
+            hash,
+            csv_field(&path),
+            size,
+            modified,
+            approved
+        ));
+        count += 1;
+    }
+    if let Some(parent) = output.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| format!("create output directory: {e}"))?;
+        }
+    }
+    fs::write(output, csv).map_err(|e| format!("write report: {e}"))?;
+    Ok(count)
+}
+
+/// RFC 4180 quoting: fields containing commas, quotes or newlines get wrapped
+/// in quotes with embedded quotes doubled.
+fn csv_field(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r')
+    {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn file_by_id(connection: &Connection, id: i64) -> Result<Option<IndexedFile>, String> {    connection
         .query_row(
             "SELECT id,path,size,hash,protected,approved FROM files WHERE id=?1 AND present=1",
             params![id],
@@ -2446,6 +2516,51 @@ mod tests {
             .expect("lone pair must group after its twin arrives");
         assert_eq!(lone.files.len(), 2);
         assert!(!lone.hash.starts_with("q:"));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn export_report_writes_csv_of_duplicate_members() {
+        let directory = test_directory("export-report");
+        let source = directory.join("source");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("a.txt"), b"same content").unwrap();
+        fs::write(source.join("b.txt"), b"same content").unwrap();
+        // Unique and comma-bearing names: only the quoted pair appears, and
+        // the comma path survives the round-trip.
+        fs::write(source.join("unique.txt"), b"one of a kind").unwrap();
+        fs::write(source.join("pair,1.txt"), b"quoted pair").unwrap();
+        fs::write(source.join("pair,2.txt"), b"quoted pair").unwrap();
+        let database = directory.join("index.db");
+
+        init(&database, &recycle).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        let output = directory.join("reports").join("report.csv");
+        let rows = export_report(&database, &output).unwrap();
+        assert_eq!(rows, 4);
+
+        let csv = fs::read_to_string(&output).unwrap();
+        let mut lines = csv.lines();
+        assert_eq!(lines.next().unwrap(), "hash,path,size,modified,approved");
+        let mut body = lines.collect::<Vec<_>>();
+        body.sort();
+        assert_eq!(body.len(), 4);
+        assert!(body.iter().any(|line| line.contains("pair,1.txt")));
+        assert!(body.iter().any(|line| line.contains("pair,2.txt")));
+        // Comma paths are RFC 4180 quoted: the whole path sits in quotes.
+        assert!(body
+            .iter()
+            .filter(|line| line.contains("pair,1.txt"))
+            .all(|line| line.contains(",\"")));
+        assert!(!body.iter().any(|line| line.contains("unique.txt")));
+        let hash_of = |name: &str| {
+            body.iter()
+                .find(|line| line.contains(name))
+                .map(|line| line.split(',').next().unwrap().to_string())
+                .unwrap()
+        };
+        assert_eq!(hash_of("pair,1.txt"), hash_of("pair,2.txt"));
         let _ = fs::remove_dir_all(directory);
     }
 

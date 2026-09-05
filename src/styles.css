@@ -637,6 +637,13 @@ h3 {
 .page-layer.page-active {
   display: block;
 }
+.report-bar {
+  margin-top: 4px;
+}
+.report-bar button {
+  padding: 5px 12px;
+  font-size: 0.8rem;
+}
 .cache-panel {
   display: flex;
   align-items: center;
