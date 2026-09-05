@@ -10,8 +10,70 @@ use std::{
 use clap::{Parser, Subcommand};
 use rusqlite::{Connection, OptionalExtension, params};
 
-const SCHEMA_VERSION: i64 = 1;
+/// Latest schema version this build understands. Older databases are
+/// upgraded stepwise through MIGRATIONS on open; newer ones are rejected so a
+/// downgrade can never misread an unknown schema.
+const SCHEMA_VERSION: i64 = 2;
 const COPY_BUFFER_SIZE: usize = 8 * 1024 * 1024;
+const QUICK_HASH_CHUNK: u64 = 64 * 1024;
+/// Files above this size get the two-stage hash: quick fingerprint first,
+/// full BLAKE3 only if a same-(size, quick) sibling shows up.
+const LARGE_FILE_QUICK_THRESHOLD: u64 = 16 * 1024 * 1024;
+
+/// Stepwise schema upgrades: entry N upgrades a version-N database to N+1.
+/// Each runs inside a transaction with its schema_version bump.
+const MIGRATIONS: &[&str] = &[
+    // v1 -> v2: quick fingerprint column for the two-stage large-file hash.
+    "ALTER TABLE files ADD COLUMN quick_hash TEXT;
+     CREATE INDEX IF NOT EXISTS files_size_quick_hash ON files(size, quick_hash);",
+];
+
+fn create_schema_sql() -> &'static str {
+    "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+     CREATE TABLE IF NOT EXISTS files (
+       id INTEGER PRIMARY KEY,
+       path TEXT NOT NULL UNIQUE,
+       size INTEGER NOT NULL,
+       modified INTEGER NOT NULL,
+       hash TEXT NOT NULL,
+       protected INTEGER NOT NULL DEFAULT 0,
+       approved INTEGER NOT NULL DEFAULT 0,
+       present INTEGER NOT NULL DEFAULT 1,
+       scanned_at INTEGER NOT NULL,
+       quick_hash TEXT
+     );
+     CREATE INDEX IF NOT EXISTS files_hash_size_present ON files(hash, size, present);
+     CREATE INDEX IF NOT EXISTS files_size_quick_hash ON files(size, quick_hash);
+     CREATE TABLE IF NOT EXISTS photo_fingerprints (
+       file_id INTEGER PRIMARY KEY,
+       dhash INTEGER NOT NULL,
+       part_a INTEGER NOT NULL,
+       part_b INTEGER NOT NULL,
+       part_c INTEGER NOT NULL,
+       part_d INTEGER NOT NULL,
+       part_e INTEGER NOT NULL,
+       FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+     );
+     CREATE INDEX IF NOT EXISTS photo_fingerprints_parts ON photo_fingerprints(part_a, part_b, part_c, part_d, part_e);
+     CREATE TABLE IF NOT EXISTS document_fingerprints (
+       file_id INTEGER PRIMARY KEY,
+       simhash INTEGER NOT NULL,
+       token_count INTEGER NOT NULL,
+       FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+     );
+     CREATE INDEX IF NOT EXISTS document_fingerprints_hash ON document_fingerprints(simhash);
+     CREATE TABLE IF NOT EXISTS operations (
+       id INTEGER PRIMARY KEY,
+       file_id INTEGER NOT NULL,
+       source_path TEXT NOT NULL,
+       trash_path TEXT NOT NULL,
+       hash TEXT NOT NULL,
+       state TEXT NOT NULL,
+       created_at INTEGER NOT NULL,
+       restored_at INTEGER,
+       FOREIGN KEY(file_id) REFERENCES files(id)
+     );"
+}
 
 #[derive(Parser)]
 #[command(
@@ -133,50 +195,7 @@ pub fn init(database: &Path, trash: &Path) -> Result<(), String> {
     fs::create_dir_all(trash).map_err(|e| format!("create recycle bin: {e}"))?;
     let connection = open_database(database)?;
     connection
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-         CREATE TABLE IF NOT EXISTS files (
-           id INTEGER PRIMARY KEY,
-           path TEXT NOT NULL UNIQUE,
-           size INTEGER NOT NULL,
-           modified INTEGER NOT NULL,
-           hash TEXT NOT NULL,
-           protected INTEGER NOT NULL DEFAULT 0,
-           approved INTEGER NOT NULL DEFAULT 0,
-           present INTEGER NOT NULL DEFAULT 1,
-           scanned_at INTEGER NOT NULL
-         );
-         CREATE INDEX IF NOT EXISTS files_hash_size_present ON files(hash, size, present);
-         CREATE TABLE IF NOT EXISTS photo_fingerprints (
-           file_id INTEGER PRIMARY KEY,
-           dhash INTEGER NOT NULL,
-           part_a INTEGER NOT NULL,
-           part_b INTEGER NOT NULL,
-           part_c INTEGER NOT NULL,
-           part_d INTEGER NOT NULL,
-           part_e INTEGER NOT NULL,
-           FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
-         );
-         CREATE INDEX IF NOT EXISTS photo_fingerprints_parts ON photo_fingerprints(part_a, part_b, part_c, part_d, part_e);
-         CREATE TABLE IF NOT EXISTS document_fingerprints (
-           file_id INTEGER PRIMARY KEY,
-           simhash INTEGER NOT NULL,
-           token_count INTEGER NOT NULL,
-           FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
-         );
-         CREATE INDEX IF NOT EXISTS document_fingerprints_hash ON document_fingerprints(simhash);
-         CREATE TABLE IF NOT EXISTS operations (
-           id INTEGER PRIMARY KEY,
-           file_id INTEGER NOT NULL,
-           source_path TEXT NOT NULL,
-           trash_path TEXT NOT NULL,
-           hash TEXT NOT NULL,
-           state TEXT NOT NULL,
-           created_at INTEGER NOT NULL,
-           restored_at INTEGER,
-           FOREIGN KEY(file_id) REFERENCES files(id)
-         );",
-        )
+        .execute_batch(create_schema_sql())
         .map_err(|e| format!("create schema: {e}"))?;
     set_setting(&connection, "schema_version", &SCHEMA_VERSION.to_string())?;
     set_setting(
@@ -459,6 +478,10 @@ struct ProcessedEntry {
     size: i64,
     modified: i64,
     hash: String,
+    /// BLAKE3 over the first QUICK_HASH_CHUNK bytes, present only for files
+    /// above the quick threshold whose full hash was deferred; `hash` is then
+    /// empty until the writer promotes the entry to a full hash.
+    quick_hash: Option<String>,
     photo: Option<u64>,
     document: Option<(u64, i64)>,
 }
@@ -484,7 +507,15 @@ fn process_file(path: PathBuf) -> WorkResult {
         let size =
             i64::try_from(metadata.len()).map_err(|_| "file is too large".to_string())?;
         let modified = unix_seconds(metadata.modified().map_err(|e| e.to_string())?)?;
-        let hash = hash_file(&path)?;
+        // Large files only pay for the quick fingerprint here; the full hash
+        // is deferred until the writer finds a same-(size, quick) sibling,
+        // so same-size archives/videos with different content never get read
+        // in full.
+        let (hash, quick_hash) = if size as u64 > LARGE_FILE_QUICK_THRESHOLD {
+            (String::new(), Some(quick_hash_file(&path)?))
+        } else {
+            (hash_file(&path)?, None)
+        };
         let after = fs::metadata(&path).map_err(|e| e.to_string())?;
         if after.len() != metadata.len()
             || unix_seconds(after.modified().map_err(|e| e.to_string())?)? != modified
@@ -498,6 +529,7 @@ fn process_file(path: PathBuf) -> WorkResult {
             size,
             modified,
             hash,
+            quick_hash,
             photo,
             document,
         })
@@ -649,9 +681,9 @@ fn write_entry(
         IndexOutcome::New
     };
     connection.execute(
-        "INSERT INTO files(path,size,modified,hash,protected,approved,present,scanned_at) VALUES(?1,?2,?3,?4,?5,0,1,?6)
-         ON CONFLICT(path) DO UPDATE SET size=excluded.size,modified=excluded.modified,hash=excluded.hash,protected=excluded.protected,approved=0,present=1,scanned_at=excluded.scanned_at",
-        params![entry.path_text, entry.size, entry.modified, entry.hash, is_protected as i64, now],
+        "INSERT INTO files(path,size,modified,hash,protected,approved,present,scanned_at,quick_hash) VALUES(?1,?2,?3,?4,?5,0,1,?6,?7)
+         ON CONFLICT(path) DO UPDATE SET size=excluded.size,modified=excluded.modified,hash=excluded.hash,protected=excluded.protected,approved=0,present=1,scanned_at=excluded.scanned_at,quick_hash=excluded.quick_hash",
+        params![entry.path_text, entry.size, entry.modified, entry.hash, is_protected as i64, now, entry.quick_hash],
     )
     .map_err(|e| e.to_string())?;
     connection.execute(
@@ -737,6 +769,11 @@ fn run_parallel_scan(
             })
         };
         drop(work_tx);
+        // Large-file entries waiting for a same-(size, quick) sibling before
+        // paying for a full hash. Every bucket here holds at most one entry:
+        // a second arrival promotes and removes the whole bucket.
+        let mut pending: std::collections::HashMap<(i64, String), ProcessedEntry> =
+            std::collections::HashMap::new();
         for _ in 0..worker_count {
             let work_rx = work_rx.clone();
             let result_tx = result_tx.clone();
@@ -785,11 +822,52 @@ fn run_parallel_scan(
                         log.record(&path, "directory unreadable");
                     }
                 }
-                WorkResult::Processed(Ok(entry)) => match write_entry(connection, &entry, protect)? {
-                    IndexOutcome::New => counters.new += 1,
-                    IndexOutcome::Updated => counters.updated += 1,
-                    IndexOutcome::Unchanged => counters.unchanged += 1,
-                },
+                WorkResult::Processed(Ok(entry)) => {
+                    if entry.quick_hash.is_none() {
+                        match write_entry(connection, &entry, protect)? {
+                            IndexOutcome::New => counters.new += 1,
+                            IndexOutcome::Updated => counters.updated += 1,
+                            IndexOutcome::Unchanged => counters.unchanged += 1,
+                        }
+                    } else {
+                        let quick = entry.quick_hash.clone().expect("checked above");
+                        let key = (entry.size, quick.clone());
+                        // A pending sibling or an indexed row sharing the
+                        // (size, quick) bucket means a real duplicate is
+                        // plausible: promote everything to full hashes.
+                        let has_pending = pending.contains_key(&key);
+                        let has_indexed = !has_pending
+                            && connection
+                                .query_row(
+                                    "SELECT 1 FROM files WHERE size=?1 AND quick_hash=?2 AND path<>?3 LIMIT 1",
+                                    params![entry.size, quick, entry.path_text],
+                                    |_| Ok(()),
+                                )
+                                .optional()
+                                .map_err(|e| e.to_string())?
+                                .is_some();
+                        if has_pending || has_indexed {
+                            let mut bucket = vec![entry];
+                            if let Some(sibling) = pending.remove(&key) {
+                                bucket.push(sibling);
+                            }
+                            for mut promoted in bucket {
+                                promoted.hash = hash_file(Path::new(&promoted.path_text))?;
+                                match write_entry(connection, &promoted, protect)? {
+                                    IndexOutcome::New => counters.new += 1,
+                                    IndexOutcome::Updated => counters.updated += 1,
+                                    IndexOutcome::Unchanged => counters.unchanged += 1,
+                                }
+                            }
+                            // Indexed rows promoted in an earlier scan still
+                            // carry their quick marker; refresh them so a
+                            // newly found twin groups under the real hash.
+                            refresh_quick_hash_rows(connection, key.0, &quick)?;
+                        } else {
+                            pending.insert(key, entry);
+                        }
+                    }
+                }
                 WorkResult::Processed(Err((path, error))) => {
                     eprintln!("warning: {path}: {error}");
                     counters.errors += 1;
@@ -808,8 +886,55 @@ fn run_parallel_scan(
                 current.as_deref(),
             );
         }
+        // Remaining pending entries never found a sibling: unique for now.
+        // Store the quick fingerprint as a marked hash so they cannot be
+        // mistaken for BLAKE3 duplicates; if a twin appears in a later scan
+        // the promotion path refreshes both rows with real hashes.
+        for (_, entry) in pending {
+            let mut unique = entry;
+            unique.hash = format!(
+                "q:{}",
+                unique.quick_hash.clone().expect("pending entries are quick-hashed")
+            );
+            match write_entry(connection, &unique, protect)? {
+                IndexOutcome::New => counters.new += 1,
+                IndexOutcome::Updated => counters.updated += 1,
+                IndexOutcome::Unchanged => counters.unchanged += 1,
+            }
+        }
         walker.join().map_err(|_| "scan worker panicked".to_string())?
     })?;
+    Ok(())
+}
+
+// Rows promoted in an earlier scan still carry the "q:<quick>" marker until a
+// same-bucket twin shows up; re-hash them with real BLAKE3 so the marker
+// never splits what is actually one duplicate group.
+fn refresh_quick_hash_rows(
+    connection: &Connection,
+    size: i64,
+    quick: &str,
+) -> Result<(), String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT path FROM files WHERE size=?1 AND quick_hash=?2 AND hash LIKE 'q:%'",
+        )
+        .map_err(|e| e.to_string())?;
+    let paths = statement
+        .query_map(params![size, quick], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    drop(statement);
+    for path in paths {
+        let hash = hash_file(Path::new(&path))?;
+        connection
+            .execute(
+                "UPDATE files SET hash=?1 WHERE path=?2",
+                params![hash, path],
+            )
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -847,6 +972,26 @@ fn hash_file(path: &Path) -> Result<String, String> {
             break;
         }
         hasher.update(&buffer[..count]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Quick fingerprint over the first QUICK_HASH_CHUNK bytes: cheap identity
+/// for same-size bucketing. Two files with equal (size, quick hash) still get
+/// full hashes before they can be reported as duplicates.
+fn quick_hash_file(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|e| e.to_string())?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; 4096];
+    let mut remaining = QUICK_HASH_CHUNK;
+    while remaining > 0 {
+        let want = remaining.min(buffer.len() as u64) as usize;
+        let count = file.read(&mut buffer[..want]).map_err(|e| e.to_string())?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        remaining -= count as u64;
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
@@ -1594,8 +1739,24 @@ fn required_setting(connection: &Connection, key: &str) -> Result<String, String
 }
 fn ensure_initialized(connection: &Connection) -> Result<(), String> {
     let version = required_setting(connection, "schema_version")?;
-    if version.parse::<i64>().ok() != Some(SCHEMA_VERSION) {
+    let version = version
+        .parse::<i64>()
+        .map_err(|_| format!("invalid schema version: {version}"))?;
+    if version > SCHEMA_VERSION {
         return Err(format!("unsupported schema version: {version}"));
+    }
+    // Stepwise, transactional upgrades; each entry bumps the stored version
+    // so an interrupted migration resumes instead of replaying.
+    for (index, migration) in MIGRATIONS.iter().enumerate() {
+        let target = index as i64 + 2; // migration N upgrades N+1 -> N+2
+        if version < target {
+            connection
+                .execute_batch(&format!(
+                    "BEGIN; {migration} UPDATE settings SET value='{target}' \
+                     WHERE key='schema_version'; COMMIT;"
+                ))
+                .map_err(|e| format!("schema migration to v{target} failed: {e}"))?;
+        }
     }
     // Cover the trash/history orderings. `IF NOT EXISTS` keeps this idempotent
     // so databases created before the indexes existed pick them up on open.
@@ -2142,6 +2303,149 @@ mod tests {
         )
         .unwrap();
         assert_eq!(groups.groups.len(), 1);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn v1_database_migrates_to_v2_preserving_data() {
+        let directory = test_directory("migration-v1-v2");
+        let database = directory.join("index.db");
+        // Build a hand-rolled v1 database: pre-quick_hash schema with data.
+        let connection = open_database(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE files (
+                   id INTEGER PRIMARY KEY,
+                   path TEXT NOT NULL UNIQUE,
+                   size INTEGER NOT NULL,
+                   modified INTEGER NOT NULL,
+                   hash TEXT NOT NULL,
+                   protected INTEGER NOT NULL DEFAULT 0,
+                   approved INTEGER NOT NULL DEFAULT 0,
+                   present INTEGER NOT NULL DEFAULT 1,
+                   scanned_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE operations (
+                   id INTEGER PRIMARY KEY,
+                   file_id INTEGER NOT NULL,
+                   source_path TEXT NOT NULL,
+                   trash_path TEXT NOT NULL,
+                   hash TEXT NOT NULL,
+                   state TEXT NOT NULL,
+                   created_at INTEGER NOT NULL,
+                   restored_at INTEGER
+                 );
+                 INSERT INTO settings(key,value) VALUES('schema_version','1');
+                 INSERT INTO settings(key,value) VALUES('trash_path','/tmp/recycle');
+                 INSERT INTO files(path,size,modified,hash,scanned_at)
+                   VALUES('/data/keep.txt',42,100,'deadbeef',100);",
+            )
+            .unwrap();
+        drop(connection);
+
+        // Any command entry point migrates on open; groups also proves the
+        // table shape is queryable afterwards.
+        let _ = query_groups(
+            &database,
+            &GroupQuery {
+                min_size: 0,
+                path_contains: None,
+                sort: GroupSort::Size,
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .unwrap();
+
+        let connection = open_database(&database).unwrap();
+        let version: String = connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "2");
+        let (rows, hashed): (i64, String) = connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(hash),'') FROM files WHERE path='/data/keep.txt'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(hashed, "deadbeef");
+        drop(connection);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn large_files_use_two_stage_hashing() {
+        let directory = test_directory("two-stage");
+        let source = directory.join("source");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&source).unwrap();
+        let database = directory.join("index.db");
+        init(&database, &recycle).unwrap();
+
+        let block = vec![0xCD_u8; (LARGE_FILE_QUICK_THRESHOLD + 1024) as usize];
+        // All four files share the first QUICK_HASH_CHUNK bytes, so a naive
+        // quick-hash-only grouping would merge them; full hashes must split
+        // them into the two real content pairs.
+        let mut different = block.clone();
+        different[(LARGE_FILE_QUICK_THRESHOLD + 512) as usize] ^= 0xFF;
+        fs::write(source.join("same-a.bin"), &block).unwrap();
+        fs::write(source.join("same-b.bin"), &block).unwrap();
+        fs::write(source.join("diff-a.bin"), &different).unwrap();
+        fs::write(source.join("diff-b.bin"), &different).unwrap();
+
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        let groups = query_groups(
+            &database,
+            &GroupQuery {
+                min_size: 0,
+                path_contains: None,
+                sort: GroupSort::Size,
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(groups.groups.len(), 2, "same pair groups, diff pair groups too");
+        for group in &groups.groups {
+            assert_eq!(group.files.len(), 2);
+            assert!(!group.hash.starts_with("q:"), "promoted pairs carry real hashes");
+        }
+
+        // A lone large file is stored with the quick marker; when its twin
+        // appears in a later scan, both rows end up with real hashes and one
+        // duplicate group.
+        let lone_block = vec![0xEF_u8; (LARGE_FILE_QUICK_THRESHOLD + 1024) as usize];
+        fs::write(source.join("lone-a.bin"), &lone_block).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        fs::write(source.join("lone-b.bin"), &lone_block).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+
+        let groups = query_groups(
+            &database,
+            &GroupQuery {
+                min_size: 0,
+                path_contains: None,
+                sort: GroupSort::Size,
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(groups.groups.len(), 3);
+        let lone = groups
+            .groups
+            .iter()
+            .find(|group| group.files.iter().any(|file| file.path.ends_with("lone-a.bin")))
+            .expect("lone pair must group after its twin arrives");
+        assert_eq!(lone.files.len(), 2);
+        assert!(!lone.hash.starts_with("q:"));
         let _ = fs::remove_dir_all(directory);
     }
 
