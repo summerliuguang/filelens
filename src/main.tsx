@@ -22,6 +22,13 @@ type GroupFile = {
   modified: number;
 };
 type Group = { hash: string; size: number; files: GroupFile[] };
+type GroupsPage = { total: number; groups: Group[] };
+type GroupFilters = {
+  search: string;
+  minSize: number;
+  sort: "size" | "members" | "path";
+};
+type Toast = { id: number; kind: "ok" | "error"; text: string };
 type Status = {
   files: number;
   duplicates: number;
@@ -108,11 +115,18 @@ function App() {
   const [status, setStatus] = useState<Status | null>(null);
   const [groups, setGroups] = useState<Group[]>([]);
   const [groupsExhausted, setGroupsExhausted] = useState(true);
+  const [groupsTotal, setGroupsTotal] = useState(0);
+  const [groupFilters, setGroupFilters] = useState<GroupFilters>({
+    search: "",
+    minSize: 0,
+    sort: "size",
+  });
   const [trashItems, setTrashItems] = useState<TrashItem[]>([]);
   const [similarPhotos, setSimilarPhotos] = useState<SimilarPhoto[]>([]);
   const [similarDocuments, setSimilarDocuments] = useState<SimilarDocument[]>([]);
   const [detectors, setDetectors] = useState<DetectorStatus[]>([]);
-  const [message, setMessage] = useState("正在打开本地项目...");
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const [booting, setBooting] = useState(true);
   const [busy, setBusy] = useState(false);
   const [scanState, setScanState] = useState<ScanState>({
     state: "idle",
@@ -121,6 +135,20 @@ function App() {
     message: "",
   });
   const progressHistory = useRef<{ t: number; processed: number }[]>([]);
+  const toastSeq = useRef(0);
+
+  function notify(kind: Toast["kind"], text: string) {
+    const id = ++toastSeq.current;
+    // Keep the stack short; successes self-dismiss, errors stay until closed.
+    setToasts((current) => [...current.slice(-3), { id, kind, text }]);
+    if (kind === "ok") {
+      window.setTimeout(() => dismissToast(id), 3600);
+    }
+  }
+
+  function dismissToast(id: number) {
+    setToasts((current) => current.filter((toast) => toast.id !== id));
+  }
 
   useEffect(() => {
     invoke<ProjectState>("open_project")
@@ -134,11 +162,14 @@ function App() {
         if (project.auto_scan && project.roots.length > 0) {
           void startScan(project.database, project.roots, project.protect_rules);
         } else {
-          setMessage("本地项目已打开。");
           void refresh(project.database);
         }
       })
-      .catch((error) => setMessage(`自动打开本地项目失败：${String(error)}`));
+      .catch((error) =>
+        notify("error", `自动打开本地项目失败：${String(error)}`),
+      )
+      .finally(() => setBooting(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -153,7 +184,7 @@ function App() {
           while (history.length > 1 && now - history[0].t > 8000) history.shift();
           setScanState(next);
           if (next.state !== "running") {
-            setMessage(next.message);
+            notify(next.state === "failed" ? "error" : "ok", next.message);
             void refresh();
           }
         })
@@ -167,39 +198,77 @@ function App() {
         );
     }, 500);
     return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scanState.state]);
 
   async function execute(action: () => Promise<string>) {
     setBusy(true);
     try {
-      setMessage(await action());
+      notify("ok", await action());
     } catch (error) {
-      setMessage(friendlyError(error));
+      notify("error", friendlyError(error));
     } finally {
       setBusy(false);
     }
   }
 
+  function groupsInvokeArgs(target: string, offset: number, limit: number) {
+    return {
+      database: target,
+      offset,
+      limit,
+      minSize: groupFilters.minSize,
+      pathContains: groupFilters.search.trim() || undefined,
+      sort: groupFilters.sort,
+    };
+  }
+
   async function refresh(target = database) {
     if (!target) return;
     await execute(async () => {
-      const [nextStatus, nextGroups, nextTrash, nextSimilarPhotos, nextDocuments, nextDetectors] = await Promise.all([
+      const [nextStatus, page, nextTrash, nextSimilarPhotos, nextDocuments, nextDetectors] = await Promise.all([
         invoke<Status>("status", { database: target }),
-        invoke<Group[]>("groups", { database: target, offset: 0, limit: GROUPS_PAGE }),
+        // Reload as many groups as are already on screen so an action taken
+        // deep in the list does not snap the queue back to its first page.
+        invoke<GroupsPage>("groups", groupsInvokeArgs(target, 0, Math.max(GROUPS_PAGE, groups.length))),
         invoke<TrashItem[]>("trash_list", { database: target }),
         invoke<SimilarPhoto[]>("similar_photos", { database: target }),
         invoke<SimilarDocument[]>("similar_documents", { database: target }),
         invoke<DetectorStatus[]>("detector_status"),
       ]);
       setStatus(nextStatus);
-      setGroups(nextGroups);
-      setGroupsExhausted(nextGroups.length < GROUPS_PAGE);
+      setGroups(page.groups);
+      setGroupsTotal(page.total);
+      setGroupsExhausted(page.groups.length >= page.total);
       setTrashItems(nextTrash);
       setSimilarPhotos(nextSimilarPhotos);
       setSimilarDocuments(nextDocuments);
       setDetectors(nextDetectors);
       return `索引已更新：${nextStatus.groups} 个精确重复组待审核。`;
     });
+  }
+
+  async function applyGroupFilters(next: GroupFilters) {
+    if (!database) return;
+    setGroupFilters(next);
+    setBusy(true);
+    try {
+      const page = await invoke<GroupsPage>("groups", {
+        database,
+        offset: 0,
+        limit: GROUPS_PAGE,
+        minSize: next.minSize,
+        pathContains: next.search.trim() || undefined,
+        sort: next.sort,
+      });
+      setGroups(page.groups);
+      setGroupsTotal(page.total);
+      setGroupsExhausted(page.groups.length >= page.total);
+    } catch (error) {
+      notify("error", friendlyError(error));
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function initialize() {
@@ -233,16 +302,20 @@ function App() {
 
   async function loadMoreGroups() {
     if (!database) return;
-    await execute(async () => {
-      const next = await invoke<Group[]>("groups", {
-        database,
-        offset: groups.length,
-        limit: GROUPS_PAGE,
-      });
-      setGroups((current) => [...current, ...next]);
-      setGroupsExhausted(next.length < GROUPS_PAGE);
-      return `已加载 ${groups.length + next.length} 个重复组。`;
-    });
+    setBusy(true);
+    try {
+      const page = await invoke<GroupsPage>(
+        "groups",
+        groupsInvokeArgs(database, groups.length, GROUPS_PAGE),
+      );
+      setGroups((current) => [...current, ...page.groups]);
+      setGroupsTotal(page.total);
+      setGroupsExhausted(groups.length + page.groups.length >= page.total);
+    } catch (error) {
+      notify("error", friendlyError(error));
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function cancelScan() {
@@ -254,7 +327,7 @@ function App() {
     try {
       await invoke("save_roots", { database, roots: next, protectRules });
     } catch (error) {
-      setMessage(friendlyError(error));
+      notify("error", friendlyError(error));
     }
   }
 
@@ -326,38 +399,54 @@ function App() {
             ↻ 刷新
           </button>
         </header>
-        {scanState.state === "running" && <ScanProgress scanState={scanState} history={progressHistory.current} onCancel={cancelScan} disabled={busy} />}
-        {page === "overview" && (
-          <Overview
-            status={status}
-            groups={groups}
-            selected={selected}
-            onNavigate={setPage}
-          />
-        )}
-        {page === "sources" && (
-          <Sources
-            roots={roots}
-            rootInput={rootInput}
-            setRootInput={setRootInput}
-            addRoot={addRootPath}
-            removeRoot={removeRootPath}
+        {booting ? (
+          <div className="loading-view">
+            <span className="spinner" aria-hidden="true" />
+            正在打开本地项目...
+          </div>
+        ) : (
+          <>
+            {scanState.state === "running" && (
+              <ScanProgress
+                scanState={scanState}
+                history={progressHistory.current}
+                onCancel={cancelScan}
+                disabled={busy}
+              />
+            )}
+            {page === "overview" && (
+              <Overview
+                status={status}
+                groups={groups}
+                selected={selected}
+                onNavigate={setPage}
+              />
+            )}
+            {page === "sources" && (
+              <Sources
+                roots={roots}
+                rootInput={rootInput}
+                setRootInput={setRootInput}
+                addRoot={addRootPath}
+                removeRoot={removeRootPath}
             scan={() => startScan(database, roots, protectRules)}
             disabled={busy || !database || scanState.state === "running"}
           />
         )}
-        {page === "review" && (
-          <Review
-            database={database}
-            groups={groups}
-            totalGroups={status ? status.groups : groups.length}
-            busy={busy}
-            execute={execute}
-            refresh={refresh}
-            hasMore={!groupsExhausted}
-            onLoadMore={loadMoreGroups}
-          />
-        )}
+            {page === "review" && (
+              <Review
+                database={database}
+                groups={groups}
+                totalGroups={groupsTotal}
+                filters={groupFilters}
+                onFilters={(next) => void applyGroupFilters(next)}
+                busy={busy}
+                execute={execute}
+                refresh={refresh}
+                hasMore={!groupsExhausted}
+                onLoadMore={loadMoreGroups}
+              />
+            )}
         {page === "similar" && (
           <SimilarPhotos
             database={database}
@@ -393,13 +482,32 @@ function App() {
             setAutoScan={setAutoScan}
             initialize={initialize}
             execute={execute}
-            notify={setMessage}
+            notify={(text) => notify("error", text)}
             busy={busy}
           />
         )}
-        <footer className={message.startsWith("操作失败") ? "error" : ""}>
-          {busy ? "正在处理，请不要关闭程序..." : message}
-        </footer>
+          </>
+        )}
+        {(toasts.length > 0 || busy) && (
+          <div className="toast-stack" aria-live="polite">
+            {toasts.map((toast) => (
+              <div
+                key={toast.id}
+                className={toast.kind === "error" ? "toast error" : "toast"}
+              >
+                <span>{toast.text}</span>
+                <button
+                  className="toast-close"
+                  aria-label="关闭通知"
+                  onClick={() => dismissToast(toast.id)}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+            {busy && <div className="toast busy">正在处理，请不要关闭程序...</div>}
+          </div>
+        )}
       </main>
     </div>
   );
@@ -622,6 +730,7 @@ function Sources({
             icon="⌁"
             text="还没有扫描目录"
             detail="添加本地同步目录后，即可建立内容索引。"
+            action={{ label: "选择目录", onClick: () => void pickDirectory() }}
           />
         ) : (
           roots.map((root, index) => (
@@ -676,6 +785,8 @@ function Review({
   database,
   groups,
   totalGroups,
+  filters,
+  onFilters,
   busy,
   execute,
   refresh,
@@ -685,6 +796,8 @@ function Review({
   database: string;
   groups: Group[];
   totalGroups: number;
+  filters: GroupFilters;
+  onFilters: (next: GroupFilters) => void;
   busy: boolean;
   execute: (action: () => Promise<string>) => Promise<void>;
   refresh: () => Promise<void>;
@@ -694,6 +807,31 @@ function Review({
   const [previewPath, setPreviewPath] = useState<string | null>(null);
   const [pendingRemove, setPendingRemove] = useState<GroupFile | null>(null);
   const [pendingBatch, setPendingBatch] = useState<Group | null>(null);
+  const [searchInput, setSearchInput] = useState(filters.search);
+
+  // Mark every duplicate of the "keeper" for later batch processing; pure
+  // front-end choice over data the group already carries.
+  function smartMark(group: Group, strategy: "newest" | "oldest" | "shortest") {
+    const pool = group.files.filter((file) => !file.protected);
+    if (pool.length < 2) return;
+    let keeper = pool[0];
+    for (const file of pool) {
+      if (strategy === "newest" && file.modified > keeper.modified) keeper = file;
+      if (strategy === "oldest" && file.modified < keeper.modified) keeper = file;
+      if (strategy === "shortest" && file.path.length < keeper.path.length) keeper = file;
+    }
+    const targets = pool.filter((file) => file.id !== keeper.id && !file.approved);
+    if (targets.length === 0) return;
+    const label =
+      strategy === "newest" ? "保留最新" : strategy === "oldest" ? "保留最旧" : "保留最短路径";
+    void execute(async () => {
+      for (const file of targets) {
+        await invoke("approve", { database, fileId: file.id });
+      }
+      await refresh();
+      return `已按「${label}」标记 ${targets.length} 个副本，确认后可整组处理。`;
+    });
+  }
 
   // mode: "trash" recycles (recoverable), "delete" removes permanently.
   function confirmRemoval(file: GroupFile, mode: "trash" | "delete") {
@@ -732,11 +870,61 @@ function Review({
         </div>
         <span className="pill">{totalGroups} 个组</span>
       </div>
+      <div className="filter-bar">
+        <input
+          value={searchInput}
+          onChange={(event) => setSearchInput(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") onFilters({ ...filters, search: searchInput });
+          }}
+          placeholder="按路径关键字筛选，回车应用"
+          aria-label="按路径筛选重复组"
+        />
+        <select
+          value={String(filters.minSize)}
+          onChange={(event) =>
+            onFilters({ ...filters, minSize: Number(event.target.value) })
+          }
+          aria-label="最小文件大小"
+        >
+          <option value="0">任意大小</option>
+          <option value={1024 * 1024}>≥ 1 MB</option>
+          <option value={10 * 1024 * 1024}>≥ 10 MB</option>
+          <option value={100 * 1024 * 1024}>≥ 100 MB</option>
+          <option value={1024 * 1024 * 1024}>≥ 1 GB</option>
+        </select>
+        <select
+          value={filters.sort}
+          onChange={(event) =>
+            onFilters({ ...filters, sort: event.target.value as GroupFilters["sort"] })
+          }
+          aria-label="排序方式"
+        >
+          <option value="size">按大小</option>
+          <option value="members">按副本数</option>
+          <option value="path">按路径</option>
+        </select>
+        {(filters.search || filters.minSize > 0 || filters.sort !== "size") && (
+          <button
+            className="text-button"
+            onClick={() => {
+              setSearchInput("");
+              onFilters({ search: "", minSize: 0, sort: "size" });
+            }}
+          >
+            重置筛选
+          </button>
+        )}
+      </div>
       {groups.length === 0 ? (
         <Empty
           icon="⊞"
-          text="没有待审核的精确重复"
-          detail="完成扫描后，重复组会按可释放空间显示在这里。"
+          text={totalGroups === 0 ? "没有待审核的精确重复" : "当前筛选没有匹配的重复组"}
+          detail={
+            totalGroups === 0
+              ? "完成扫描后，重复组会按可释放空间显示在这里。"
+              : "试试放宽大小阈值或更换关键字。"
+          }
         />
       ) : (
         <div className="groups">
@@ -753,6 +941,32 @@ function Review({
                 </div>
               </div>
               <div className="hash">BLAKE3 {group.hash}</div>
+              {group.files.filter((file) => !file.protected).length > 1 && (
+                <div className="smart-row">
+                  <span>智能标记：</span>
+                  <button
+                    className="text-button"
+                    disabled={busy}
+                    onClick={() => smartMark(group, "newest")}
+                  >
+                    保留最新
+                  </button>
+                  <button
+                    className="text-button"
+                    disabled={busy}
+                    onClick={() => smartMark(group, "oldest")}
+                  >
+                    保留最旧
+                  </button>
+                  <button
+                    className="text-button"
+                    disabled={busy}
+                    onClick={() => smartMark(group, "shortest")}
+                  >
+                    保留最短路径
+                  </button>
+                </div>
+              )}
               {group.files.map((file) => (
                 <div className="file-row" key={file.id}>
                   <button
@@ -840,7 +1054,7 @@ function Review({
                 disabled={busy}
                 onClick={() => void onLoadMore()}
               >
-                加载更多重复组
+                加载更多重复组（还有 {Math.max(0, totalGroups - groups.length)} 组）
               </button>
             </div>
           )}
@@ -1021,34 +1235,45 @@ function SimilarPhotos({
         />
       ) : (
         <div className="similar-list">
-          {shown.map((photo, index) => (
-            <article className="similar-pair" key={`${photo.first_path}-${photo.second_path}`}>
-              <div className="similar-photos">
-                <PhotoSlot
-                  photo={photo}
-                  side="first"
-                  previewPath={previewPath}
-                  onPreview={setPreviewPath}
-                  selected={selected}
-                  onToggle={toggleSelection}
-                />
-                <PhotoSlot
-                  photo={photo}
-                  side="second"
-                  previewPath={previewPath}
-                  onPreview={setPreviewPath}
-                  selected={selected}
-                  onToggle={toggleSelection}
-                />
-              </div>
-              <div>
-                <b>候选 {index + 1}</b>
-                <PhotoInfo path={photo.first_path} size={photo.first_size} modified={photo.first_modified} />
-                <PhotoInfo path={photo.second_path} size={photo.second_size} modified={photo.second_modified} />
-              </div>
-              <small>dHash 差异 {photo.distance}/64</small>
-            </article>
-          ))}
+          {shown.map((photo, index) => {
+            const keep = suggestKeep(photo);
+            return (
+              <article
+                className="similar-pair"
+                key={`${photo.first_path}-${photo.second_path}`}
+              >
+                <div className="similar-photos">
+                  <PhotoSlot
+                    photo={photo}
+                    side="first"
+                    previewPath={previewPath}
+                    onPreview={setPreviewPath}
+                    selected={selected}
+                    onToggle={toggleSelection}
+                  />
+                  <PhotoSlot
+                    photo={photo}
+                    side="second"
+                    previewPath={previewPath}
+                    onPreview={setPreviewPath}
+                    selected={selected}
+                    onToggle={toggleSelection}
+                  />
+                </div>
+                <div>
+                  <b>候选 {index + 1}</b>
+                  {keep && (
+                    <span className="keep-pill">
+                      建议保留{keep.side === "first" ? "左" : "右"}图 · {keep.reason}
+                    </span>
+                  )}
+                  <PhotoInfo path={photo.first_path} size={photo.first_size} modified={photo.first_modified} />
+                  <PhotoInfo path={photo.second_path} size={photo.second_size} modified={photo.second_modified} />
+                </div>
+                <small>dHash 差异 {photo.distance}/64</small>
+              </article>
+            );
+          })}
           {visible < photos.length && (
             <div className="load-more">
               <button
@@ -1127,6 +1352,24 @@ function PhotoSlot({
       </button>
     </div>
   );
+}
+
+// Cheap retention hint for a similar pair: prefer the larger file (likely
+// the higher-quality original), break ties by recency.
+function suggestKeep(
+  photo: SimilarPhoto,
+): { side: "first" | "second"; reason: string } | null {
+  if (photo.first_size !== photo.second_size) {
+    return photo.first_size > photo.second_size
+      ? { side: "first", reason: "文件更大" }
+      : { side: "second", reason: "文件更大" };
+  }
+  if (photo.first_modified !== photo.second_modified) {
+    return photo.first_modified > photo.second_modified
+      ? { side: "first", reason: "修改更近" }
+      : { side: "second", reason: "修改更近" };
+  }
+  return null;
 }
 
 function PhotoInfo({
@@ -1626,16 +1869,23 @@ function Empty({
   icon,
   text,
   detail,
+  action,
 }: {
   icon: string;
   text: string;
   detail: string;
+  action?: { label: string; onClick: () => void };
 }) {
   return (
     <div className="empty">
       <span>{icon}</span>
       <b>{text}</b>
       <p>{detail}</p>
+      {action && (
+        <button className="secondary" onClick={action.onClick}>
+          {action.label}
+        </button>
+      )}
     </div>
   );
 }

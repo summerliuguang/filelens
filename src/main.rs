@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs::{self, File},
     io::{self, Read},
     path::{Path, PathBuf},
@@ -521,7 +522,7 @@ fn write_entry(
     entry: &ProcessedEntry,
     protect: &[String],
 ) -> Result<IndexOutcome, String> {
-    let is_protected = protect.iter().any(|rule| entry.path_text.contains(rule));
+    let is_protected = is_protected_path(&entry.path_text, protect);
     let now = now_seconds()?;
     let outcome = if connection
         .query_row(
@@ -1037,6 +1038,27 @@ fn remove_indexed_path(connection: &Connection, path: &str, to_trash: bool) -> R
     Ok(())
 }
 
+/// Protection rules are substring matches with separators normalized, so a
+/// rule stored as `D:\backup` also covers `D:/backup/...`; comparisons fold
+/// case on Windows, where path casing carries no meaning. Substring (rather
+/// than strict prefix) semantics is deliberate: over-protecting is safe,
+/// silently un-protecting files an existing rule was covering is not.
+fn is_protected_path(path_text: &str, rules: &[String]) -> bool {
+    let path = normalize_path_text(path_text);
+    rules.iter().any(|rule| {
+        let rule = normalize_path_text(rule);
+        !rule.is_empty() && path.contains(&rule)
+    })
+}
+
+fn normalize_path_text(value: &str) -> String {
+    let trimmed = value.trim().replace('\\', "/");
+    #[cfg(target_os = "windows")]
+    return trimmed.to_lowercase();
+    #[cfg(not(target_os = "windows"))]
+    return trimmed;
+}
+
 /// Permanently delete one file from the application recycle bin.
 pub fn delete_trash(database: &Path, operation_id: i64) -> Result<(), String> {
     let connection = open_database(database)?;
@@ -1144,12 +1166,153 @@ pub fn empty_trash(database: &Path) -> Result<u64, String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
     drop(statement);
-    drop(connection);
+    let mut deleted = 0_u64;
     for id in &ids {
-        delete_trash(database, *id)?;
+        // Best effort per file so one undeletable entry does not strand the
+        // rest of the bin; the reused connection avoids a reopen per file.
+        match delete_trash_with(&connection, *id) {
+            Ok(()) => deleted += 1,
+            Err(error) => eprintln!("warning: could not delete operation {id}: {error}"),
+        }
     }
-    println!("Recycle bin emptied: {} files", ids.len());
-    Ok(ids.len() as u64)
+    println!("Recycle bin emptied: {} files", deleted);
+    Ok(deleted)
+}
+
+/// Sorting options for the duplicate-group review queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupSort {
+    Size,
+    Members,
+    Path,
+}
+
+/// Filters and paging for `query_groups`.
+pub struct GroupQuery<'a> {
+    pub min_size: i64,
+    pub path_contains: Option<&'a str>,
+    pub sort: GroupSort,
+    pub offset: i64,
+    pub limit: i64,
+}
+
+#[derive(serde::Serialize)]
+pub struct GroupFile {
+    pub id: i64,
+    pub path: String,
+    pub protected: bool,
+    pub approved: bool,
+    pub modified: i64,
+}
+
+#[derive(serde::Serialize)]
+pub struct Group {
+    pub hash: String,
+    pub size: i64,
+    pub files: Vec<GroupFile>,
+}
+
+#[derive(serde::Serialize)]
+pub struct GroupsPage {
+    pub total: i64,
+    pub groups: Vec<Group>,
+}
+
+/// Paged duplicate groups with optional size/path filters and ordering.
+/// The filter runs in SQL (the `(hash,size,present)` index carries the
+/// grouping), the total is computed over the same filtered set, and members
+/// for the whole page are fetched in one query instead of one per group.
+pub fn query_groups(database: &Path, query: &GroupQuery) -> Result<GroupsPage, String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    query_groups_with(&connection, query)
+}
+
+fn query_groups_with(connection: &Connection, query: &GroupQuery) -> Result<GroupsPage, String> {
+    let limit = query.limit.clamp(1, 200);
+    let offset = query.offset.max(0);
+    let min_size = query.min_size.max(0);
+    let pattern = format!(
+        "%{}%",
+        like_escape(query.path_contains.unwrap_or_default().trim())
+    );
+    // LIKE is ASCII-case-insensitive by default, close enough for a search box.
+    let filter_sql =
+        "FROM files WHERE present=1 GROUP BY hash,size \
+         HAVING COUNT(*) > 1 AND size >= ?1 AND SUM(path LIKE ?2 ESCAPE '\\') > 0";
+    let order_sql = match query.sort {
+        GroupSort::Size => "size DESC, members DESC",
+        GroupSort::Members => "members DESC, size DESC",
+        GroupSort::Path => "first_path",
+    };
+    let total: i64 = connection
+        .query_row(
+            &format!("SELECT COUNT(*) FROM (SELECT 1 {filter_sql})"),
+            params![min_size, pattern],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT hash,size,COUNT(*) AS members,MIN(path) AS first_path {filter_sql} \
+             ORDER BY {order_sql} LIMIT ?3 OFFSET ?4"
+        ))
+        .map_err(|e| e.to_string())?;
+    let keys = statement
+        .query_map(params![min_size, pattern, limit, offset], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    drop(statement);
+
+    let mut members: HashMap<(String, i64), Vec<GroupFile>> = HashMap::new();
+    if !keys.is_empty() {
+        let mut conditions = String::new();
+        let mut values: Vec<rusqlite::types::Value> = Vec::new();
+        for (hash, size) in &keys {
+            if !conditions.is_empty() {
+                conditions.push_str(" OR ");
+            }
+            values.push(rusqlite::types::Value::Text(hash.clone()));
+            values.push(rusqlite::types::Value::Integer(*size));
+            conditions.push_str(&format!("(hash=?{} AND size=?{})", values.len() - 1, values.len()));
+        }
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT hash,size,id,path,protected,approved,modified FROM files \
+                 WHERE present=1 AND ({conditions}) ORDER BY path"
+            ))
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+                let hash: String = row.get(0)?;
+                let size: i64 = row.get(1)?;
+                let file = GroupFile {
+                    id: row.get(2)?,
+                    path: row.get(3)?,
+                    protected: row.get::<_, i64>(4)? != 0,
+                    approved: row.get::<_, i64>(5)? != 0,
+                    modified: row.get(6)?,
+                };
+                Ok((hash, size, file))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            let (hash, size, file) = row.map_err(|e| e.to_string())?;
+            members.entry((hash, size)).or_default().push(file);
+        }
+    }
+
+    let groups = keys
+        .into_iter()
+        .map(|(hash, size)| {
+            let files = members.remove(&(hash.clone(), size)).unwrap_or_default();
+            Group { hash, size, files }
+        })
+        .collect();
+    Ok(GroupsPage { total, groups })
 }
 
 /// Build the recycle-bin destination for one indexed file and create its
@@ -1288,20 +1451,33 @@ fn required_setting(connection: &Connection, key: &str) -> Result<String, String
 }
 fn ensure_initialized(connection: &Connection) -> Result<(), String> {
     let version = required_setting(connection, "schema_version")?;
-    if version.parse::<i64>().ok() == Some(SCHEMA_VERSION) {
-        Ok(())
-    } else {
-        Err(format!("unsupported schema version: {version}"))
+    if version.parse::<i64>().ok() != Some(SCHEMA_VERSION) {
+        return Err(format!("unsupported schema version: {version}"));
     }
+    // Cover the trash/history orderings. `IF NOT EXISTS` keeps this idempotent
+    // so databases created before the indexes existed pick them up on open.
+    connection
+        .execute_batch(
+            "CREATE INDEX IF NOT EXISTS operations_state_created
+                 ON operations(state, created_at);
+             CREATE INDEX IF NOT EXISTS operations_created
+                 ON operations(created_at);",
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 fn absolute_path(path: &Path) -> Result<PathBuf, String> {
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
     } else {
         std::env::current_dir()
-            .map_err(|e| e.to_string())
-            .map(|cwd| cwd.join(path))
-    }
+            .map_err(|e| e.to_string())?
+            .join(path)
+    };
+    // Canonicalize so scan-root prefixes keep matching stored paths across
+    // sessions (links, `.`, `..`); dunce keeps Windows paths free of the
+    // `\\?\` verbatim prefix, which would break LIKE prefix matching.
+    dunce::canonicalize(&resolved).or_else(|_| Ok(resolved))
 }
 fn unix_seconds(time: SystemTime) -> Result<i64, String> {
     i64::try_from(
@@ -1777,6 +1953,118 @@ mod tests {
         assert_eq!(summary.pruned, 1);
         assert!(summary.failed_roots.is_empty());
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn query_groups_filters_sorts_and_counts() {
+        let directory = test_directory("query-groups");
+        let source = directory.join("source");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&source).unwrap();
+        // Two exact-duplicate groups plus noise: big pair (2×4096), small
+        // pair (2×9), and a unique file that must never appear.
+        fs::write(source.join("big-a.bin"), vec![0xAB_u8; 4096]).unwrap();
+        fs::write(source.join("big-b.bin"), vec![0xAB_u8; 4096]).unwrap();
+        fs::create_dir_all(source.join("notes")).unwrap();
+        fs::write(source.join("notes/小.txt"), b"tiny pair").unwrap();
+        fs::write(source.join("notes/大.txt"), b"tiny pair").unwrap();
+        fs::write(source.join("unique.txt"), b"one of a kind").unwrap();
+        let database = directory.join("index.db");
+
+        init(&database, &recycle).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+
+        let all = query_groups(
+            &database,
+            &GroupQuery {
+                min_size: 0,
+                path_contains: None,
+                sort: GroupSort::Size,
+                offset: 0,
+                limit: 50,
+            },
+        )
+        .unwrap();
+        assert_eq!(all.total, 2);
+        assert_eq!(all.groups.len(), 2);
+        // Size sort puts the big pair first; members come back path-ordered.
+        assert_eq!(all.groups[0].size, 4096);
+        assert_eq!(all.groups[0].files[0].path, source.join("big-a.bin").to_string_lossy());
+
+        // Path filter narrows to the group containing a matching member.
+        let filtered = query_groups(
+            &database,
+            &GroupQuery {
+                min_size: 0,
+                path_contains: Some("大.txt"),
+                sort: GroupSort::Size,
+                offset: 0,
+                limit: 50,
+            },
+        )
+        .unwrap();
+        assert_eq!(filtered.total, 1);
+        assert_eq!(filtered.groups.len(), 1);
+        assert_eq!(filtered.groups[0].size, 9);
+
+        // Min size excludes the small pair from both page and total.
+        let big_only = query_groups(
+            &database,
+            &GroupQuery {
+                min_size: 100,
+                path_contains: None,
+                sort: GroupSort::Size,
+                offset: 0,
+                limit: 50,
+            },
+        )
+        .unwrap();
+        assert_eq!(big_only.total, 1);
+        assert_eq!(big_only.groups[0].size, 4096);
+
+        // Member-count sort with paging through the same set.
+        let first_page = query_groups(
+            &database,
+            &GroupQuery {
+                min_size: 0,
+                path_contains: None,
+                sort: GroupSort::Members,
+                offset: 0,
+                limit: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(first_page.total, 2);
+        assert_eq!(first_page.groups.len(), 1);
+        let second_page = query_groups(
+            &database,
+            &GroupQuery {
+                min_size: 0,
+                path_contains: None,
+                sort: GroupSort::Members,
+                offset: 1,
+                limit: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(second_page.groups.len(), 1);
+        assert_ne!(first_page.groups[0].hash, second_page.groups[0].hash);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn protection_rules_match_normalized_separators() {
+        let rules = vec!["/data/backup".to_string(), "keep".to_string()];
+        assert!(is_protected_path("/data/backup/old/a.txt", &rules));
+        assert!(is_protected_path("/data/backup", &rules));
+        // Trailing separator in the rule must not create a dead rule.
+        assert!(is_protected_path("/data/backup/x.txt", &vec!["/data/backup/".to_string()]));
+        // Substring semantics deliberately over-protects: a rule for
+        // `/data/backup` also matches `/data/backup2` (safe direction).
+        assert!(is_protected_path("/data/backup2/a.txt", &rules));
+        // Plain name fragments keep matching anywhere in the path.
+        assert!(is_protected_path("/mnt/store/keepme.txt", &rules));
+        assert!(!is_protected_path("/mnt/store/other.txt", &rules));
     }
 
     #[test]

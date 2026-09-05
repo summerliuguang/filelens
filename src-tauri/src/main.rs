@@ -25,20 +25,6 @@ struct Status {
     groups: i64,
     recoverable_bytes: i64,
 }
-#[derive(Serialize)]
-struct GroupFile {
-    id: i64,
-    path: String,
-    protected: bool,
-    approved: bool,
-    modified: i64,
-}
-#[derive(Serialize)]
-struct Group {
-    hash: String,
-    size: i64,
-    files: Vec<GroupFile>,
-}
 
 #[derive(Serialize)]
 struct SimilarPhoto {
@@ -568,11 +554,10 @@ fn open_file(path: String) -> Result<String, String> {
     if !path.is_file() {
         return Err("文件不存在或已删除".into());
     }
+    // explorer.exe (not `cmd /C start`) so cmd metacharacters in the path are
+    // never interpreted by a shell.
     #[cfg(target_os = "windows")]
-    let result = std::process::Command::new("cmd")
-        .args(["/C", "start", ""])
-        .arg(&path)
-        .spawn();
+    let result = std::process::Command::new("explorer").arg(&path).spawn();
     #[cfg(target_os = "macos")]
     let result = std::process::Command::new("open").arg(&path).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -643,41 +628,25 @@ fn groups(
     database: String,
     offset: Option<i64>,
     limit: Option<i64>,
-) -> Result<Vec<Group>, String> {
-    let limit = limit.unwrap_or(50).clamp(1, 200);
-    let offset = offset.unwrap_or(0).max(0);
-    let connection = open_database(&database)?;
-    let mut statement = connection
-        .prepare(
-            "SELECT hash,size FROM files WHERE present=1 \
-             GROUP BY hash,size HAVING COUNT(*) > 1 ORDER BY size DESC LIMIT ?1 OFFSET ?2",
-        )
-        .map_err(|error| error.to_string())?;
-    let keys = statement
-        .query_map(params![limit, offset], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })
-        .map_err(|error| error.to_string())?;
-    let mut result = Vec::new();
-    for key in keys {
-        let (hash, size) = key.map_err(|error| error.to_string())?;
-        let mut members = connection.prepare("SELECT id,path,protected,approved,modified FROM files WHERE present=1 AND hash=?1 AND size=?2 ORDER BY path").map_err(|error| error.to_string())?;
-        let files = members
-            .query_map(params![hash, size], |row| {
-                Ok(GroupFile {
-                    id: row.get(0)?,
-                    path: row.get(1)?,
-                    protected: row.get::<_, i64>(2)? != 0,
-                    approved: row.get::<_, i64>(3)? != 0,
-                    modified: row.get(4)?,
-                })
-            })
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
-        result.push(Group { hash, size, files });
-    }
-    Ok(result)
+    min_size: Option<i64>,
+    path_contains: Option<String>,
+    sort: Option<String>,
+) -> Result<filelens::GroupsPage, String> {
+    let query = filelens::GroupQuery {
+        min_size: min_size.unwrap_or(0),
+        path_contains: path_contains
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+        sort: match sort.as_deref() {
+            Some("members") => filelens::GroupSort::Members,
+            Some("path") => filelens::GroupSort::Path,
+            _ => filelens::GroupSort::Size,
+        },
+        offset: offset.unwrap_or(0),
+        limit: limit.unwrap_or(50),
+    };
+    filelens::query_groups(&PathBuf::from(database), &query)
 }
 
 struct FingerprintEntry {

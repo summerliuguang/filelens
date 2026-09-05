@@ -806,6 +806,119 @@ footer {
 footer.error {
   color: #e98e82;
 }
+.toast-stack {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 30;
+  display: grid;
+  gap: 8px;
+  width: min(420px, calc(100vw - 36px));
+}
+.toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 11px 13px;
+  border: 1px solid #4a543e;
+  border-radius: 8px;
+  background: #23291e;
+  color: #d7dcc9;
+  font-size: 0.82rem;
+  line-height: 1.5;
+  box-shadow: 0 8px 22px rgba(8, 10, 6, 0.45);
+}
+.toast span {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+.toast.error {
+  border-color: #6e3b33;
+  background: #2c211d;
+  color: #eba49a;
+}
+.toast.busy {
+  color: #9fa694;
+  border-style: dashed;
+}
+.toast-close {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  background: none;
+  color: #939a8e;
+  font-size: 0.9rem;
+  line-height: 1;
+}
+.toast-close:hover {
+  color: #eff0e8;
+}
+.loading-view {
+  display: grid;
+  place-items: center;
+  gap: 12px;
+  padding: 80px 0;
+  color: #939a8e;
+  font-size: 0.88rem;
+}
+.spinner {
+  width: 22px;
+  height: 22px;
+  border: 2px solid #3a4231;
+  border-top-color: #d8d267;
+  border-radius: 999px;
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 14px 0 4px;
+}
+.filter-bar input {
+  flex: 1;
+  min-width: 220px;
+}
+.filter-bar select {
+  padding: 8px 10px;
+  border: 1px solid #3a4231;
+  border-radius: 7px;
+  background: #1f251c;
+  color: #cdd3c1;
+  font-size: 0.8rem;
+}
+.smart-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 6px 0 2px;
+  color: #939a8e;
+  font-size: 0.75rem;
+}
+.smart-row .text-button {
+  margin-left: 0;
+  padding: 4px 8px;
+  font-size: 0.75rem;
+}
+.smart-row .text-button:hover {
+  color: #eff0e8;
+}
+.keep-pill {
+  display: inline-block;
+  margin: 4px 0;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: #333a2d;
+  color: #d8d267;
+  font-size: 0.72rem;
+}
 @media (max-width: 900px) {
   .app-shell {
     grid-template-columns: 1fr;
