@@ -72,13 +72,6 @@ struct HistoryItem {
 }
 
 #[derive(Serialize)]
-struct ProjectConfig {
-    trash_path: String,
-    roots: Vec<String>,
-    protect_rules: Vec<String>,
-}
-
-#[derive(Serialize)]
 struct ProjectState {
     database: String,
     trash_path: String,
@@ -109,12 +102,6 @@ fn open_database(path: &str) -> Result<Connection, String> {
         .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
         .map_err(|error| error.to_string())?;
     Ok(connection)
-}
-
-#[tauri::command]
-fn initialize(database: String, trash: String) -> Result<String, String> {
-    filelens::init(&PathBuf::from(database), &PathBuf::from(trash))
-        .map(|_| "项目已创建或打开。".into())
 }
 
 fn write_project_pointer(app: &tauri::AppHandle, database: &str) -> Result<(), String> {
@@ -180,23 +167,6 @@ fn open_project(app: tauri::AppHandle) -> Result<ProjectState, String> {
         protect_rules: setting_list(&connection, "protect_rules")?,
         trash_retention_days: filelens::trash_retention_days(&connection),
         auto_scan: setting_flag(&connection, "auto_scan_on_start", true),
-    })
-}
-
-#[tauri::command]
-fn project_config(database: String) -> Result<ProjectConfig, String> {
-    let connection = open_database(&database)?;
-    let trash_path = connection
-        .query_row(
-            "SELECT value FROM settings WHERE key='trash_path'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    Ok(ProjectConfig {
-        trash_path,
-        roots: setting_list(&connection, "roots")?,
-        protect_rules: setting_list(&connection, "protect_rules")?,
     })
 }
 
@@ -922,8 +892,6 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             open_project,
-            initialize,
-            project_config,
             save_project_config,
             save_roots,
             start_scan,

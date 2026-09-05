@@ -445,6 +445,8 @@ function App() {
                 refresh={refresh}
                 hasMore={!groupsExhausted}
                 onLoadMore={loadMoreGroups}
+                indexedFiles={status?.files ?? 0}
+                onNavigate={setPage}
               />
             )}
         {page === "similar" && (
@@ -456,7 +458,9 @@ function App() {
             refresh={refresh}
           />
         )}
-        {page === "documents" && <SimilarDocuments documents={similarDocuments} />}
+        {page === "documents" && (
+          <SimilarDocuments documents={similarDocuments} execute={execute} />
+        )}
         {page === "detectors" && <Detectors detectors={detectors} />}
         {page === "trash" && (
           <Trash
@@ -792,6 +796,8 @@ function Review({
   refresh,
   hasMore,
   onLoadMore,
+  indexedFiles,
+  onNavigate,
 }: {
   database: string;
   groups: Group[];
@@ -803,6 +809,8 @@ function Review({
   refresh: () => Promise<void>;
   hasMore: boolean;
   onLoadMore: () => Promise<void>;
+  indexedFiles: number;
+  onNavigate: (page: Page) => void;
 }) {
   const [previewPath, setPreviewPath] = useState<string | null>(null);
   const [pendingRemove, setPendingRemove] = useState<GroupFile | null>(null);
@@ -922,8 +930,15 @@ function Review({
           text={totalGroups === 0 ? "没有待审核的精确重复" : "当前筛选没有匹配的重复组"}
           detail={
             totalGroups === 0
-              ? "完成扫描后，重复组会按可释放空间显示在这里。"
+              ? indexedFiles === 0
+                ? "添加扫描目录并完成首次扫描后，重复组会显示在这里。"
+                : "完成扫描后，重复组会按可释放空间显示在这里。"
               : "试试放宽大小阈值或更换关键字。"
+          }
+          action={
+            totalGroups === 0 && indexedFiles === 0
+              ? { label: "去添加扫描目录", onClick: () => onNavigate("sources") }
+              : undefined
           }
         />
       ) : (
@@ -1388,14 +1403,97 @@ function PhotoInfo({
   );
 }
 
-function SimilarDocuments({ documents }: { documents: SimilarDocument[] }) {
+function DocumentInfo({
+  path,
+  size,
+  modified,
+  execute,
+}: {
+  path: string;
+  size: number;
+  modified: number;
+  execute: (action: () => Promise<string>) => Promise<void>;
+}) {
+  return (
+    <div className="document-info">
+      <PhotoInfo path={path} size={size} modified={modified} />
+      <button
+        className="secondary"
+        onClick={() => void execute(() => invoke<string>("open_file", { path }))}
+      >
+        打开
+      </button>
+    </div>
+  );
+}
+
+function SimilarDocuments({
+  documents,
+  execute,
+}: {
+  documents: SimilarDocument[];
+  execute: (action: () => Promise<string>) => Promise<void>;
+}) {
   const [visible, setVisible] = useState(60);
   const shown = documents.slice(0, visible);
-  return <section className="panel review-page"><div className="section-head"><div><h2>相似文档</h2><p>文本近似仅供人工查看，不能作为自动处理依据。</p></div><span className="pill">{documents.length} 对</span></div>{documents.length === 0 ? <Empty icon="≡" text="没有高置信度相似文档" detail="扫描 TXT、Markdown、CSV、JSON、XML 或 HTML 后会显示候选。" /> : <div className="similar-list">{shown.map((document, index) => <article className="similar-pair" key={`${document.first_path}-${document.second_path}`}><div><b>候选 {index + 1}</b><PhotoInfo path={document.first_path} size={document.first_size} modified={document.first_modified} /><PhotoInfo path={document.second_path} size={document.second_size} modified={document.second_modified} /></div><small>SimHash 差异 {document.distance}/64</small></article>)}{visible < documents.length && (<div className="load-more"><button className="secondary" onClick={() => setVisible((count) => count + 120)}>显示更多（还有 {documents.length - visible} 对）</button></div>)}</div>}</section>;
+  return (
+    <section className="panel review-page">
+      <div className="section-head">
+        <div>
+          <h2>相似文档</h2>
+          <p>文本近似仅供人工查看，不能作为自动处理依据。</p>
+        </div>
+        <span className="pill">{documents.length} 对</span>
+      </div>
+      {documents.length === 0 ? (
+        <Empty
+          icon="≡"
+          text="没有高置信度相似文档"
+          detail="扫描 TXT、Markdown、CSV、JSON、XML 或 HTML 后会显示候选。"
+        />
+      ) : (
+        <div className="similar-list">
+          {shown.map((document, index) => (
+            <article
+              className="similar-pair"
+              key={`${document.first_path}-${document.second_path}`}
+            >
+              <div>
+                <b>候选 {index + 1}</b>
+                <DocumentInfo
+                  path={document.first_path}
+                  size={document.first_size}
+                  modified={document.first_modified}
+                  execute={execute}
+                />
+                <DocumentInfo
+                  path={document.second_path}
+                  size={document.second_size}
+                  modified={document.second_modified}
+                  execute={execute}
+                />
+              </div>
+              <small>SimHash 差异 {document.distance}/64</small>
+            </article>
+          ))}
+          {visible < documents.length && (
+            <div className="load-more">
+              <button
+                className="secondary"
+                onClick={() => setVisible((count) => count + 120)}
+              >
+                显示更多（还有 {documents.length - visible} 对）
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+    </section>
+  );
 }
 
 function Detectors({ detectors }: { detectors: DetectorStatus[] }) {
-  return <section className="panel review-page"><div className="section-head"><div><h2>检测能力</h2><p>所有处理均在本地进行。未启用的能力不会以低质量算法替代。</p></div></div><div className="source-list">{detectors.map(detector => <article className="source" key={detector.name}><span className="source-icon">{detector.available ? "✓" : "·"}</span><div><b>{detector.name}</b><small>{detector.detail}</small></div><span className={detector.available ? "approved" : "protected"}>{detector.available ? "已启用" : "待接入"}</span></article>)}</div></section>;
+  return <section className="panel review-page"><div className="section-head"><div><h2>检测能力</h2><p>所有处理均在本地进行。未启用的能力不会以低质量算法替代。</p></div></div>{detectors.length === 0 ? <Empty icon="◎" text="检测能力列表为空" detail="打开项目或完成初始化后会显示当前支持的检测能力。" /> : <div className="source-list">{detectors.map(detector => <article className="source" key={detector.name}><span className="source-icon">{detector.available ? "✓" : "·"}</span><div><b>{detector.name}</b><small>{detector.detail}</small></div><span className={detector.available ? "approved" : "protected"}>{detector.available ? "已启用" : "待接入"}</span></article>)}</div>}</section>;
 }
 
 function Trash({
