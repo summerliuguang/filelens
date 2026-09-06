@@ -1054,7 +1054,18 @@ export function Trash({
         />
       ) : (
         <div className="trash-list">
-          {items.map((item) => (
+          {groupTrashByBatch(items).map((segment) => (
+            <div className="trash-batch" key={segment.key}>
+              {segment.batch && (
+                <div className="trash-batch-head">
+                  <b>批次清理</b>
+                  <span>
+                    {new Date(segment.batch.time * 1000).toLocaleString("zh-CN")} ·{" "}
+                    {segment.items.length} 个文件 · 同一次批量操作
+                  </span>
+                </div>
+              )}
+              {segment.items.map((item) => (
             <article className="trash-item" key={item.id}>
               <span className="source-icon">↶</span>
               <div>
@@ -1091,6 +1102,8 @@ export function Trash({
                 </button>
               </div>
             </article>
+              ))}
+            </div>
           ))}
         </div>
       )}
@@ -1179,8 +1192,26 @@ export function Trash({
   );
 }
 
-const HISTORY_PAGE = 100;
+// Segments the recycle list into batches: consecutive items sharing a
+// batch_id form one user action; unbatched (single) removals stand alone.
+function groupTrashByBatch(items: TrashItem[]): { key: string; batch: { id: number; time: number } | null; items: TrashItem[] }[] {
+  const segments: { key: string; batch: { id: number; time: number } | null; items: TrashItem[] }[] = [];
+  for (const item of items) {
+    const last = segments[segments.length - 1];
+    if (item.batch_id !== null && last?.batch?.id === item.batch_id) {
+      last.items.push(item);
+      continue;
+    }
+    segments.push({
+      key: item.batch_id !== null ? `batch-${item.batch_id}` : `item-${item.id}`,
+      batch: item.batch_id !== null ? { id: item.batch_id, time: item.created_at } : null,
+      items: [item],
+    });
+  }
+  return segments;
+}
 
+const HISTORY_PAGE = 100;
 export function History({ database, active }: { database: string; active: boolean }) {
   const [items, setItems] = useState<HistoryItem[]>([]);
   const [loading, setLoading] = useState(true);

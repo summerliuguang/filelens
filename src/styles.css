@@ -486,6 +486,26 @@ h3 {
   color: #c9def2;
   font-size: 0.8rem;
 }
+.trash-batch {
+  display: grid;
+  gap: 8px;
+}
+.trash-batch-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 8px 12px;
+  background: #232a21;
+  border-left: 3px solid var(--color-accent);
+  border-radius: 6px;
+}
+.trash-batch-head b {
+  font-size: 0.8rem;
+}
+.trash-batch-head span {
+  color: var(--color-text-muted);
+  font-size: 0.75rem;
+}
 .approved {
   color: var(--color-accent);
   background: #414c30;

@@ -13,7 +13,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// Latest schema version this build understands. Older databases are
 /// upgraded stepwise through MIGRATIONS on open; newer ones are rejected so a
 /// downgrade can never misread an unknown schema.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const COPY_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const QUICK_HASH_CHUNK: u64 = 64 * 1024;
 /// Files above this size get the two-stage hash: quick fingerprint first,
@@ -30,6 +30,10 @@ const MIGRATIONS: &[&str] = &[
     // without POSIX metadata, where the feature degrades to "unknown").
     "ALTER TABLE files ADD COLUMN dev INTEGER NOT NULL DEFAULT 0;
      ALTER TABLE files ADD COLUMN inode INTEGER NOT NULL DEFAULT 0;",
+    // v3 -> v4: batch id grouping the operations of one user action so the
+    // recycle bin can be presented (and reasoned about) per cleanup.
+    "ALTER TABLE operations ADD COLUMN batch_id INTEGER;
+     CREATE INDEX IF NOT EXISTS operations_batch ON operations(batch_id);",
 ];
 
 fn create_schema_sql() -> &'static str {
@@ -77,8 +81,10 @@ fn create_schema_sql() -> &'static str {
        state TEXT NOT NULL,
        created_at INTEGER NOT NULL,
        restored_at INTEGER,
+       batch_id INTEGER,
        FOREIGN KEY(file_id) REFERENCES files(id)
-     );"
+     );
+     CREATE INDEX IF NOT EXISTS operations_batch ON operations(batch_id);"
 }
 
 #[derive(Parser)]
@@ -1172,9 +1178,38 @@ pub fn set_approval(database: &Path, file_id: i64, approved: bool) -> Result<(),
 pub fn trash(database: &Path, file_id: i64) -> Result<(), String> {
     let connection = open_database(database)?;
     ensure_initialized(&connection)?;
+    trash_one(&connection, file_id, None)
+}
+
+/// Move several approved duplicates in one user action: one connection, and
+/// every resulting operations row shares a single batch id so the recycle
+/// bin can present them as one cleanup.
+pub fn trash_batch(database: &Path, file_ids: &[i64]) -> BatchOutcome {
+    let mut outcome = BatchOutcome::default();
+    if file_ids.is_empty() {
+        return outcome;
+    }
+    let Ok(connection) = open_database(database).map_err(|e| outcome.failures.push(e)) else {
+        return outcome;
+    };
+    if let Err(error) = ensure_initialized(&connection) {
+        outcome.failures.push(error);
+        return outcome;
+    }
+    let batch_id = new_batch_id();
+    for file_id in file_ids {
+        match trash_one(&connection, *file_id, Some(batch_id)) {
+            Ok(()) => outcome.succeeded += 1,
+            Err(error) => outcome.failures.push(format!("文件 #{file_id}：{error}")),
+        }
+    }
+    outcome
+}
+
+fn trash_one(connection: &Connection, file_id: i64, batch_id: Option<i64>) -> Result<(), String> {
     let file =
-        file_by_id(&connection, file_id)?.ok_or_else(|| format!("unknown file id {file_id}"))?;
-    if file.protected || !file.approved || !is_exact_duplicate(&connection, &file)? {
+        file_by_id(connection, file_id)?.ok_or_else(|| format!("unknown file id {file_id}"))?;
+    if file.protected || !file.approved || !is_exact_duplicate(connection, &file)? {
         return Err(
             "file must be an approved, unprotected member of an exact duplicate group".to_string(),
         );
@@ -1183,9 +1218,9 @@ pub fn trash(database: &Path, file_id: i64) -> Result<(), String> {
     if hash_file(&source)? != file.hash {
         return Err("source no longer matches indexed hash; scan again".to_string());
     }
-    let destination = recycle_destination(&connection, file.id, &source)?;
+    let destination = recycle_destination(connection, file.id, &source)?;
     move_verified(&source, &destination, &file.hash)?;
-    connection.execute("INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at) VALUES(?1,?2,?3,?4,'trashed',?5)", params![file.id, file.path, destination.to_string_lossy(), file.hash, now_seconds()?]).map_err(|e| e.to_string())?;
+    connection.execute("INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at,batch_id) VALUES(?1,?2,?3,?4,'trashed',?5,?6)", params![file.id, file.path, destination.to_string_lossy(), file.hash, now_seconds()?, batch_id]).map_err(|e| e.to_string())?;
     connection
         .execute(
             "UPDATE files SET present=0, approved=0 WHERE id=?1",
@@ -1256,9 +1291,41 @@ pub fn restore(database: &Path, operation_id: i64) -> Result<(), String> {
 pub fn delete_direct(database: &Path, file_id: i64) -> Result<(), String> {
     let connection = open_database(database)?;
     ensure_initialized(&connection)?;
+    delete_one(&connection, file_id, None)
+}
+
+/// Permanently delete several approved duplicates from one user action,
+/// sharing a single batch id (see `trash_batch`).
+pub fn delete_approved_batch(database: &Path, file_ids: &[i64]) -> BatchOutcome {
+    let mut outcome = BatchOutcome::default();
+    if file_ids.is_empty() {
+        return outcome;
+    }
+    let Ok(connection) = open_database(database).map_err(|e| outcome.failures.push(e)) else {
+        return outcome;
+    };
+    if let Err(error) = ensure_initialized(&connection) {
+        outcome.failures.push(error);
+        return outcome;
+    }
+    let batch_id = new_batch_id();
+    for file_id in file_ids {
+        match delete_one(&connection, *file_id, Some(batch_id)) {
+            Ok(()) => outcome.succeeded += 1,
+            Err(error) => outcome.failures.push(format!("文件 #{file_id}：{error}")),
+        }
+    }
+    outcome
+}
+
+fn delete_one(
+    connection: &Connection,
+    file_id: i64,
+    batch_id: Option<i64>,
+) -> Result<(), String> {
     let file =
-        file_by_id(&connection, file_id)?.ok_or_else(|| format!("unknown file id {file_id}"))?;
-    if file.protected || !file.approved || !is_exact_duplicate(&connection, &file)? {
+        file_by_id(connection, file_id)?.ok_or_else(|| format!("unknown file id {file_id}"))?;
+    if file.protected || !file.approved || !is_exact_duplicate(connection, &file)? {
         return Err(
             "file must be an approved, unprotected member of an exact duplicate group".to_string(),
         );
@@ -1270,8 +1337,8 @@ pub fn delete_direct(database: &Path, file_id: i64) -> Result<(), String> {
     fs::remove_file(&source).map_err(|e| format!("delete file: {e}"))?;
     connection
         .execute(
-            "INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at) VALUES(?1,?2,'',?3,'deleted',?4)",
-            params![file.id, file.path, file.hash, now_seconds()?],
+            "INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at,batch_id) VALUES(?1,?2,'',?3,'deleted',?4,?5)",
+            params![file.id, file.path, file.hash, now_seconds()?, batch_id],
         )
         .map_err(|e| e.to_string())?;
     connection
@@ -1286,20 +1353,31 @@ pub fn delete_direct(database: &Path, file_id: i64) -> Result<(), String> {
 
 /// Outcome of removing user-picked paths: partial success is allowed and the
 /// failures carry per-path reasons for the UI to display verbatim.
+#[derive(Default)]
 pub struct BatchOutcome {
     pub succeeded: usize,
     pub failures: Vec<String>,
 }
 
+/// Nanosecond timestamp as a batch identity: rows written by one user action
+/// share it, rows from different actions never collide in practice.
+fn new_batch_id() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
 fn remove_paths(database: &Path, paths: &[String], to_trash: bool) -> Result<BatchOutcome, String> {
     let connection = open_database(database)?;
     ensure_initialized(&connection)?;
+    let batch_id = new_batch_id();
     let mut outcome = BatchOutcome {
         succeeded: 0,
         failures: Vec::new(),
     };
     for path in paths {
-        match remove_indexed_path(&connection, path, to_trash) {
+        match remove_indexed_path(&connection, path, to_trash, Some(batch_id)) {
             Ok(()) => outcome.succeeded += 1,
             Err(error) => outcome.failures.push(format!("{path}：{error}")),
         }
@@ -1321,7 +1399,12 @@ pub fn delete_paths(database: &Path, paths: &[String]) -> Result<BatchOutcome, S
     remove_paths(database, paths, false)
 }
 
-fn remove_indexed_path(connection: &Connection, path: &str, to_trash: bool) -> Result<(), String> {
+fn remove_indexed_path(
+    connection: &Connection,
+    path: &str,
+    to_trash: bool,
+    batch_id: Option<i64>,
+) -> Result<(), String> {
     let row: Option<(i64, String, i64, i64)> = connection
         .query_row(
             "SELECT id,hash,protected,present FROM files WHERE path=?1",
@@ -1349,13 +1432,13 @@ fn remove_indexed_path(connection: &Connection, path: &str, to_trash: bool) -> R
     if to_trash {
         let destination = recycle_destination(connection, file_id, &source)?;
         move_verified(&source, &destination, &hash)?;
-        connection.execute("INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at) VALUES(?1,?2,?3,?4,'trashed',?5)", params![file_id, path, destination.to_string_lossy(), hash, now_seconds()?]).map_err(|e| e.to_string())?;
+        connection.execute("INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at,batch_id) VALUES(?1,?2,?3,?4,'trashed',?5,?6)", params![file_id, path, destination.to_string_lossy(), hash, now_seconds()?, batch_id]).map_err(|e| e.to_string())?;
     } else {
         fs::remove_file(&source).map_err(|e| format!("删除文件失败：{e}"))?;
         connection
             .execute(
-                "INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at) VALUES(?1,?2,'',?3,'deleted',?4)",
-                params![file_id, path, hash, now_seconds()?],
+                "INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at,batch_id) VALUES(?1,?2,'',?3,'deleted',?4,?5)",
+                params![file_id, path, hash, now_seconds()?, batch_id],
             )
             .map_err(|e| e.to_string())?;
     }
@@ -2668,7 +2751,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_database_migrates_to_v3_preserving_data() {
+    fn v2_database_migrates_to_current_preserving_data() {
         let directory = test_directory("migration-v2-v3");
         let database = directory.join("index.db");
         // Hand-rolled v2 database: pre-dev/inode schema with a data row.
@@ -2728,7 +2811,8 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap();
-        assert_eq!(version, 3);
+        // Stepwise migrations carry v2 all the way to the current version.
+        assert_eq!(version, SCHEMA_VERSION);
         let row: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM files WHERE dev=0 AND inode=0",
@@ -2737,6 +2821,74 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, 1);
+        drop(connection);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn batch_trash_shares_one_batch_id() {
+        let directory = test_directory("batch-view");
+        let source = directory.join("source");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&source).unwrap();
+        // One three-member pair (the batch keeps the required one copy)
+        // and one two-member pair removed file-by-file afterwards.
+        fs::write(source.join("a1.txt"), b"pair one").unwrap();
+        fs::write(source.join("a2.txt"), b"pair one").unwrap();
+        fs::write(source.join("a3.txt"), b"pair one").unwrap();
+        fs::write(source.join("b1.txt"), b"pair two").unwrap();
+        fs::write(source.join("b2.txt"), b"pair two").unwrap();
+        let database = directory.join("index.db");
+        init(&database, &recycle).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        let connection = open_database(&database).unwrap();
+        let id_of = |name: &str| -> i64 {
+            connection
+                .query_row(
+                    "SELECT id FROM files WHERE path LIKE ?1",
+                    [format!("%/{name}.txt")],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let (a1, a2, b1, b2) = (id_of("a1"), id_of("a2"), id_of("b1"), id_of("b2"));
+        drop(connection);
+
+        // One batch action removes both members of pair a (approval first,
+        // exactly like the UI's mark-then-process flow).
+        set_approval(&database, a1, true).unwrap();
+        set_approval(&database, a2, true).unwrap();
+        let outcome = trash_batch(&database, &[a1, a2]);
+        assert_eq!(outcome.succeeded, 2);
+        assert!(outcome.failures.is_empty());
+        // Single-file removal of pair b (both approved while the pair is
+        // still intact; only b1 is then removed, keeping one copy as the
+        // safety rule requires). No batch id.
+        set_approval(&database, b1, true).unwrap();
+        set_approval(&database, b2, true).unwrap();
+        trash(&database, b1).unwrap();
+
+        let connection = open_database(&database).unwrap();
+        let (batched, unbatched): (i64, i64) = connection
+            .query_row(
+                "SELECT \
+                 SUM(batch_id IS NOT NULL), SUM(batch_id IS NULL) \
+                 FROM operations WHERE state='trashed'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(batched, 2, "one batch action writes one shared batch id");
+        assert_eq!(unbatched, 1, "single removals stay unbatched");
+        let distinct: i64 = connection
+            .query_row(
+                "SELECT COUNT(DISTINCT batch_id) FROM operations \
+                 WHERE state='trashed' AND batch_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(distinct, 1);
         drop(connection);
         let _ = fs::remove_dir_all(directory);
     }

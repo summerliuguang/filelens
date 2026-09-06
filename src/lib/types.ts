@@ -51,6 +51,8 @@ export type TrashItem = {
   source_path: string;
   trash_path: string;
   expired: boolean;
+  /** Shared id of one bulk user action; null for single-file removals. */
+  batch_id: number | null;
 };
 
 export type HistoryItem = {
