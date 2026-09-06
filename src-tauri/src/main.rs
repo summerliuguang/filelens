@@ -59,6 +59,8 @@ struct TrashItem {
     source_path: String,
     trash_path: String,
     expired: bool,
+    /// Shared id of one bulk user action; null for single-file removals.
+    batch_id: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -396,23 +398,13 @@ fn trash(database: String, file_id: i64) -> Result<String, String> {
 
 #[tauri::command]
 fn trash_approved(database: String, file_ids: Vec<i64>) -> Result<String, String> {
-    let mut moved = 0;
-    let mut failed: Vec<String> = Vec::new();
-    for file_id in file_ids {
-        match filelens::trash(&PathBuf::from(&database), file_id) {
-            Ok(()) => moved += 1,
-            Err(error) => failed.push(format!("文件 #{file_id}：{error}")),
-        }
-    }
-    if failed.is_empty() {
-        Ok(format!("已将 {moved} 个确认副本移入应用回收站。"))
-    } else {
-        Ok(format!(
-            "已移动 {moved} 个，{} 个失败：{}",
-            failed.len(),
-            failed.join("；")
-        ))
-    }
+    let outcome = filelens::trash_batch(&PathBuf::from(&database), &file_ids);
+    Ok(format!(
+        "已移动 {} 个，{} 个失败：{}",
+        outcome.succeeded,
+        outcome.failures.len(),
+        outcome.failures.join("；")
+    ))
 }
 
 #[tauri::command]
@@ -423,23 +415,13 @@ fn delete_direct(database: String, file_id: i64) -> Result<String, String> {
 
 #[tauri::command]
 fn delete_direct_batch(database: String, file_ids: Vec<i64>) -> Result<String, String> {
-    let mut deleted = 0;
-    let mut failed: Vec<String> = Vec::new();
-    for file_id in file_ids {
-        match filelens::delete_direct(&PathBuf::from(&database), file_id) {
-            Ok(()) => deleted += 1,
-            Err(error) => failed.push(format!("文件 #{file_id}：{error}")),
-        }
-    }
-    if failed.is_empty() {
-        Ok(format!("已永久删除 {deleted} 个文件。"))
-    } else {
-        Ok(format!(
-            "已删除 {deleted} 个，{} 个失败：{}",
-            failed.len(),
-            failed.join("；")
-        ))
-    }
+    let outcome = filelens::delete_approved_batch(&PathBuf::from(&database), &file_ids);
+    Ok(format!(
+        "已删除 {} 个，{} 个失败：{}",
+        outcome.succeeded,
+        outcome.failures.len(),
+        outcome.failures.join("；")
+    ))
 }
 
 /// Recycle user-selected similar candidates (not exact duplicates) after the
@@ -924,7 +906,7 @@ fn trash_list(database: String) -> Result<Vec<TrashItem>, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|value| value.as_secs() as i64)
         .unwrap_or(0);
-    let mut statement = connection.prepare("SELECT id,created_at,source_path,trash_path FROM operations WHERE state='trashed' ORDER BY created_at DESC").map_err(|error| error.to_string())?;
+    let mut statement = connection.prepare("SELECT id,created_at,source_path,trash_path,batch_id FROM operations WHERE state='trashed' ORDER BY created_at DESC").map_err(|error| error.to_string())?;
     statement
         .query_map([], |row| {
             let created_at: i64 = row.get(1)?;
@@ -934,6 +916,7 @@ fn trash_list(database: String) -> Result<Vec<TrashItem>, String> {
                 source_path: row.get(2)?,
                 trash_path: row.get(3)?,
                 expired: retention > 0 && now.saturating_sub(created_at) > retention * 86_400,
+                batch_id: row.get(4)?,
             })
         })
         .map_err(|error| error.to_string())?
