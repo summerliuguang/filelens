@@ -506,6 +506,95 @@ h3 {
   color: var(--color-text-muted);
   font-size: 0.75rem;
 }
+.trash-batch-head button {
+  margin-left: auto;
+  padding: 5px 10px;
+  font-size: 0.72rem;
+}
+.onboarding {
+  display: grid;
+  justify-items: center;
+  align-content: center;
+  gap: 18px;
+  min-height: 340px;
+  text-align: center;
+}
+.onboarding-title {
+  color: #e7e9e1;
+  font-weight: 700;
+}
+.onboarding-steps {
+  display: grid;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  text-align: left;
+}
+.onboarding-steps li {
+  display: grid;
+  grid-template-columns: 26px 1fr;
+  gap: 10px;
+  align-items: start;
+  counter-increment: step;
+}
+.onboarding-steps li::before {
+  content: counter(step);
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border: 1px solid #4b5540;
+  border-radius: 50%;
+  color: var(--color-accent);
+  font-size: 0.8rem;
+}
+.onboarding-steps b {
+  display: block;
+  color: #e7e9e1;
+  font-size: 0.9rem;
+}
+.onboarding-steps span {
+  color: #a7ada2;
+  font-size: 0.8rem;
+  line-height: 1.5;
+}
+.onboarding button {
+  min-width: 180px;
+}
+.onboarding-steps {
+  counter-reset: step;
+}
+.protect-preview {
+  display: grid;
+  gap: 10px;
+  justify-items: start;
+}
+.protect-preview button {
+  width: fit-content;
+}
+.protect-preview-result {
+  display: grid;
+  gap: 7px;
+  width: 100%;
+  padding: 10px 12px;
+  background: #232a21;
+  border-left: 3px solid var(--color-accent);
+  border-radius: 6px;
+  font-size: 0.8rem;
+}
+.protect-preview-result b {
+  color: #e7e9e1;
+}
+.protect-preview-result ul {
+  display: grid;
+  gap: 3px;
+  margin: 0;
+  padding-left: 18px;
+  color: var(--color-text-muted);
+  font-size: 0.74rem;
+  word-break: break-all;
+}
 .approved {
   color: var(--color-accent);
   background: #414c30;

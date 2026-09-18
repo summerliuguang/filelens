@@ -77,6 +77,8 @@ function App() {
     total: 0,
     message: "",
     current_path: null,
+    hashing_path: null,
+    hashing_bytes: 0,
     errors_total: 0,
     recent_errors: [],
   });
@@ -155,6 +157,8 @@ function App() {
             total: 0,
             message: String(error),
             current_path: null,
+            hashing_path: null,
+            hashing_bytes: 0,
             errors_total: 0,
             recent_errors: [],
           }),
@@ -268,6 +272,8 @@ function App() {
         total: 0,
         message: result,
         current_path: null,
+        hashing_path: null,
+        hashing_bytes: 0,
         errors_total: 0,
         recent_errors: [],
       });

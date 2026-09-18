@@ -80,12 +80,17 @@ export type ProjectState = ProjectConfig & {
 
 export type ScanErrorSample = { path: string; error: string };
 
+export type ProtectPreview = { matched: number; examples: string[] };
+
 export type ScanState = {
   state: "idle" | "running" | "completed" | "cancelled" | "failed";
   processed: number;
   total: number;
   message: string;
   current_path: string | null;
+  /** Most recently started full hash + cumulative bytes hashed this scan. */
+  hashing_path: string | null;
+  hashing_bytes: number;
   errors_total: number;
   recent_errors: ScanErrorSample[];
 };

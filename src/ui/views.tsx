@@ -15,8 +15,10 @@ import type {
   Group,
   GroupFile,
   GroupFilters,
+  GroupsPage,
   HistoryItem,
   Page,
+  ProtectPreview,
   SimilarDocument,
   SimilarPhoto,
   Status,
@@ -181,12 +183,28 @@ export function Sources({
       </div>
       <div className="source-list">
         {roots.length === 0 ? (
-          <Empty
-            icon="⌁"
-            text="还没有扫描目录"
-            detail="添加本地同步目录后，即可建立内容索引。"
-            action={{ label: "选择目录", onClick: () => void pickDirectory() }}
-          />
+          <div className="onboarding">
+            <p className="onboarding-title">三步开始清理重复文件</p>
+            <ol className="onboarding-steps">
+              <li>
+                <b>添加扫描目录</b>
+                <span>点击下方按钮选择文件夹，或把路径粘贴进输入框。</span>
+              </li>
+              <li>
+                <b>开始增量扫描</b>
+                <span>
+                  点击右上角「开始增量扫描」；大文件先只比对指纹，不会长时间卡住。
+                </span>
+              </li>
+              <li>
+                <b>审核并清理</b>
+                <span>
+                  在「重复审核」里逐组确认，移入应用回收站的内容随时可整批恢复。
+                </span>
+              </li>
+            </ol>
+            <button onClick={() => void pickDirectory()}>选择第一个目录</button>
+          </div>
         ) : (
           roots.map((root, index) => (
             <article className="source" key={root}>
@@ -269,6 +287,40 @@ export function Review({
   const [pendingRemove, setPendingRemove] = useState<GroupFile | null>(null);
   const [pendingBatch, setPendingBatch] = useState<Group | null>(null);
   const [searchInput, setSearchInput] = useState(filters.search);
+  const [bulkStrategy, setBulkStrategy] = useState<
+    "newest" | "oldest" | "shortest"
+  >("newest");
+  const [pendingBulk, setPendingBulk] = useState<
+    { kind: "mark" } | { kind: "recycle"; fileIds: number[] } | null
+  >(null);
+
+  // Page through every group matching the current filters, not just the
+  // loaded slice, so bulk actions cover the full result set.
+  async function collectAllMatching(): Promise<Group[]> {
+    const all: Group[] = [];
+    let offset = 0;
+    for (;;) {
+      const page = await invoke<GroupsPage>("groups", {
+        database,
+        offset,
+        limit: 200,
+        minSize: filters.minSize,
+        pathContains: filters.search,
+        sort: filters.sort,
+      });
+      all.push(...page.groups);
+      if (page.groups.length === 0 || all.length >= page.total) break;
+      offset += 200;
+    }
+    return all;
+  }
+
+  const bulkStrategyLabel =
+    bulkStrategy === "newest"
+      ? "保留最新"
+      : bulkStrategy === "oldest"
+        ? "保留最旧"
+        : "保留最短路径";
 
   // Mark every duplicate of the "keeper" for later batch processing; pure
   // front-end choice over data the group already carries.
@@ -389,6 +441,45 @@ export function Review({
           <option value="members">按副本数</option>
           <option value="path">按路径</option>
         </select>
+        {totalGroups > 0 && (
+          <>
+            <select
+              value={bulkStrategy}
+              onChange={(event) =>
+                setBulkStrategy(event.target.value as typeof bulkStrategy)
+              }
+              aria-label="批量保留策略"
+            >
+              <option value="newest">每组保留最新</option>
+              <option value="oldest">每组保留最旧</option>
+              <option value="shortest">每组保留最短路径</option>
+            </select>
+            <button
+              className="secondary"
+              disabled={busy}
+              onClick={() => setPendingBulk({ kind: "mark" })}
+            >
+              全部组智能标记
+            </button>
+            <button
+              className="secondary"
+              disabled={busy}
+              onClick={() => {
+                void (async () => {
+                  const all = await collectAllMatching();
+                  const fileIds = all.flatMap((group) =>
+                    group.files
+                      .filter((file) => file.approved && !file.protected)
+                      .map((file) => file.id),
+                  );
+                  setPendingBulk({ kind: "recycle", fileIds });
+                })();
+              }}
+            >
+              回收全部已标记
+            </button>
+          </>
+        )}
         {(filters.search || filters.minSize > 0 || filters.sort !== "size") && (
           <button
             className="text-button"
@@ -637,6 +728,66 @@ export function Review({
               },
             },
           ]}
+        />
+      )}
+      {pendingBulk && (
+        <ConfirmDialog
+          title={
+            pendingBulk.kind === "mark"
+              ? "对筛选命中的全部重复组智能标记"
+              : pendingBulk.fileIds.length > 0
+                ? `移入回收站 ${pendingBulk.fileIds.length} 个已标记副本`
+                : "没有可回收的副本"
+          }
+          detail={
+            pendingBulk.kind === "mark" ? (
+              <>
+                将按「{bulkStrategyLabel}」在筛选命中的每一组（共{" "}
+                {totalGroups} 组）保留一个副本，其余未受保护的副本全部标记为待处理。
+                受保护路径永远不会被标记；标记后可在各组内核对，再用「回收全部已标记」统一处理。
+              </>
+            ) : pendingBulk.fileIds.length > 0 ? (
+              <>
+                这些副本将作为一个批次移入应用回收站，随时可整批恢复；每个文件移动前都会再次校验内容。
+              </>
+            ) : (
+              <>当前筛选结果里没有已标记的副本。可先用「全部组智能标记」批量标记。</>
+            )
+          }
+          busy={busy}
+          onClose={() => setPendingBulk(null)}
+          options={
+            pendingBulk.kind === "recycle" && pendingBulk.fileIds.length === 0
+              ? [{ label: "知道了", action: () => setPendingBulk(null) }]
+              : [
+                  {
+                    label: pendingBulk.kind === "mark" ? "开始标记" : "移入回收站",
+                    kind: pendingBulk.kind === "mark" ? undefined : "danger",
+                    action: () => {
+                      const current = pendingBulk;
+                      setPendingBulk(null);
+                      void execute(async () => {
+                        if (current.kind === "mark") {
+                          const result = await invoke<string>("approve_filtered", {
+                            database,
+                            strategy: bulkStrategy,
+                            minSize: filters.minSize,
+                            pathContains: filters.search,
+                          });
+                          await refresh();
+                          return result;
+                        }
+                        const result = await invoke<string>("trash_approved", {
+                          database,
+                          fileIds: current.fileIds,
+                        });
+                        await refresh();
+                        return result;
+                      }, "bulk");
+                    },
+                  },
+                ]
+          }
         />
       )}
     </section>
@@ -1016,6 +1167,10 @@ export function Trash({
   const [pendingEmpty, setPendingEmpty] = useState(false);
   const [pendingPrune, setPendingPrune] = useState(false);
   const [pendingItem, setPendingItem] = useState<TrashItem | null>(null);
+  const [pendingBatchRestore, setPendingBatchRestore] = useState<{
+    id: number;
+    count: number;
+  } | null>(null);
   const expiredCount = items.filter((item) => item.expired).length;
   return (
     <section className="panel trash-page">
@@ -1063,6 +1218,18 @@ export function Trash({
                     {new Date(segment.batch.time * 1000).toLocaleString("zh-CN")} ·{" "}
                     {segment.items.length} 个文件 · 同一次批量操作
                   </span>
+                  <button
+                    className="secondary"
+                    disabled={busyKeys.has("restore-batch")}
+                    onClick={() =>
+                      setPendingBatchRestore({
+                        id: segment.batch!.id,
+                        count: segment.items.length,
+                      })
+                    }
+                  >
+                    恢复整批
+                  </button>
                 </div>
               )}
               {segment.items.map((item) => (
@@ -1150,6 +1317,31 @@ export function Trash({
                   await refresh();
                   return result;
                 }, "empty");
+              },
+            },
+          ]}
+        />
+      )}
+      {pendingBatchRestore && (
+        <ConfirmDialog
+          title={`恢复整批 ${pendingBatchRestore.count} 个文件`}
+          detail="这批文件将恢复到各自的原位置；原位置已被占用或内容校验失败的文件会被跳过并在结果中提示。"
+          busy={busy}
+          onClose={() => setPendingBatchRestore(null)}
+          options={[
+            {
+              label: "恢复整批",
+              action: () => {
+                const batchId = pendingBatchRestore.id;
+                setPendingBatchRestore(null);
+                void execute(async () => {
+                  const result = await invoke<string>("restore_batch", {
+                    database,
+                    batchId,
+                  });
+                  await refresh();
+                  return result;
+                }, "restore-batch");
               },
             },
           ]}
@@ -1362,6 +1554,9 @@ export function Settings({
   busyKeys: ReadonlySet<string>;
 }) {
   const [rule, setRule] = useState("");
+  const [protectPreview, setProtectPreview] = useState<ProtectPreview | null>(
+    null,
+  );
   const [excludeInput, setExcludeInput] = useState("");
   const [minSizeInput, setMinSizeInput] = useState(
     minFileSize ? String(Math.round(minFileSize / (1024 * 1024))) : "",
@@ -1476,16 +1671,18 @@ export function Settings({
             onChange={(event) => setRule(event.target.value)}
             placeholder="例如 Originals"
           />
-          <button
-            className="secondary"
-            onClick={() => {
-              if (rule.trim() && !protectRules.includes(rule.trim()))
-                setProtectRules([...protectRules, rule.trim()]);
-              setRule("");
-            }}
-          >
-            添加
-          </button>
+            <button
+              className="secondary"
+              onClick={() => {
+                if (rule.trim() && !protectRules.includes(rule.trim())) {
+                  setProtectRules([...protectRules, rule.trim()]);
+                  setProtectPreview(null);
+                }
+                setRule("");
+              }}
+            >
+              添加
+            </button>
         </div>
       </label>
       <div className="rules">
@@ -1493,15 +1690,51 @@ export function Settings({
           <span className="chip" key={item}>
             {item}
             <button
-              onClick={() =>
-                setProtectRules(protectRules.filter((value) => value !== item))
-              }
+              onClick={() => {
+                setProtectRules(protectRules.filter((value) => value !== item));
+                setProtectPreview(null);
+              }}
             >
               ×
             </button>
           </span>
         ))}
       </div>
+      {protectRules.length > 0 && (
+        <div className="protect-preview">
+          <button
+            className="secondary"
+            disabled={busy}
+            onClick={() =>
+              void execute(async () => {
+                const preview = await invoke<ProtectPreview>(
+                  "protect_preview",
+                  { database, protectRules },
+                );
+                setProtectPreview(preview);
+                return `当前规则将保护 ${preview.matched} 个已索引文件。`;
+              }, "protect-preview")
+            }
+          >
+            预览保护范围
+          </button>
+          {protectPreview && (
+            <div className="protect-preview-result">
+              <b>
+                当前规则将保护 {protectPreview.matched} 个已索引文件
+                {protectPreview.matched === 0 && "——没有匹配任何路径，请检查规则拼写"}
+              </b>
+              {protectPreview.examples.length > 0 && (
+                <ul>
+                  {protectPreview.examples.map((example) => (
+                    <li key={example}>{example}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+        </div>
+      )}
       <label>
         排除目录规则
         <div className="input-action">

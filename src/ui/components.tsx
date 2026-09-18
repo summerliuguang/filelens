@@ -9,6 +9,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   fileFolder,
   fileName,
+  formatBytes,
   formatEta,
   formatRate,
 } from "../lib/format";
@@ -273,6 +274,12 @@ export function ScanProgress({
       {scanState.current_path && (
         <div className="scan-current" title={scanState.current_path}>
           正在处理：{scanState.current_path}
+        </div>
+      )}
+      {scanState.hashing_path && (
+        <div className="scan-current" title={scanState.hashing_path}>
+          正在全量哈希大文件：{fileName(scanState.hashing_path)} · 本次扫描累计{" "}
+          {formatBytes(scanState.hashing_bytes)}
         </div>
       )}
       {scanState.errors_total > 0 && (
