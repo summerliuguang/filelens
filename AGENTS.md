@@ -8,7 +8,9 @@ Tauri 2 + React 19 + TypeScript(strict) + Rust。纯本地：扫描/哈希/删�
 - 根 `src/main.rs` — **核心库**（扫描管线、BLAKE3 哈希、相似检测、回收站、安全链）+ CLI + 全部单元测试。不依赖 tauri。
 - `src/lib.rs` — 核心库导出清单；新增公开函数后要同步在这里 re-export。
 - `src-tauri/src/main.rs` — **薄命令层**：`#[tauri::command]`、serde 结构体、缩略图缓存。业务逻辑不写在这里，放进核心库（可测试）。
-- `src/main.tsx` — 整个前端（单文件，~2000 行）；`src/styles.css` 全部样式。
+- `src/main.tsx` — App 外壳与全局状态（约 500 行）；页面视图在 `src/ui/views.tsx`，
+  通用组件（ConfirmDialog/PreviewModal/Empty/ScanProgress）在 `src/ui/components.tsx`，
+  跨层类型镜像与格式化在 `src/lib/{types,format}.ts`；`src/styles.css` 全部样式。
 - `IMPROVEMENT.md` — 本地改进清单（P0–P3），经 `.git/info/exclude` 排除、**不入库**。
 - 测试只写核心库（`src/main.rs` 的 `mod tests`），命令层不设测试。
 
@@ -41,8 +43,10 @@ copy+校验+删源）→ `operations` 表留痕 → 置 `present=0`。相似候�
 ## SQLite 约定
 
 - 每个连接打开即设 `PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;`（核心库与命令层都要）。
-- `ensure_initialized` 校验 `schema_version==1` 并幂等补建索引（`CREATE INDEX IF NOT EXISTS`）。
-  **没有迁移框架**：改表结构前必须先设计迁移路径，否则老库直接打不开。
+- `ensure_initialized` 读取 `schema_version`（当前 v4），低于当前版本则按 `MIGRATIONS`
+  数组逐步事务升级（v2 两级哈希 quick_hash、v3 硬链接 dev/inode、v4 操作批次 batch_id），
+  幂等补建索引（`CREATE INDEX IF NOT EXISTS`），高于当前版本拒绝打开。
+  **改表结构必须新增迁移步骤**，不许改历史迁移或绕过框架。
 - 长任务模式：`Mutex<Option<ScanTask>>` 任务槽 + `AtomicBool` 协作取消 + 轮询 `scan_state`。
 
 ## 约定与环境
