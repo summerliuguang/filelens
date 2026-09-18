@@ -98,6 +98,10 @@ struct ScanState {
     total: u64,
     message: String,
     current_path: Option<String>,
+    /// Most recently started full hash plus cumulative bytes hashed this
+    /// scan, so a multi-GB file never looks like a stalled progress bar.
+    hashing_path: Option<String>,
+    hashing_bytes: u64,
     errors_total: u64,
     recent_errors: Vec<ScanErrorSample>,
 }
@@ -106,6 +110,7 @@ struct ScanTask {
     cancelled: Arc<AtomicBool>,
     state: Arc<Mutex<ScanState>>,
     errors: Arc<filelens::ScanErrorLog>,
+    hash_progress: Arc<filelens::HashProgress>,
 }
 
 fn open_database(path: &str) -> Result<Connection, String> {
@@ -254,13 +259,17 @@ fn start_scan(
         total: 0,
         message: "正在准备扫描...".into(),
         current_path: None,
+        hashing_path: None,
+        hashing_bytes: 0,
         errors_total: 0,
         recent_errors: Vec::new(),
     }));
     let errors = Arc::new(filelens::ScanErrorLog::new());
+    let hash_progress = Arc::new(filelens::HashProgress::new());
     let worker_cancelled = cancelled.clone();
     let worker_state = state.clone();
     let worker_errors = errors.clone();
+    let worker_hash = hash_progress.clone();
     std::thread::spawn(move || {
         let progress_state = worker_state.clone();
         let result = filelens::scan_with_control(
@@ -279,6 +288,7 @@ fn start_scan(
                 }
             },
             Some(&worker_errors),
+            Some(&worker_hash),
         );
         if let Ok(mut current) = worker_state.lock() {
             match result {
@@ -316,7 +326,12 @@ fn start_scan(
             }
         }
     });
-    *task = Some(ScanTask { cancelled, state, errors });
+    *task = Some(ScanTask {
+        cancelled,
+        state,
+        errors,
+        hash_progress,
+    });
     Ok("扫描任务已在后台启动。".into())
 }
 
@@ -330,6 +345,8 @@ fn scan_state(task: tauri::State<'_, Mutex<Option<ScanTask>>>) -> Result<ScanSta
             total: 0,
             message: "没有正在运行的扫描任务。".into(),
             current_path: None,
+            hashing_path: None,
+            hashing_bytes: 0,
             errors_total: 0,
             recent_errors: Vec::new(),
         });
@@ -339,6 +356,9 @@ fn scan_state(task: tauri::State<'_, Mutex<Option<ScanTask>>>) -> Result<ScanSta
         .lock()
         .map_err(|_| "scan state lock failed")?
         .clone();
+    let (hashing_path, hashing_bytes) = current.hash_progress.snapshot();
+    state.hashing_path = hashing_path;
+    state.hashing_bytes = hashing_bytes;
     let (errors_total, recent) = current.errors.snapshot();
     state.errors_total = errors_total;
     state.recent_errors = recent
@@ -465,6 +485,10 @@ fn trash_empty(database: String) -> Result<String, String> {
         .map(|count| format!("已清空回收站，永久删除 {count} 个文件。"))
 }
 
+// Thumbnails and full previews share one cache directory; 500 MB is generous
+// for 320 px tiles while keeping long-term disk growth bounded.
+const THUMBNAIL_CACHE_MAX_BYTES: u64 = 500 * 1024 * 1024;
+
 fn thumbnail_cache_key(path: &Path) -> String {
     let metadata = fs::metadata(path).ok();
     let modified = metadata
@@ -529,6 +553,9 @@ fn render_image(
     let temporary = cached.with_extension("tmp");
     if fs::write(&temporary, &bytes).is_ok() {
         let _ = fs::rename(&temporary, &cached);
+        // Best-effort bound on cache growth; eviction failure must not
+        // break the preview that was just rendered.
+        let _ = filelens::evict_lru_files(&cache_dir, THUMBNAIL_CACHE_MAX_BYTES);
     }
     Ok(Some(format!(
         "data:image/png;base64,{}",
@@ -577,6 +604,64 @@ fn open_file(path: String) -> Result<String, String> {
 #[tauri::command]
 fn restore(database: String, operation_id: i64) -> Result<String, String> {
     filelens::restore(&PathBuf::from(database), operation_id).map(|_| "文件已恢复至原位置。".into())
+}
+
+#[tauri::command]
+fn restore_batch(database: String, batch_id: i64) -> Result<String, String> {
+    let outcome = filelens::restore_batch(&PathBuf::from(&database), batch_id);
+    if outcome.failures.is_empty() {
+        Ok(format!("已恢复整批 {} 个文件至原位置。", outcome.succeeded))
+    } else {
+        Ok(format!(
+            "已恢复 {} 个，{} 个失败：{}",
+            outcome.succeeded,
+            outcome.failures.len(),
+            outcome.failures.join("；")
+        ))
+    }
+}
+
+/// Settings-page preview: how many indexed files the unsaved rule set would
+/// shield, with sample paths.
+#[tauri::command]
+fn protect_preview(
+    database: String,
+    protect_rules: Vec<String>,
+) -> Result<filelens::ProtectPreview, String> {
+    filelens::protect_preview(&PathBuf::from(&database), &protect_rules)
+}
+
+/// Apply one keep-strategy to every duplicate group matching the review
+/// filters, not just the loaded page.
+#[tauri::command]
+fn approve_filtered(
+    database: String,
+    strategy: String,
+    min_size: i64,
+    path_contains: String,
+) -> Result<String, String> {
+    let strategy = match strategy.as_str() {
+        "newest" => filelens::MarkStrategy::Newest,
+        "oldest" => filelens::MarkStrategy::Oldest,
+        "shortest" => filelens::MarkStrategy::Shortest,
+        other => return Err(format!("未知的保留策略：{other}")),
+    };
+    let outcome = filelens::approve_groups_except_keeper(
+        &PathBuf::from(&database),
+        strategy,
+        min_size.max(0),
+        &path_contains,
+    )?;
+    if outcome.failures.is_empty() {
+        Ok(format!("已标记 {} 个副本待处理。", outcome.succeeded))
+    } else {
+        Ok(format!(
+            "已标记 {} 个副本，{} 个失败：{}",
+            outcome.succeeded,
+            outcome.failures.len(),
+            outcome.failures.join("；")
+        ))
+    }
 }
 
 #[tauri::command]
@@ -1036,6 +1121,9 @@ fn main() {
             export_report,
             reveal_in_manager,
             restore,
+            restore_batch,
+            protect_preview,
+            approve_filtered,
             trash_list
         ])
         .run(tauri::generate_context!())
