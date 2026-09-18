@@ -4,6 +4,7 @@ use std::{
     io::{self, Read},
     path::{Path, PathBuf},
     sync::Mutex,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -208,7 +209,9 @@ fn open_database(path: &Path) -> Result<Connection, String> {
     }
     let connection = Connection::open(path).map_err(|e| format!("open database: {e}"))?;
     connection
-        .execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+        .execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+        )
         .map_err(|e| format!("configure database: {e}"))?;
     Ok(connection)
 }
@@ -216,10 +219,25 @@ fn open_database(path: &Path) -> Result<Connection, String> {
 pub fn init(database: &Path, trash: &Path) -> Result<(), String> {
     fs::create_dir_all(trash).map_err(|e| format!("create recycle bin: {e}"))?;
     let connection = open_database(database)?;
-    connection
-        .execute_batch(create_schema_sql())
-        .map_err(|e| format!("create schema: {e}"))?;
-    set_setting(&connection, "schema_version", &SCHEMA_VERSION.to_string())?;
+    let initialized = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if initialized.is_some() {
+        // Existing project: migrate stepwise. Re-running the current-schema
+        // DDL would fail on older databases whose tables lack the columns
+        // the new indexes reference.
+        ensure_initialized(&connection)?;
+    } else {
+        connection
+            .execute_batch(create_schema_sql())
+            .map_err(|e| format!("create schema: {e}"))?;
+        set_setting(&connection, "schema_version", &SCHEMA_VERSION.to_string())?;
+    }
     set_setting(
         &connection,
         "trash_path",
@@ -255,6 +273,7 @@ pub fn scan_with_options(
         silent,
         &|| false,
         &|_, _, _| {},
+        None,
         None,
     )
 }
@@ -321,6 +340,41 @@ impl ScanErrorLog {
     }
 }
 
+/// Live byte counters for the full-hash stage of a running scan, shared
+/// between hashing workers and the GUI task slot. Workers call `begin`/`add`;
+/// the `scan_state` poller reads `snapshot`. A poisoned lock degrades to
+/// best-effort access exactly like `ScanErrorLog`.
+#[derive(Default)]
+pub struct HashProgress {
+    current_path: Mutex<Option<String>>,
+    bytes_done: AtomicU64,
+}
+
+impl HashProgress {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn begin(&self, path: &Path) {
+        if let Ok(mut current) = self.current_path.lock() {
+            *current = Some(path.to_string_lossy().into_owned());
+        }
+    }
+
+    fn add(&self, bytes: u64) {
+        self.bytes_done.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// (most recently started file, cumulative bytes hashed this scan)
+    pub fn snapshot(&self) -> (Option<String>, u64) {
+        let current = match self.current_path.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        (current, self.bytes_done.load(Ordering::Relaxed))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn scan_with_control(
     database: &Path,
@@ -332,6 +386,7 @@ pub fn scan_with_control(
     cancelled: &(dyn Fn() -> bool + Send + Sync),
     progress: &(dyn Fn(u64, u64, Option<&str>) + Send + Sync),
     errors: Option<&ScanErrorLog>,
+    hash_progress: Option<&HashProgress>,
 ) -> Result<ScanSummary, String> {
     let connection = open_database(database)?;
     ensure_initialized(&connection)?;
@@ -370,6 +425,7 @@ pub fn scan_with_control(
             cancelled,
             progress,
             errors,
+            hash_progress,
             total,
         )?;
         scanned_roots.push(root.clone());
@@ -538,7 +594,7 @@ enum WorkResult {
 
 /// Hash and fingerprint one file on a worker thread. Pure file I/O: the
 /// database is only touched by the writer thread.
-fn process_file(path: PathBuf) -> WorkResult {
+fn process_file(path: PathBuf, hash_progress: Option<&HashProgress>) -> WorkResult {
     let path_text = match absolute_path(&path) {
         Ok(absolute) => absolute.to_string_lossy().into_owned(),
         Err(error) => {
@@ -557,7 +613,7 @@ fn process_file(path: PathBuf) -> WorkResult {
         let (hash, quick_hash) = if size as u64 > LARGE_FILE_QUICK_THRESHOLD {
             (String::new(), Some(quick_hash_file(&path)?))
         } else {
-            (hash_file(&path)?, None)
+            (hash_file_progress(&path, hash_progress)?, None)
         };
         let after = fs::metadata(&path).map_err(|e| e.to_string())?;
         if after.len() != metadata.len()
@@ -787,6 +843,7 @@ fn run_parallel_scan(
     cancelled: &(dyn Fn() -> bool + Send + Sync),
     progress: &(dyn Fn(u64, u64, Option<&str>) + Send + Sync),
     errors: Option<&ScanErrorLog>,
+    hash_progress: Option<&HashProgress>,
     total: u64,
 ) -> Result<(), String> {
     use std::sync::mpsc::{self, TryRecvError};
@@ -835,7 +892,7 @@ fn run_parallel_scan(
                 };
                 match item {
                     Ok(path) => {
-                        let _ = result_tx.send(process_file(path));
+                        let _ = result_tx.send(process_file(path, hash_progress));
                     }
                     Err(TryRecvError::Empty) => {
                         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -900,7 +957,10 @@ fn run_parallel_scan(
                                 bucket.push(sibling);
                             }
                             for mut promoted in bucket {
-                                promoted.hash = hash_file(Path::new(&promoted.path_text))?;
+                                promoted.hash = hash_file_progress(
+                                    Path::new(&promoted.path_text),
+                                    hash_progress,
+                                )?;
                                 match write_entry(connection, &promoted, protect)? {
                                     IndexOutcome::New => counters.new += 1,
                                     IndexOutcome::Updated => counters.updated += 1,
@@ -910,7 +970,7 @@ fn run_parallel_scan(
                             // Indexed rows promoted in an earlier scan still
                             // carry their quick marker; refresh them so a
                             // newly found twin groups under the real hash.
-                            refresh_quick_hash_rows(connection, key.0, &quick)?;
+                            refresh_quick_hash_rows(connection, key.0, &quick, hash_progress)?;
                         } else {
                             pending.insert(key, entry);
                         }
@@ -962,6 +1022,7 @@ fn refresh_quick_hash_rows(
     connection: &Connection,
     size: i64,
     quick: &str,
+    hash_progress: Option<&HashProgress>,
 ) -> Result<(), String> {
     let mut statement = connection
         .prepare(
@@ -975,7 +1036,7 @@ fn refresh_quick_hash_rows(
         .map_err(|e| e.to_string())?;
     drop(statement);
     for path in paths {
-        let hash = hash_file(Path::new(&path))?;
+        let hash = hash_file_progress(Path::new(&path), hash_progress)?;
         connection
             .execute(
                 "UPDATE files SET hash=?1 WHERE path=?2",
@@ -1011,6 +1072,16 @@ enum IndexOutcome {
 }
 
 fn hash_file(path: &Path) -> Result<String, String> {
+    hash_file_progress(path, None)
+}
+
+/// Full BLAKE3 hash with optional live byte reporting: `progress` sees the
+/// most recently started file plus cumulative bytes across all concurrent
+/// hashing workers.
+fn hash_file_progress(path: &Path, progress: Option<&HashProgress>) -> Result<String, String> {
+    if let Some(progress) = progress {
+        progress.begin(path);
+    }
     let mut file = File::open(path).map_err(|e| e.to_string())?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
@@ -1020,6 +1091,9 @@ fn hash_file(path: &Path) -> Result<String, String> {
             break;
         }
         hasher.update(&buffer[..count]);
+        if let Some(progress) = progress {
+            progress.add(count as u64);
+        }
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
@@ -1154,12 +1228,16 @@ fn groups(database: &Path) -> Result<(), String> {
 pub fn set_approval(database: &Path, file_id: i64, approved: bool) -> Result<(), String> {
     let connection = open_database(database)?;
     ensure_initialized(&connection)?;
+    set_approval_with(&connection, file_id, approved)
+}
+
+fn set_approval_with(connection: &Connection, file_id: i64, approved: bool) -> Result<(), String> {
     let file =
-        file_by_id(&connection, file_id)?.ok_or_else(|| format!("unknown file id {file_id}"))?;
+        file_by_id(connection, file_id)?.ok_or_else(|| format!("unknown file id {file_id}"))?;
     if approved && file.protected {
         return Err("protected files cannot be approved".to_string());
     }
-    if approved && !is_exact_duplicate(&connection, &file)? {
+    if approved && !is_exact_duplicate(connection, &file)? {
         return Err("only members of an exact duplicate group can be approved".to_string());
     }
     connection
@@ -1174,6 +1252,124 @@ pub fn set_approval(database: &Path, file_id: i64, approved: bool) -> Result<(),
     );
     Ok(())
 }
+
+/// Which copy a group keeps when bulk-marking; mirrors the review page's
+/// single-group smart-mark strategies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkStrategy {
+    Newest,
+    Oldest,
+    Shortest,
+}
+
+/// Keep-one-mark-the-rest applied to every duplicate group matching the
+/// review filters, not just the currently loaded page. Keeper choice mirrors
+/// the frontend smart mark (strict comparison, first occurrence wins ties),
+/// so both paths select the same copy. Per-copy failures are collected;
+/// the sweep never aborts midway.
+pub fn approve_groups_except_keeper(
+    database: &Path,
+    strategy: MarkStrategy,
+    min_size: i64,
+    path_contains: &str,
+) -> Result<BatchOutcome, String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    let pattern = path_contains.trim();
+    let mut outcome = BatchOutcome::default();
+    let mut query = GroupQuery {
+        min_size,
+        path_contains: (!pattern.is_empty()).then_some(pattern),
+        sort: GroupSort::Size,
+        offset: 0,
+        limit: 200,
+    };
+    loop {
+        let page = query_groups_with(&connection, &query)?;
+        if page.groups.is_empty() {
+            break;
+        }
+        let page_len = page.groups.len() as i64;
+        for group in page.groups {
+            let pool: Vec<&GroupFile> = group.files.iter().filter(|f| !f.protected).collect();
+            if pool.len() < 2 {
+                continue;
+            }
+            let mut keeper = pool[0];
+            for candidate in pool.clone() {
+                match strategy {
+                    MarkStrategy::Newest => {
+                        if candidate.modified > keeper.modified {
+                            keeper = candidate;
+                        }
+                    }
+                    MarkStrategy::Oldest => {
+                        if candidate.modified < keeper.modified {
+                            keeper = candidate;
+                        }
+                    }
+                    MarkStrategy::Shortest => {
+                        if candidate.path.len() < keeper.path.len() {
+                            keeper = candidate;
+                        }
+                    }
+                }
+            }
+            for file in pool {
+                if file.id == keeper.id || file.approved {
+                    continue;
+                }
+                match set_approval_with(&connection, file.id, true) {
+                    Ok(()) => outcome.succeeded += 1,
+                    Err(error) => outcome.failures.push(format!("{}：{error}", file.path)),
+                }
+            }
+        }
+        if page_len < query.limit {
+            break;
+        }
+        query.offset += query.limit;
+    }
+    Ok(outcome)
+}
+
+/// What the settings-page rule preview shows: how many indexed files the
+/// given rules would shield, with a few example paths. Rules are passed in
+/// because the user previews before saving them.
+#[derive(serde::Serialize)]
+pub struct ProtectPreview {
+    pub matched: i64,
+    pub examples: Vec<String>,
+}
+
+pub fn protect_preview(database: &Path, rules: &[String]) -> Result<ProtectPreview, String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    let mut statement = connection
+        .prepare("SELECT path FROM files WHERE present=1")
+        .map_err(|e| e.to_string())?;
+    let paths = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    drop(statement);
+    let mut preview = ProtectPreview {
+        matched: 0,
+        examples: Vec::new(),
+    };
+    for path in paths {
+        if is_protected_path(&path, rules) {
+            preview.matched += 1;
+            if preview.examples.len() < PROTECT_PREVIEW_EXAMPLES {
+                preview.examples.push(path);
+            }
+        }
+    }
+    Ok(preview)
+}
+
+const PROTECT_PREVIEW_EXAMPLES: usize = 20;
 
 pub fn trash(database: &Path, file_id: i64) -> Result<(), String> {
     let connection = open_database(database)?;
@@ -1234,6 +1430,45 @@ fn trash_one(connection: &Connection, file_id: i64, batch_id: Option<i64>) -> Re
 pub fn restore(database: &Path, operation_id: i64) -> Result<(), String> {
     let connection = open_database(database)?;
     ensure_initialized(&connection)?;
+    restore_with(&connection, operation_id)
+}
+
+/// Restore every still-recycled file from one bulk user action, sharing a
+/// single connection. Per-file failures (destination occupied, integrity
+/// check failed) are collected; the batch never aborts midway.
+pub fn restore_batch(database: &Path, batch_id: i64) -> BatchOutcome {
+    let mut outcome = BatchOutcome::default();
+    let Ok(connection) = open_database(database).map_err(|e| outcome.failures.push(e)) else {
+        return outcome;
+    };
+    if let Err(error) = ensure_initialized(&connection) {
+        outcome.failures.push(error);
+        return outcome;
+    }
+    let ids = match connection
+        .prepare("SELECT id FROM operations WHERE batch_id=?1 AND state='trashed' ORDER BY id")
+    {
+        Ok(mut statement) => statement
+            .query_map(params![batch_id], |row| row.get::<_, i64>(0))
+            .map_err(|e| e.to_string())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())),
+        Err(e) => Err(e.to_string()),
+    };
+    match ids {
+        Ok(ids) => {
+            for id in ids {
+                match restore_with(&connection, id) {
+                    Ok(()) => outcome.succeeded += 1,
+                    Err(error) => outcome.failures.push(format!("记录 #{id}：{error}")),
+                }
+            }
+        }
+        Err(error) => outcome.failures.push(error),
+    }
+    outcome
+}
+
+fn restore_with(connection: &Connection, operation_id: i64) -> Result<(), String> {
     let record: Option<(i64, String, String, String, String)> = connection
         .query_row(
             "SELECT file_id,source_path,trash_path,hash,state FROM operations WHERE id=?1",
@@ -1889,6 +2124,43 @@ pub fn export_report(database: &Path, output: &Path) -> Result<usize, String> {
     Ok(count)
 }
 
+/// Cache-directory eviction: keep the directory at or below `max_bytes` by
+/// deleting least-recently-modified files first. Returns the number of files
+/// removed and bytes freed. A missing directory behaves as empty; entries
+/// that cannot be read or removed are skipped, never fatal.
+pub fn evict_lru_files(directory: &Path, max_bytes: u64) -> Result<(usize, u64), String> {
+    let mut entries: Vec<(PathBuf, SystemTime, u64)> = Vec::new();
+    if let Ok(reader) = fs::read_dir(directory) {
+        for entry in reader.flatten() {
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+            entries.push((entry.path(), modified, metadata.len()));
+        }
+    }
+    let total: u64 = entries.iter().map(|(_, _, size)| size).sum();
+    if total <= max_bytes {
+        return Ok((0, 0));
+    }
+    entries.sort_by_key(|(_, modified, _)| *modified);
+    let mut removed = 0_usize;
+    let mut freed = 0_u64;
+    for (path, _, size) in entries {
+        if total - freed <= max_bytes {
+            break;
+        }
+        if fs::remove_file(&path).is_ok() {
+            removed += 1;
+            freed += size;
+        }
+    }
+    Ok((removed, freed))
+}
+
 /// RFC 4180 quoting: fields containing commas, quotes or newlines get wrapped
 /// in quotes with embedded quotes doubled.
 fn csv_field(value: &str) -> String {
@@ -2014,6 +2286,186 @@ mod tests {
         let path = std::env::temp_dir().join(format!("filelens-{name}-{nonce}"));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn evict_lru_files_keeps_directory_under_limit() {
+        let directory = test_directory("cache-evict");
+        fs::create_dir_all(&directory).unwrap();
+        let write_cached = |name: &str, age_seconds: u64| {
+            let path = directory.join(name);
+            fs::write(&path, vec![b'x'; 100]).unwrap();
+            let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_modified(SystemTime::now() - std::time::Duration::from_secs(age_seconds))
+                .unwrap();
+        };
+        write_cached("old.png", 300);
+        write_cached("middle.png", 200);
+        write_cached("new.png", 100);
+
+        // 300 bytes against a 150-byte cap: the two oldest go first.
+        let (removed, freed) = evict_lru_files(&directory, 150).unwrap();
+        assert_eq!((removed, freed), (2, 200));
+        assert!(!directory.join("old.png").exists());
+        assert!(!directory.join("middle.png").exists());
+        assert!(directory.join("new.png").exists());
+
+        // At or under the limit the pass is a no-op, and a missing
+        // directory behaves as empty instead of erroring.
+        assert_eq!(evict_lru_files(&directory, 150).unwrap(), (0, 0));
+        assert_eq!(
+            evict_lru_files(&directory.join("missing"), 100).unwrap(),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn restore_batch_restores_whole_bulk_action() {
+        let directory = test_directory("restore-batch");
+        let source = directory.join("source");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&source).unwrap();
+        // Three members in pair a: trashing two must keep one present copy,
+        // exactly like the UI's mark-then-process flow.
+        fs::write(source.join("a1.txt"), b"pair one").unwrap();
+        fs::write(source.join("a2.txt"), b"pair one").unwrap();
+        fs::write(source.join("a3.txt"), b"pair one").unwrap();
+        fs::write(source.join("b1.txt"), b"pair two").unwrap();
+        fs::write(source.join("b2.txt"), b"pair two").unwrap();
+        let database = directory.join("index.db");
+        init(&database, &recycle).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        let connection = open_database(&database).unwrap();
+        let id_of = |name: &str| -> i64 {
+            connection
+                .query_row(
+                    "SELECT id FROM files WHERE path LIKE ?1",
+                    [format!("%/{name}.txt")],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        // Batch removal of pair a shares one batch id; pair b loses one copy
+        // file-by-file with no batch id and must not be touched by it.
+        let (a1, a2, b1, b2) = (id_of("a1"), id_of("a2"), id_of("b1"), id_of("b2"));
+        set_approval(&database, a1, true).unwrap();
+        set_approval(&database, a2, true).unwrap();
+        assert_eq!(trash_batch(&database, &[a1, a2]).succeeded, 2);
+        set_approval(&database, b1, true).unwrap();
+        set_approval(&database, b2, true).unwrap();
+        trash(&database, b1).unwrap();
+        let batch_id: i64 = connection
+            .query_row(
+                "SELECT batch_id FROM operations WHERE state='trashed' AND batch_id IS NOT NULL LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(connection);
+
+        let outcome = restore_batch(&database, batch_id);
+        assert_eq!(outcome.succeeded, 2);
+        assert!(outcome.failures.is_empty());
+        assert!(source.join("a1.txt").exists());
+        assert!(source.join("a2.txt").exists());
+        assert!(!source.join("b1.txt").exists());
+        // Restoring the same batch again is a no-op: no record is still
+        // trashed.
+        let outcome = restore_batch(&database, batch_id);
+        assert_eq!(outcome.succeeded, 0);
+        assert!(outcome.failures.is_empty());
+    }
+
+    #[test]
+    fn hash_progress_reports_files_and_bytes() {
+        let directory = test_directory("hash-progress");
+        let source = directory.join("source");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("one.txt"), b"content one").unwrap();
+        fs::write(source.join("two.txt"), b"content two").unwrap();
+        let database = directory.join("index.db");
+        init(&database, &recycle).unwrap();
+
+        let progress = HashProgress::new();
+        scan_with_control(
+            &database,
+            std::slice::from_ref(&source),
+            &[],
+            &[],
+            0,
+            true,
+            &|| false,
+            &|_, _, _| {},
+            None,
+            Some(&progress),
+        )
+        .unwrap();
+        let (current, bytes) = progress.snapshot();
+        assert!(bytes > 0);
+        assert!(current.is_some());
+    }
+
+    #[test]
+    fn approve_groups_except_keeper_marks_across_groups() {
+        let directory = test_directory("bulk-mark");
+        let source = directory.join("source");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("x_old.txt"), b"g1").unwrap();
+        fs::write(source.join("x_new.txt"), b"g1").unwrap();
+        fs::write(source.join("y_old.txt"), b"g2").unwrap();
+        fs::write(source.join("y_new.txt"), b"g2").unwrap();
+        let database = directory.join("index.db");
+        init(&database, &recycle).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+
+        let connection = open_database(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE files SET modified = CASE WHEN path LIKE '%x_new%' OR path LIKE '%y_new%' THEN 2000 ELSE 1000 END, protected = CASE WHEN path LIKE '%y_old%' THEN 1 ELSE 0 END",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        // Group one keeps the newest copy and marks the old one; group two's
+        // only unprotected copy IS the keeper, so nothing is marked there.
+        let outcome = approve_groups_except_keeper(&database, MarkStrategy::Newest, 0, "").unwrap();
+        assert_eq!(outcome.succeeded, 1);
+        assert!(outcome.failures.is_empty());
+
+        let connection = open_database(&database).unwrap();
+        let marked: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE present=1 AND approved=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(marked, 1);
+    }
+
+    #[test]
+    fn protect_preview_counts_and_samples_matches() {
+        let directory = test_directory("protect-preview");
+        let source = directory.join("source");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("keep_me.txt"), b"one").unwrap();
+        fs::write(source.join("other.txt"), b"two").unwrap();
+        let database = directory.join("index.db");
+        init(&database, &recycle).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+
+        let preview = protect_preview(&database, &["keep_me".to_string()]).unwrap();
+        assert_eq!(preview.matched, 1);
+        assert_eq!(preview.examples.len(), 1);
+        assert!(preview.examples[0].ends_with("keep_me.txt"));
+
+        let preview = protect_preview(&database, &[]).unwrap();
+        assert_eq!(preview.matched, 0);
     }
 
     #[test]
@@ -2592,6 +3044,75 @@ mod tests {
     }
 
     #[test]
+    fn init_on_v1_database_migrates_instead_of_failing() {
+        let directory = test_directory("init-migration-v1");
+        let database = directory.join("index.db");
+        // Hand-rolled v1 database, same shape the desktop app's first
+        // release left behind.
+        let connection = open_database(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE files (
+                   id INTEGER PRIMARY KEY,
+                   path TEXT NOT NULL UNIQUE,
+                   size INTEGER NOT NULL,
+                   modified INTEGER NOT NULL,
+                   hash TEXT NOT NULL,
+                   protected INTEGER NOT NULL DEFAULT 0,
+                   approved INTEGER NOT NULL DEFAULT 0,
+                   present INTEGER NOT NULL DEFAULT 1,
+                   scanned_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE operations (
+                   id INTEGER PRIMARY KEY,
+                   file_id INTEGER NOT NULL,
+                   source_path TEXT NOT NULL,
+                   trash_path TEXT NOT NULL,
+                   hash TEXT NOT NULL,
+                   state TEXT NOT NULL,
+                   created_at INTEGER NOT NULL,
+                   restored_at INTEGER
+                 );
+                 INSERT INTO settings(key,value) VALUES('schema_version','1');
+                 INSERT INTO settings(key,value) VALUES('trash_path','/tmp/recycle');
+                 INSERT INTO files(path,size,modified,hash,scanned_at)
+                   VALUES('/data/keep.txt',42,100,'deadbeef',100);",
+            )
+            .unwrap();
+        drop(connection);
+
+        // The desktop app routes every launch through init, so it must
+        // upgrade the old schema rather than run current-schema DDL on it
+        // (the quick_hash index would fail on a v1 files table).
+        let recycle = directory.join("recycle");
+        init(&database, &recycle).unwrap();
+
+        let connection = open_database(&database).unwrap();
+        let version: i64 = connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let (kept, quick_hash): (i64, Option<String>) = connection
+            .query_row(
+                "SELECT COUNT(*), quick_hash FROM files WHERE path='/data/keep.txt'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kept, 1);
+        assert_eq!(quick_hash, None);
+        drop(connection);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn large_files_use_two_stage_hashing() {
         let directory = test_directory("two-stage");
         let source = directory.join("source");
@@ -2935,6 +3456,7 @@ mod tests {
             true,
             &|| false,
             &|_, _, _| {},
+            None,
             None,
         )
         .unwrap();
