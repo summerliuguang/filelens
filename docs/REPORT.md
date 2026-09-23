@@ -115,7 +115,7 @@ src/lib/{types,format} 跨层类型镜像（snake_case 对齐）与格式化/错
 
 ## 六、已知限制
 
-1. **AppImage 打包**：构建环境的 linuxdeploy 外部工具偶发失败（最近一次构建已成功产出）；deb/rpm 与裸二进制验证不受影响，Windows NSIS 交叉编译路径亦不受影响。
+1. **AppImage 打包**：构建环境（WSL2）缺 libfuse2，linuxdeploy 直接运行报错、以 extract-and-run 降级模式运行会卡死在 appimagetool——AppImage 产物不可靠；deb/rpm/NSIS 三条打包路径不受影响。需要 AppImage 时建议在有 FUSE 的原生 Linux 环境出包。
 2. **相似检测只读**：相似照片/文档是视觉/文本近似，误报率高于精确哈希，设计上仅允许人工逐个确认后处理，不提供自动清理。
 3. **两级哈希的空扫描场景**：孤立大文件先以 `q:` 标记哈希入库（不参与分组），孪生文件出现时自动晋升为全量哈希；这意味着「先扫到孤立大文件、后续新增相同文件」的成组要等到第二次扫描。
 4. **工程残留**：App 状态仍为多个 useState（未收拢为 reducer）、前端 invoke 未做集中封装、圆角/字号收敛未完成——均已记录在 IMPROVEMENT.md。
