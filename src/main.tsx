@@ -25,9 +25,27 @@ import type {
   SimilarDocument,
   SimilarPhoto,
   Status,
+  ThemeSetting,
   Toast,
   TrashItem,
 } from "./lib/types";
+
+// Applied to <html data-theme>; "system" resolves via prefers-color-scheme
+// and follows live changes while the app is open.
+const THEME_STORAGE_KEY = "filelens-theme";
+
+function loadThemeSetting(): ThemeSetting {
+  const stored = localStorage.getItem(THEME_STORAGE_KEY);
+  return stored === "light" || stored === "dark" || stored === "system"
+    ? stored
+    : "system";
+}
+
+function applyTheme(theme: ThemeSetting) {
+  const systemDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+  const resolved = theme === "system" ? (systemDark ? "dark" : "light") : theme;
+  document.documentElement.dataset.theme = resolved;
+}
 import "./styles.css";
 
 const nav: { id: Page; icon: string; label: string; caption: string }[] = [
@@ -56,6 +74,7 @@ function App() {
   const [autoScan, setAutoScan] = useState(true);
   const [rootInput, setRootInput] = useState("");
   const [status, setStatus] = useState<Status | null>(null);
+  const [theme, setTheme] = useState<ThemeSetting>(loadThemeSetting);
   const [groups, setGroups] = useState<Group[]>([]);
   const [groupsExhausted, setGroupsExhausted] = useState(true);
   const [groupsTotal, setGroupsTotal] = useState(0);
@@ -167,6 +186,17 @@ function App() {
     return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scanState.state]);
+
+  // Theme: persist the choice and re-resolve on OS scheme changes while
+  // running, so "system" keeps following without a restart.
+  useEffect(() => {
+    applyTheme(theme);
+    localStorage.setItem(THEME_STORAGE_KEY, theme);
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const onChange = () => applyTheme(theme);
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
+  }, [theme]);
 
   async function execute(action: () => Promise<string>, key = "app") {
     setKeyBusy(key, true);
@@ -466,6 +496,8 @@ function App() {
               <Settings
                 database={database}
                 trash={trash}
+                theme={theme}
+                setTheme={setTheme}
                 protectRules={protectRules}
                 excludeRules={excludeRules}
                 minFileSize={minFileSize}

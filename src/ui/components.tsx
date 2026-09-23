@@ -11,9 +11,10 @@ import {
   fileName,
   formatBytes,
   formatEta,
+  formatFileTime,
   formatRate,
 } from "../lib/format";
-import type { ScanState } from "../lib/types";
+import type { ScanState, SimilarPhoto } from "../lib/types";
 
 // Keep keyboard focus inside a modal while it is open: move focus in on
 // mount, cycle Tab across the dialog's focusable elements, restore focus to
@@ -229,6 +230,108 @@ export function PreviewModal({
         {!image && !failed && <div className="preview-loading">正在加载预览...</div>}
       </div>
     </div>
+  );
+}
+
+// Side-by-side large preview of one similar-photo pair, so both candidates
+// can be compared at full size without flipping between single previews.
+export function SimilarCompareModal({
+  photo,
+  onClose,
+}: {
+  photo: SimilarPhoto;
+  onClose: () => void;
+}) {
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  useModalFocus(dialogRef, onClose);
+  return (
+    <div className="modal-backdrop" onClick={onClose} role="presentation">
+      <div
+        ref={dialogRef}
+        className="modal compare-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label="相似照片对比"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="modal-head">
+          <div>
+            <b>相似照片对比</b>
+            <span>dHash 差异 {photo.distance}/64 · Esc 关闭</span>
+          </div>
+          <div className="modal-actions">
+            <button className="secondary" onClick={onClose}>
+              关闭
+            </button>
+          </div>
+        </div>
+        <div className="compare-grid">
+          <ComparePane
+            label="左图"
+            path={photo.first_path}
+            size={photo.first_size}
+            modified={photo.first_modified}
+          />
+          <ComparePane
+            label="右图"
+            path={photo.second_path}
+            size={photo.second_size}
+            modified={photo.second_modified}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ComparePane({
+  label,
+  path,
+  size,
+  modified,
+}: {
+  label: string;
+  path: string;
+  size: number;
+  modified: number;
+}) {
+  const [image, setImage] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    setImage(null);
+    setFailed(false);
+    void invoke<string | null>("image_preview", { path })
+      .then((result) => {
+        if (result) setImage(result);
+        else setFailed(true);
+      })
+      .catch(() => setFailed(true));
+  }, [path]);
+  return (
+    <figure className="compare-pane">
+      {image ? (
+        <img src={image} alt={`${label} ${fileName(path)}`} />
+      ) : failed ? (
+        <div className="preview-fallback">
+          <b>无法预览</b>
+          <span>该文件可能已移动或删除。</span>
+        </div>
+      ) : (
+        <div className="preview-loading">
+          <span className="spinner" aria-hidden="true" />
+          正在加载...
+        </div>
+      )}
+      <figcaption>
+        <b>
+          {label} · {fileName(path)}
+        </b>
+        <span title={path}>{fileFolder(path)}</span>
+        <small>
+          {formatBytes(size)} · {formatFileTime(modified)}
+        </small>
+      </figcaption>
+    </figure>
   );
 }
 

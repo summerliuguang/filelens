@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { ConfirmDialog, Empty, PreviewModal } from "./components";
+import { ConfirmDialog, Empty, PreviewModal, SimilarCompareModal } from "./components";
 import {
   LARGE_FILE_THRESHOLD,
   fileFolder,
@@ -22,6 +22,7 @@ import type {
   SimilarDocument,
   SimilarPhoto,
   Status,
+  ThemeSetting,
   ThumbnailCacheStats,
   TrashItem,
 } from "../lib/types";
@@ -835,10 +836,36 @@ export function SimilarPhotos({
   refresh: () => Promise<void>;
 }) {
   const [visible, setVisible] = useState(60);
-  const [previewPath, setPreviewPath] = useState<string | null>(null);
+  const [comparePair, setComparePair] = useState<SimilarPhoto | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [pendingDelete, setPendingDelete] = useState(false);
-  const shown = photos.slice(0, visible);
+  const [dirFilter, setDirFilter] = useState("all");
+  const [pendingDirTrash, setPendingDirTrash] = useState<{
+    dir: string;
+    paths: string[];
+  } | null>(null);
+
+  // Directories touched by any candidate photo, busiest first.
+  const directories = [...new Set(photos.flatMap((photo) => [fileFolder(photo.first_path), fileFolder(photo.second_path)]))]
+    .map((dir) => ({
+      dir,
+      count: photos.filter(
+        (photo) =>
+          fileFolder(photo.first_path) === dir ||
+          fileFolder(photo.second_path) === dir,
+      ).length,
+    }))
+    .sort((a, b) => b.count - a.count);
+
+  const matched =
+    dirFilter === "all"
+      ? photos
+      : photos.filter(
+          (photo) =>
+            fileFolder(photo.first_path) === dirFilter ||
+            fileFolder(photo.second_path) === dirFilter,
+        );
+  const shown = matched.slice(0, visible);
 
   function toggleSelection(path: string) {
     setSelected((current) => {
@@ -860,14 +887,54 @@ export function SimilarPhotos({
     }, "similar");
   }
 
+  // Every candidate photo living inside the selected directory — a pair can
+  // contribute one or both sides. Goes through trash_paths, so protection
+  // rules and the hash re-check still apply to each file.
+  function askRecycleDirectory(dir: string) {
+    const paths = [
+      ...new Set(
+        matched
+          .flatMap((photo) => [photo.first_path, photo.second_path])
+          .filter((path) => fileFolder(path) === dir),
+      ),
+    ];
+    if (paths.length > 0) setPendingDirTrash({ dir, paths });
+  }
+
   return (
     <section className="panel review-page">
       <div className="section-head">
         <div>
           <h2>高置信度相似照片</h2>
-          <p>仅供人工查看。点击照片放大预览，勾选后可批量移入回收站或删除。</p>
+          <p>仅供人工查看。点击照片并排放大对比，勾选后可批量移入回收站或删除。</p>
         </div>
         <div className="head-actions">
+          {directories.length > 1 && (
+            <select
+              value={dirFilter}
+              onChange={(event) => {
+                setDirFilter(event.target.value);
+                setVisible(60);
+              }}
+              aria-label="按目录筛选候选"
+            >
+              <option value="all">全部目录（{photos.length} 对）</option>
+              {directories.map(({ dir, count }) => (
+                <option key={dir} value={dir}>
+                  {dir}（{count} 对）
+                </option>
+              ))}
+            </select>
+          )}
+          {dirFilter !== "all" && (
+            <button
+              className="secondary"
+              disabled={busy}
+              onClick={() => askRecycleDirectory(dirFilter)}
+            >
+              回收该目录全部候选
+            </button>
+          )}
           {selected.size > 0 && (
             <span className="pill">已选 {selected.size} 个</span>
           )}
@@ -880,7 +947,7 @@ export function SimilarPhotos({
               删除选中文件
             </button>
           )}
-          <span className="pill">{photos.length} 对</span>
+          <span className="pill">{matched.length} 对</span>
         </div>
       </div>
       {photos.length === 0 ? (
@@ -895,28 +962,26 @@ export function SimilarPhotos({
             const keep = suggestKeep(photo);
             return (
               <article
-                className="similar-pair"
+                className="photo-pair"
                 key={`${photo.first_path}-${photo.second_path}`}
               >
                 <div className="similar-photos">
                   <PhotoSlot
                     photo={photo}
                     side="first"
-                    previewPath={previewPath}
-                    onPreview={setPreviewPath}
+                    onCompare={setComparePair}
                     selected={selected}
                     onToggle={toggleSelection}
                   />
                   <PhotoSlot
                     photo={photo}
                     side="second"
-                    previewPath={previewPath}
-                    onPreview={setPreviewPath}
+                    onCompare={setComparePair}
                     selected={selected}
                     onToggle={toggleSelection}
                   />
                 </div>
-                <div>
+                <div className="photo-pair-info">
                   <b>候选 {index + 1}</b>
                   {keep && (
                     <span className="keep-pill">
@@ -925,25 +990,53 @@ export function SimilarPhotos({
                   )}
                   <PhotoInfo path={photo.first_path} size={photo.first_size} modified={photo.first_modified} />
                   <PhotoInfo path={photo.second_path} size={photo.second_size} modified={photo.second_modified} />
+                  <small>dHash 差异 {photo.distance}/64</small>
                 </div>
-                <small>dHash 差异 {photo.distance}/64</small>
               </article>
             );
           })}
-          {visible < photos.length && (
+          {visible < matched.length && (
             <div className="load-more">
               <button
                 className="secondary"
                 onClick={() => setVisible((count) => count + 120)}
               >
-                显示更多（还有 {photos.length - visible} 对）
+                显示更多（还有 {matched.length - visible} 对）
               </button>
             </div>
           )}
         </div>
       )}
-      {previewPath && (
-        <PreviewModal path={previewPath} onClose={() => setPreviewPath(null)} />
+      {comparePair && (
+        <SimilarCompareModal
+          photo={comparePair}
+          onClose={() => setComparePair(null)}
+        />
+      )}
+      {pendingDirTrash && (
+        <ConfirmDialog
+          title={`回收目录 ${pendingDirTrash.dir} 中的候选照片`}
+          detail={`将把该目录中出现的 ${pendingDirTrash.paths.length} 张候选照片移入应用回收站（可恢复）。若某一对的两张都在该目录，两张都会被移入；移动前逐张校验内容与保护规则。`}
+          busy={busy}
+          onClose={() => setPendingDirTrash(null)}
+          options={[
+            {
+              label: "移入回收站",
+              action: () => {
+                const { paths } = pendingDirTrash;
+                setPendingDirTrash(null);
+                void execute(async () => {
+                  const result = await invoke<string>("trash_paths", {
+                    database,
+                    paths,
+                  });
+                  await refresh();
+                  return result;
+                }, "similar");
+              },
+            },
+          ]}
+        />
       )}
       {pendingDelete && (
         <ConfirmDialog
@@ -977,15 +1070,13 @@ export function SimilarPhotos({
 function PhotoSlot({
   photo,
   side,
-  previewPath,
-  onPreview,
+  onCompare,
   selected,
   onToggle,
 }: {
   photo: SimilarPhoto;
   side: "first" | "second";
-  previewPath: string | null;
-  onPreview: (path: string) => void;
+  onCompare: (photo: SimilarPhoto) => void;
   selected: Set<string>;
   onToggle: (path: string) => void;
 }) {
@@ -1001,8 +1092,8 @@ function PhotoSlot({
       </label>
       <button
         className="thumbnail-button"
-        title="点击放大预览"
-        onClick={() => onPreview(path)}
+        title="点击并排放大对比"
+        onClick={() => onCompare(photo)}
       >
         <Thumbnail path={path} />
       </button>
@@ -1515,6 +1606,8 @@ export function History({ database, active }: { database: string; active: boolea
 export function Settings({
   database,
   trash,
+  theme,
+  setTheme,
   protectRules,
   excludeRules,
   minFileSize,
@@ -1535,6 +1628,8 @@ export function Settings({
 }: {
   database: string;
   trash: string;
+  theme: ThemeSetting;
+  setTheme: (value: ThemeSetting) => void;
   protectRules: string[];
   excludeRules: string[];
   minFileSize: number;
@@ -1642,6 +1737,29 @@ export function Settings({
           <p>数据库记录扫描结果和操作日志；回收站必须位于客户端本地磁盘。</p>
         </div>
       </div>
+      <label>
+        界面主题
+        <div className="theme-choice" role="radiogroup" aria-label="界面主题">
+          {(
+            [
+              ["system", "跟随系统"],
+              ["light", "日间模式"],
+              ["dark", "夜间模式"],
+            ] as [ThemeSetting, string][]
+          ).map(([value, label]) => (
+            <button
+              key={value}
+              type="button"
+              className={theme === value ? "on" : ""}
+              aria-pressed={theme === value}
+              onClick={() => setTheme(value)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <span className="field-hint">「跟随系统」随操作系统的深浅色设置自动切换。</span>
+      </label>
       <label>
         项目数据库路径
         <input

@@ -569,7 +569,8 @@ async fn image_thumbnail(
     path: String,
 ) -> Result<Option<String>, String> {
     let source = PathBuf::from(&path);
-    tauri::async_runtime::spawn_blocking(move || render_image(&app, &source, "t", 320))
+    // 560 px so the larger similar-photo tiles stay crisp on scaled displays.
+    tauri::async_runtime::spawn_blocking(move || render_image(&app, &source, "th", 560))
         .await
         .map_err(|error| error.to_string())?
 }

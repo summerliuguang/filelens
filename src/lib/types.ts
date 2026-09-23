@@ -80,6 +80,8 @@ export type ProjectState = ProjectConfig & {
 
 export type ScanErrorSample = { path: string; error: string };
 
+export type ThemeSetting = "system" | "light" | "dark";
+
 export type ProtectPreview = { matched: number; examples: string[] };
 
 export type ScanState = {
