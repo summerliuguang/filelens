@@ -75,6 +75,9 @@ function App() {
   const [rootInput, setRootInput] = useState("");
   const [status, setStatus] = useState<Status | null>(null);
   const [theme, setTheme] = useState<ThemeSetting>(loadThemeSetting);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(
+    () => localStorage.getItem("filelens-sidebar") === "collapsed",
+  );
   const [groups, setGroups] = useState<Group[]>([]);
   const [groupsExhausted, setGroupsExhausted] = useState(true);
   const [groupsTotal, setGroupsTotal] = useState(0);
@@ -198,6 +201,13 @@ function App() {
     media.addEventListener("change", onChange);
     return () => media.removeEventListener("change", onChange);
   }, [theme]);
+
+  useEffect(() => {
+    localStorage.setItem(
+      "filelens-sidebar",
+      sidebarCollapsed ? "collapsed" : "open",
+    );
+  }, [sidebarCollapsed]);
 
   async function execute(action: () => Promise<string>, key = "app") {
     setKeyBusy(key, true);
@@ -366,24 +376,33 @@ function App() {
   );
 
   return (
-    <div className="app-shell">
+    <div className={sidebarCollapsed ? "app-shell sidebar-collapsed" : "app-shell"}>
       <aside>
         <div className="brand">
           <span className="brand-mark">+</span>
-          <div>
+          <div className="brand-text">
             <b>FileLens</b>
             <small>本地文件整理</small>
           </div>
+          <button
+            className="sidebar-toggle"
+            title={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}
+            aria-label={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}
+            onClick={() => setSidebarCollapsed((value) => !value)}
+          >
+            {sidebarCollapsed ? "»" : "«"}
+          </button>
         </div>
         <nav>
           {nav.map((item) => (
             <button
               key={item.id}
               className={page === item.id ? "active" : ""}
+              title={item.label}
               onClick={() => setPage(item.id)}
             >
               <span>{item.icon}</span>
-              {item.label}
+              <i>{item.label}</i>
               {item.id === "review" && status && status.duplicates > 0 && (
                 <em>{status.duplicates}</em>
               )}

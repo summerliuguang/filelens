@@ -159,6 +159,10 @@ input:focus {
   grid-template-columns: 236px minmax(0, 1fr);
 }
 aside {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
   background: var(--color-bg-sidebar);
   border-right: 1px solid var(--color-line);
   padding: 30px 14px;
@@ -170,6 +174,62 @@ aside {
   align-items: center;
   gap: 10px;
   padding: 0 12px 32px;
+}
+.brand-text {
+  min-width: 0;
+}
+.sidebar-toggle {
+  margin-left: auto;
+  flex: 0 0 auto;
+  padding: 3px 9px;
+  background: none;
+  color: var(--color-text-muted);
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+.sidebar-toggle:hover {
+  color: var(--color-text-primary);
+}
+/* Collapsed rail: icons only, width animates on the grid track. */
+.app-shell {
+  transition: grid-template-columns 0.16s ease;
+}
+.app-shell.sidebar-collapsed {
+  grid-template-columns: 64px minmax(0, 1fr);
+}
+.sidebar-collapsed aside {
+  padding: 22px 9px;
+}
+.sidebar-collapsed .brand {
+  flex-direction: column;
+  gap: 10px;
+  padding: 0 0 22px;
+}
+.sidebar-collapsed .brand-text,
+.sidebar-collapsed .side-note {
+  display: none;
+}
+.sidebar-collapsed .sidebar-toggle {
+  margin-left: 0;
+  padding: 2px 8px;
+}
+.sidebar-collapsed nav button {
+  justify-content: center;
+  gap: 0;
+  padding: 11px 0;
+}
+.sidebar-collapsed nav button i {
+  display: none;
+}
+.sidebar-collapsed nav button em {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  margin: 0;
+  padding: 0 5px;
+}
+.sidebar-collapsed nav button {
+  position: relative;
 }
 .brand-mark {
   display: grid;
@@ -206,6 +266,12 @@ nav button {
   color: var(--color-text-muted);
   text-align: left;
   font-weight: 650;
+}
+nav button i {
+  font-style: normal;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 nav button span {
   width: 20px;
@@ -1292,7 +1358,8 @@ footer.error {
   font-size: 0.72rem;
 }
 @media (max-width: 900px) {
-  .app-shell {
+  .app-shell,
+  .app-shell.sidebar-collapsed {
     grid-template-columns: 1fr;
   }
   aside {
@@ -1304,6 +1371,18 @@ footer.error {
     padding: 12px;
     border-right: 0;
     border-bottom: 1px solid var(--color-line);
+  }
+  /* The collapsed rail is a wide-screen affordance; keep the mobile bar
+     exactly as before. */
+  .sidebar-collapsed .brand {
+    flex-direction: row;
+    padding: 0;
+  }
+  .sidebar-collapsed .brand-text {
+    display: block;
+  }
+  .sidebar-collapsed nav button {
+    justify-content: flex-start;
   }
   .brand {
     padding: 0;
