@@ -85,6 +85,7 @@ function App() {
   });
   const [trashItems, setTrashItems] = useState<TrashItem[]>([]);
   const [similarPhotos, setSimilarPhotos] = useState<SimilarPhoto[]>([]);
+  const [duplicatePhotos, setDuplicatePhotos] = useState<SimilarPhoto[]>([]);
   const [similarDocuments, setSimilarDocuments] = useState<SimilarDocument[]>([]);
   const [detectors, setDetectors] = useState<DetectorStatus[]>([]);
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -223,13 +224,14 @@ function App() {
   async function refresh(target = database) {
     if (!target) return;
     await execute(async () => {
-      const [nextStatus, page, nextTrash, nextSimilarPhotos, nextDocuments, nextDetectors] = await Promise.all([
+      const [nextStatus, page, nextTrash, nextSimilarPhotos, nextDuplicatePhotos, nextDocuments, nextDetectors] = await Promise.all([
         invoke<Status>("status", { database: target }),
         // Reload as many groups as are already on screen so an action taken
         // deep in the list does not snap the queue back to its first page.
         invoke<GroupsPage>("groups", groupsInvokeArgs(target, 0, Math.max(GROUPS_PAGE, groups.length))),
         invoke<TrashItem[]>("trash_list", { database: target }),
-        invoke<SimilarPhoto[]>("similar_photos", { database: target }),
+        invoke<SimilarPhoto[]>("similar_photos", { database: target, kind: "similar" }),
+        invoke<SimilarPhoto[]>("similar_photos", { database: target, kind: "duplicate" }),
         invoke<SimilarDocument[]>("similar_documents", { database: target }),
         invoke<DetectorStatus[]>("detector_status"),
       ]);
@@ -239,6 +241,7 @@ function App() {
       setGroupsExhausted(page.groups.length >= page.total);
       setTrashItems(nextTrash);
       setSimilarPhotos(nextSimilarPhotos);
+      setDuplicatePhotos(nextDuplicatePhotos);
       setSimilarDocuments(nextDocuments);
       setDetectors(nextDetectors);
       return `索引已更新：${nextStatus.groups} 个精确重复组待审核。`;
@@ -467,6 +470,7 @@ function App() {
               <SimilarPhotos
                 database={database}
                 photos={similarPhotos}
+                duplicates={duplicatePhotos}
                 busy={busy}
                 busyKeys={busyKeys}
                 execute={execute}

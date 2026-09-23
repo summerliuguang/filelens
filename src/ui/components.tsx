@@ -257,7 +257,12 @@ export function SimilarCompareModal({
         <div className="modal-head">
           <div>
             <b>相似照片对比</b>
-            <span>dHash 差异 {photo.distance}/64 · Esc 关闭</span>
+            <span>
+              {photo.distance === 0
+                ? "像素级一致（字节不同）"
+                : `dHash 差异 ${photo.distance}/64`}
+              {" · "}Esc 关闭
+            </span>
           </div>
           <div className="modal-actions">
             <button className="secondary" onClick={onClose}>

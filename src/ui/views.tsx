@@ -823,6 +823,7 @@ function Thumbnail({ path }: { path: string }) {
 export function SimilarPhotos({
   database,
   photos,
+  duplicates,
   busy,
   busyKeys,
   execute,
@@ -830,6 +831,7 @@ export function SimilarPhotos({
 }: {
   database: string;
   photos: SimilarPhoto[];
+  duplicates: SimilarPhoto[];
   busy: boolean;
   busyKeys: ReadonlySet<string>;
   execute: (action: () => Promise<string>, key?: string) => Promise<void>;
@@ -839,17 +841,29 @@ export function SimilarPhotos({
   const [comparePair, setComparePair] = useState<SimilarPhoto | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [pendingDelete, setPendingDelete] = useState(false);
+  const [view, setView] = useState<"duplicate" | "similar">("similar");
   const [dirFilter, setDirFilter] = useState("all");
   const [pendingDirTrash, setPendingDirTrash] = useState<{
     dir: string;
     paths: string[];
   } | null>(null);
 
+  // duplicate: identical pixels, differing bytes (a copy with drifted EXIF
+  // or metadata). similar: near-identical pixels, dHash distance 1-4.
+  const base = view === "duplicate" ? duplicates : photos;
+
+  function switchView(next: "duplicate" | "similar") {
+    setView(next);
+    setDirFilter("all");
+    setVisible(60);
+    setSelected(new Set());
+  }
+
   // Directories touched by any candidate photo, busiest first.
-  const directories = [...new Set(photos.flatMap((photo) => [fileFolder(photo.first_path), fileFolder(photo.second_path)]))]
+  const directories = [...new Set(base.flatMap((photo) => [fileFolder(photo.first_path), fileFolder(photo.second_path)]))]
     .map((dir) => ({
       dir,
-      count: photos.filter(
+      count: base.filter(
         (photo) =>
           fileFolder(photo.first_path) === dir ||
           fileFolder(photo.second_path) === dir,
@@ -859,8 +873,8 @@ export function SimilarPhotos({
 
   const matched =
     dirFilter === "all"
-      ? photos
-      : photos.filter(
+      ? base
+      : base.filter(
           (photo) =>
             fileFolder(photo.first_path) === dirFilter ||
             fileFolder(photo.second_path) === dirFilter,
@@ -905,10 +919,30 @@ export function SimilarPhotos({
     <section className="panel review-page">
       <div className="section-head">
         <div>
-          <h2>高置信度相似照片</h2>
-          <p>仅供人工查看。点击照片并排放大对比，勾选后可批量移入回收站或删除。</p>
+          <h2>{view === "duplicate" ? "重复照片" : "相似照片"}</h2>
+          <p>
+            {view === "duplicate"
+              ? "像素完全一致、但复制时 EXIF 等信息略有不同的照片。仅供人工查看，确认后可移入回收站。"
+              : "仅供人工查看。点击照片并排放大对比，勾选后可批量移入回收站或删除。"}
+          </p>
         </div>
         <div className="head-actions">
+          <div className="theme-choice" role="tablist" aria-label="照片检测视图">
+            <button
+              type="button"
+              className={view === "duplicate" ? "on" : ""}
+              onClick={() => switchView("duplicate")}
+            >
+              重复（{duplicates.length} 对）
+            </button>
+            <button
+              type="button"
+              className={view === "similar" ? "on" : ""}
+              onClick={() => switchView("similar")}
+            >
+              相似（{photos.length} 对）
+            </button>
+          </div>
           {directories.length > 1 && (
             <select
               value={dirFilter}
@@ -918,7 +952,7 @@ export function SimilarPhotos({
               }}
               aria-label="按目录筛选候选"
             >
-              <option value="all">全部目录（{photos.length} 对）</option>
+              <option value="all">全部目录（{base.length} 对）</option>
               {directories.map(({ dir, count }) => (
                 <option key={dir} value={dir}>
                   {dir}（{count} 对）
@@ -950,11 +984,15 @@ export function SimilarPhotos({
           <span className="pill">{matched.length} 对</span>
         </div>
       </div>
-      {photos.length === 0 ? (
+      {base.length === 0 ? (
         <Empty
           icon="◒"
-          text="没有高置信度相似照片"
-          detail="完成扫描后，这里会显示重压缩或缩放后的同源照片候选。"
+          text={view === "duplicate" ? "没有重复照片候选" : "没有高置信度相似照片"}
+          detail={
+            view === "duplicate"
+              ? "完成扫描后，像素完全一致但字节不同的照片（复制导致信息略异）会显示在这里。"
+              : "完成扫描后，这里会显示重压缩或缩放后的同源照片候选。"
+          }
         />
       ) : (
         <div className="similar-list">
@@ -990,7 +1028,9 @@ export function SimilarPhotos({
                   )}
                   <PhotoInfo path={photo.first_path} size={photo.first_size} modified={photo.first_modified} />
                   <PhotoInfo path={photo.second_path} size={photo.second_size} modified={photo.second_modified} />
-                  <small>dHash 差异 {photo.distance}/64</small>
+                  <small>
+                    {photo.distance === 0 ? "像素级一致（字节不同）" : `dHash 差异 ${photo.distance}/64`}
+                  </small>
                 </div>
               </article>
             );

@@ -876,6 +876,7 @@ fn load_fingerprints(
 fn similar_pairs(
     entries: &[FingerprintEntry],
     chunks: &[(u32, u64)],
+    min_distance: u32,
     max_distance: u32,
 ) -> Vec<(usize, usize, u32)> {
     let mut seen: HashSet<(usize, usize)> = HashSet::new();
@@ -901,12 +902,14 @@ fn similar_pairs(
                         continue;
                     }
                     let (first, second) = (&entries[key.0], &entries[key.1]);
+                    // Byte-identical duplicates belong to the exact-duplicate
+                    // review, never to the photo detectors.
                     if first.hash == second.hash {
                         seen.insert(key);
                         continue;
                     }
                     let distance = (first.value ^ second.value).count_ones();
-                    if distance <= max_distance {
+                    if distance >= min_distance && distance <= max_distance {
                         seen.insert(key);
                         result.push((key.0, key.1, distance));
                     }
@@ -922,29 +925,45 @@ fn similar_pairs(
     result
 }
 
+/// kind = "duplicate": identical pixels, differing bytes (a copy whose EXIF
+/// or metadata drifted). kind = "similar": near-identical pixels (dHash
+/// distance 1-4). Both exclude byte-identical exact duplicates.
 #[tauri::command]
-fn similar_photos(database: String) -> Result<Vec<SimilarPhoto>, String> {
+fn similar_photos(
+    database: String,
+    kind: Option<String>,
+) -> Result<Vec<SimilarPhoto>, String> {
     let connection = open_database(&database)?;
     let entries = load_fingerprints(&connection, "photo_fingerprints", "dhash")?;
-    Ok(similar_pairs(&entries, &PHOTO_CHUNKS, 4)
-        .into_iter()
-        .map(|(a, b, distance)| SimilarPhoto {
-            first_path: entries[a].path.clone(),
-            second_path: entries[b].path.clone(),
-            distance,
-            first_size: entries[a].size,
-            first_modified: entries[a].modified,
-            second_size: entries[b].size,
-            second_modified: entries[b].modified,
-        })
-        .collect())
+    let (min_distance, max_distance) = if kind.as_deref() == Some("duplicate") {
+        (0, 0)
+    } else {
+        (1, 4)
+    };
+    Ok(similar_pairs(
+        &entries,
+        &PHOTO_CHUNKS,
+        min_distance,
+        max_distance,
+    )
+    .into_iter()
+    .map(|(a, b, distance)| SimilarPhoto {
+        first_path: entries[a].path.clone(),
+        second_path: entries[b].path.clone(),
+        distance,
+        first_size: entries[a].size,
+        first_modified: entries[a].modified,
+        second_size: entries[b].size,
+        second_modified: entries[b].modified,
+    })
+    .collect())
 }
 
 #[tauri::command]
 fn similar_documents(database: String) -> Result<Vec<SimilarDocument>, String> {
     let connection = open_database(&database)?;
     let entries = load_fingerprints(&connection, "document_fingerprints", "simhash")?;
-    Ok(similar_pairs(&entries, &DOCUMENT_CHUNKS, 8)
+    Ok(similar_pairs(&entries, &DOCUMENT_CHUNKS, 0, 8)
         .into_iter()
         .map(|(a, b, distance)| SimilarDocument {
             first_path: entries[a].path.clone(),
@@ -962,9 +981,9 @@ fn similar_documents(database: String) -> Result<Vec<SimilarDocument>, String> {
 fn detector_status() -> Vec<DetectorStatus> {
     vec![
         DetectorStatus {
-            name: "照片相似".into(),
+            name: "照片重复/相似".into(),
             available: true,
-            detail: "本地 dHash，高置信度只读候选".into(),
+            detail: "本地 dHash：像素一致的重复（复制导致信息略异）与高置信度相似候选".into(),
         },
         DetectorStatus {
             name: "文档近似".into(),
