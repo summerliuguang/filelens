@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// Latest schema version this build understands. Older databases are
 /// upgraded stepwise through MIGRATIONS on open; newer ones are rejected so a
 /// downgrade can never misread an unknown schema.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const COPY_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const QUICK_HASH_CHUNK: u64 = 64 * 1024;
 /// Files above this size get the two-stage hash: quick fingerprint first,
@@ -35,6 +35,27 @@ const MIGRATIONS: &[&str] = &[
     // recycle bin can be presented (and reasoned about) per cleanup.
     "ALTER TABLE operations ADD COLUMN batch_id INTEGER;
      CREATE INDEX IF NOT EXISTS operations_batch ON operations(batch_id);",
+    // v4 -> v5: pHash column for photo fingerprints (old rows are dropped, so
+    // the missing-fingerprint rule in is_unchanged re-fingerprints every
+    // image on the next scan), plus the NTFS file-reference column used by
+    // the optional USN fast scan on Windows. The fingerprint table is
+    // rebuilt rather than altered so databases predating the table upgrade
+    // cleanly too.
+    "CREATE TABLE photo_fingerprints_new (
+       file_id INTEGER PRIMARY KEY,
+       dhash INTEGER NOT NULL,
+       phash INTEGER NOT NULL DEFAULT 0,
+       part_a INTEGER NOT NULL,
+       part_b INTEGER NOT NULL,
+       part_c INTEGER NOT NULL,
+       part_d INTEGER NOT NULL,
+       part_e INTEGER NOT NULL,
+       FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+     );
+     DROP TABLE IF EXISTS photo_fingerprints;
+     ALTER TABLE photo_fingerprints_new RENAME TO photo_fingerprints;
+     CREATE INDEX IF NOT EXISTS photo_fingerprints_parts ON photo_fingerprints(part_a, part_b, part_c, part_d, part_e);
+     ALTER TABLE files ADD COLUMN frn INTEGER NOT NULL DEFAULT 0;",
 ];
 
 fn create_schema_sql() -> &'static str {
@@ -51,13 +72,15 @@ fn create_schema_sql() -> &'static str {
        scanned_at INTEGER NOT NULL,
        quick_hash TEXT,
        dev INTEGER NOT NULL DEFAULT 0,
-       inode INTEGER NOT NULL DEFAULT 0
+       inode INTEGER NOT NULL DEFAULT 0,
+       frn INTEGER NOT NULL DEFAULT 0
      );
      CREATE INDEX IF NOT EXISTS files_hash_size_present ON files(hash, size, present);
      CREATE INDEX IF NOT EXISTS files_size_quick_hash ON files(size, quick_hash);
      CREATE TABLE IF NOT EXISTS photo_fingerprints (
        file_id INTEGER PRIMARY KEY,
        dhash INTEGER NOT NULL,
+       phash INTEGER NOT NULL DEFAULT 0,
        part_a INTEGER NOT NULL,
        part_b INTEGER NOT NULL,
        part_c INTEGER NOT NULL,
@@ -138,6 +161,18 @@ enum Command {
         #[arg(long)]
         file_id: i64,
     },
+    /// Replace an approved duplicate with a hard link to its kept copy.
+    Hardlink {
+        database: PathBuf,
+        #[arg(long)]
+        file_id: i64,
+    },
+    /// Enable or disable the strict pre-delete byte comparison.
+    StrictVerify {
+        database: PathBuf,
+        #[arg(long)]
+        enabled: bool,
+    },
     /// Restore a recycled file to its recorded original path.
     Restore {
         database: PathBuf,
@@ -163,6 +198,9 @@ struct IndexedFile {
     hash: String,
     protected: bool,
     approved: bool,
+    /// POSIX device/inode identity; (0, 0) where the platform has none.
+    dev: i64,
+    inode: i64,
 }
 
 fn main() {
@@ -189,6 +227,11 @@ fn run() -> Result<(), String> {
         Command::Approve { database, file_id } => set_approval(&database, file_id, true),
         Command::Unapprove { database, file_id } => set_approval(&database, file_id, false),
         Command::Trash { database, file_id } => trash(&database, file_id),
+        Command::Hardlink { database, file_id } => hardlink(&database, file_id),
+        Command::StrictVerify {
+            database,
+            enabled,
+        } => set_strict_verify(&database, enabled),
         Command::Restore {
             database,
             operation_id,
@@ -289,6 +332,10 @@ pub struct ScanSummary {
     pub errors: u64,
     pub missing: u64,
     pub pruned: u64,
+    /// Present images whose photo fingerprint had to be recomputed this scan
+    /// (e.g. after a fingerprint-algorithm migration), so the UI can explain
+    /// why a routine incremental scan takes longer than usual.
+    pub fingerprint_rebuild: u64,
     pub failed_roots: Vec<String>,
 }
 
@@ -393,6 +440,15 @@ pub fn scan_with_control(
     let trash = PathBuf::from(required_setting(&connection, "trash_path")?);
     let scan_started = now_seconds()?;
     let mut counters = ScanCounters::default();
+    // Fingerprints wiped by an algorithm upgrade come back through the
+    // regular scan; counting them up front lets the UI set expectations
+    // ("this incremental scan re-fingerprints N images").
+    let fingerprint_rebuild = count_fingerprint_rebuild(&connection)?;
+    if fingerprint_rebuild > 0 && !silent {
+        println!(
+            "Re-fingerprinting {fingerprint_rebuild} image(s) this scan (fingerprint format changed or rows missing)."
+        );
+    }
     let absolute_roots = roots
         .iter()
         .map(|root| absolute_path(root))
@@ -456,6 +512,7 @@ pub fn scan_with_control(
         errors: counters.errors,
         missing: removed,
         pruned,
+        fingerprint_rebuild,
         failed_roots,
     })
 }
@@ -565,7 +622,10 @@ struct ProcessedEntry {
     /// the platform has no such metadata.
     dev: i64,
     inode: i64,
-    photo: Option<u64>,
+    /// NTFS file reference number, populated only by the USN fast scan;
+    /// 0 elsewhere.
+    frn: i64,
+    photo: Option<(u64, u64)>,
     document: Option<(u64, i64)>,
 }
 
@@ -632,6 +692,7 @@ fn process_file(path: PathBuf, hash_progress: Option<&HashProgress>) -> WorkResu
             quick_hash,
             dev,
             inode,
+            frn: 0,
             photo,
             document,
         })
@@ -643,7 +704,9 @@ fn process_file(path: PathBuf, hash_progress: Option<&HashProgress>) -> WorkResu
 }
 
 /// Walk one root, sending unchanged files straight to the writer and the rest
-/// to the hashing workers. Uses its own read-only view of the database.
+/// to the hashing workers. Uses its own read-only view of the database. When
+/// the optional USN fast scan is enabled (and permitted), the file list comes
+/// from the MFT instead of directory recursion.
 #[allow(clippy::too_many_arguments)]
 fn walk_root(
     database: &Path,
@@ -656,6 +719,33 @@ fn walk_root(
     cancelled: &dyn Fn() -> bool,
 ) -> Result<(), String> {
     let connection = open_database(database)?;
+    if usn_scan_enabled(&connection) {
+        match usn_root_paths(root) {
+            Some(Ok(paths)) => {
+                for path in paths {
+                    if cancelled() {
+                        return Err("scan cancelled".to_string());
+                    }
+                    dispatch_path(
+                        &connection,
+                        &path,
+                        trash,
+                        exclude,
+                        min_file_size,
+                        work_tx,
+                        result_tx,
+                    );
+                }
+                return Ok(());
+            }
+            Some(Err(error)) => {
+                // Permission or volume problems degrade to the plain walk;
+                // the scan must never fail because the accelerator is off.
+                eprintln!("warning: USN fast scan unavailable, walking normally: {error}");
+            }
+            None => {}
+        }
+    }
     let mut directories = vec![root.to_path_buf()];
     while let Some(directory) = directories.pop() {
         if cancelled() {
@@ -692,34 +782,325 @@ fn walk_root(
                 }
                 continue;
             }
-            if !file_type.is_file() || is_excluded(&path, trash, exclude) {
+            if !file_type.is_file() {
                 let _ = result_tx.send(WorkResult::Skipped);
                 continue;
             }
-            // Below-threshold files are dropped from the report entirely:
-            // they are skipped here (not marked seen), so a previous index
-            // row is marked absent by mark_missing_absent after the scan.
-            if min_file_size > 0 {
-                let too_small = entry
-                    .metadata()
-                    .map(|metadata| metadata.len() < min_file_size)
-                    .unwrap_or(false);
-                if too_small {
-                    let _ = result_tx.send(WorkResult::Skipped);
-                    continue;
-                }
-            }
-            if is_unchanged(&connection, &path) {
-                let _ = result_tx.send(WorkResult::Unchanged(
-                    path.to_string_lossy().into_owned(),
-                ));
-            } else if work_tx.send(path).is_err() {
-                // Workers only exit early on cancellation.
-                return Err("scan cancelled".to_string());
-            }
+            dispatch_path(
+                &connection,
+                &path,
+                trash,
+                exclude,
+                min_file_size,
+                work_tx,
+                result_tx,
+            );
         }
     }
     Ok(())
+}
+
+/// Shared per-file decision for both walkers: exclusion, minimum size,
+/// unchanged short-circuit, otherwise hand the path to the hashing workers.
+fn dispatch_path(
+    connection: &Connection,
+    path: &Path,
+    trash: &Path,
+    exclude: &[String],
+    min_file_size: u64,
+    work_tx: &std::sync::mpsc::Sender<PathBuf>,
+    result_tx: &std::sync::mpsc::Sender<WorkResult>,
+) {
+    if is_excluded(path, trash, exclude) {
+        let _ = result_tx.send(WorkResult::Skipped);
+        return;
+    }
+    // Below-threshold files are dropped from the report entirely: they are
+    // skipped here (not marked seen), so a previous index row is marked
+    // absent by mark_missing_absent after the scan.
+    if min_file_size > 0 {
+        let too_small = fs::metadata(path)
+            .map(|metadata| metadata.len() < min_file_size)
+            .unwrap_or(false);
+        if too_small {
+            let _ = result_tx.send(WorkResult::Skipped);
+            return;
+        }
+    }
+    if is_unchanged(connection, path) {
+        let _ = result_tx.send(WorkResult::Unchanged(
+            path.to_string_lossy().into_owned(),
+        ));
+    } else if work_tx.send(path.to_path_buf()).is_err() {
+        // Workers only exit early on cancellation; a send error surfaces as
+        // a cancelled scan on the walker's own next check.
+    }
+}
+
+// --- Optional USN fast scan (Windows) ----------------------------------------
+
+/// Setting read for the MFT-order file listing. Off by default: the fast
+/// path only engages for elevated processes (NTFS refuses generic volume
+/// reads otherwise) and silently degrades to the directory walk everywhere
+/// else.
+fn usn_scan_enabled(connection: &Connection) -> bool {
+    connection
+        .query_row(
+            "SELECT value FROM settings WHERE key='usn_scan'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+pub fn set_usn_scan(database: &Path, enabled: bool) -> Result<(), String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    set_setting(&connection, "usn_scan", if enabled { "1" } else { "0" })
+}
+
+/// File list for one root from the NTFS change journal. `None` off Windows;
+/// `Some(Err(..))` whenever the journal cannot be read (permissions, non-NTFS
+/// volume) so the caller can walk the directory tree instead.
+#[cfg(windows)]
+fn usn_root_paths(root: &Path) -> Option<Result<Vec<PathBuf>, String>> {
+    Some(usn::root_paths(root))
+}
+
+#[cfg(not(windows))]
+fn usn_root_paths(root: &Path) -> Option<Result<Vec<PathBuf>, String>> {
+    let _ = root;
+    None
+}
+
+#[cfg(windows)]
+mod usn {
+    use std::collections::HashMap;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::{Path, PathBuf};
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    const FSCTL_ENUM_USN_DATA: u32 = 0x000900B3;
+    const FSCTL_GET_NTFS_USN_JOURNAL: u32 = 0x000900E4;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    const ENUM_BUFFER: usize = 16 * 1024 * 1024;
+
+    struct Handle(HANDLE);
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    fn last_error() -> String {
+        std::io::Error::last_os_error().to_string()
+    }
+
+    fn ctl_code(device: u32, function: u32, method: u32, access: u32) -> u32 {
+        (device << 16) | (access << 14) | (function << 2) | method
+    }
+
+    fn open_volume(drive: &str) -> Result<Handle, String> {
+        let wide: Vec<u16> = drive.encode_utf16().chain([0]).collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(format!("open volume {drive}: {}", last_error()));
+        }
+        Ok(Handle(handle))
+    }
+
+    fn device_io(control: u32, handle: HANDLE, input: &[u8], output: &mut [u8]) -> Result<usize, String> {
+        let mut returned = 0_u32;
+        let ok = unsafe {
+            DeviceIoControl(
+                handle,
+                control,
+                input.as_ptr() as *const _,
+                input.len() as u32,
+                output.as_mut_ptr() as *mut _,
+                output.len() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(last_error());
+        }
+        Ok(returned as usize)
+    }
+
+    // #pragma pack(4) in the SDK; repr(C) on x64 gives the same 48-byte size.
+    #[repr(C)]
+    struct MftEnumDataV0 {
+        start_usn: u64,
+        reason_mask: u64,
+        return_only_on_close: u64,
+        timeout: u64,
+        bytes_to_wait_for: u64,
+        usn_journal_id: u32,
+    }
+
+    #[repr(C)]
+    struct UsnJournalData {
+        usn_journal_id: u64,
+        first_usn: i64,
+        next_usn: i64,
+        lowest_valid_usn: i64,
+        max_usn: i64,
+        maximum_size: u64,
+        allocation_delta: u64,
+    }
+
+    /// Every file (and directory) below `root`, in MFT order. Directory
+    /// recursion is replaced by a parent-reference walk over the journal's
+    /// records; reparse points are pruned exactly like the plain walker.
+    pub fn root_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
+        let root_text = root.to_string_lossy().into_owned();
+        let bytes = root_text.as_bytes();
+        if bytes.len() < 2 || bytes[1] != b':' {
+            return Err("USN fast scan supports drive-letter roots only".into());
+        }
+        let drive_letter = root_text[..1].to_ascii_uppercase();
+        let volume_path = format!(r"\\.\{drive_letter}:");
+        let volume = open_volume(&volume_path)?;
+
+        let mut journal = [0_u8; std::mem::size_of::<UsnJournalData>()];
+        let read = device_io(FSCTL_GET_NTFS_USN_JOURNAL, volume.0, &[], &mut journal)?;
+        if read < std::mem::size_of::<UsnJournalData>() {
+            return Err("short USN journal reply".into());
+        }
+        let journal: UsnJournalData = unsafe { std::ptr::read(journal.as_ptr() as *const _) };
+
+        let mut input = MftEnumDataV0 {
+            start_usn: 0,
+            reason_mask: 0,
+            return_only_on_close: 0,
+            timeout: 0,
+            bytes_to_wait_for: 0,
+            usn_journal_id: journal.usn_journal_id as u32,
+        };
+        // frn -> (parent frn, file name, attributes)
+        let mut entries: HashMap<u64, (u64, String, u32)> = HashMap::new();
+        let mut output = vec![0_u8; ENUM_BUFFER];
+        loop {
+            let read = device_io(
+                FSCTL_ENUM_USN_DATA,
+                volume.0,
+                unsafe { std::slice::from_raw_parts((&input as *const MftEnumDataV0).cast::<u8>(), std::mem::size_of::<MftEnumDataV0>()) },
+                &mut output,
+            )?;
+            if read <= std::mem::size_of::<u64>() {
+                break;
+            }
+            let mut offset = std::mem::size_of::<u64>();
+            while offset + 4 <= read {
+                let record_len =
+                    u32::from_le_bytes(output[offset..offset + 4].try_into().unwrap()) as usize;
+                if record_len == 0 || offset + record_len > read {
+                    break;
+                }
+                let record = &output[offset..offset + record_len];
+                let major = u16::from_le_bytes(record[4..6].try_into().unwrap());
+                if major == 2 {
+                    let frn = u64::from_le_bytes(record[8..16].try_into().unwrap());
+                    let parent = u64::from_le_bytes(record[16..24].try_into().unwrap());
+                    let attributes = u32::from_le_bytes(record[52..56].try_into().unwrap());
+                    let name_len =
+                        u16::from_le_bytes(record[56..58].try_into().unwrap()) as usize;
+                    let name_offset =
+                        u16::from_le_bytes(record[58..60].try_into().unwrap()) as usize;
+                    if name_offset + name_len <= record_len {
+                        let name: String = String::from_utf16_lossy(
+                            record[name_offset..name_offset + name_len]
+                                .chunks_exact(2)
+                                .map(|pair| u16::from_le_bytes(pair.try_into().unwrap()))
+                                .collect::<Vec<_>>()
+                                .as_slice(),
+                        );
+                        entries.insert(frn, (parent, name, attributes));
+                    }
+                }
+                offset += record_len;
+            }
+            input.start_usn = u64::from_le_bytes(output[..8].try_into().unwrap());
+        }
+        if entries.is_empty() {
+            return Err("USN enumeration returned nothing".into());
+        }
+
+        // Anchor: the scan root's own file reference number.
+        let root_frn = file_reference_of(root)?;
+        let mut children: HashMap<u64, Vec<(u64, String, u32)>> = HashMap::new();
+        for (frn, (parent, name, attributes)) in &entries {
+            children.entry(*parent).or_default().push((*frn, name.clone(), *attributes));
+        }
+        for list in children.values_mut() {
+            list.sort_by(|a, b| a.1.cmp(&b.1));
+        }
+
+        let mut files = Vec::new();
+        let mut stack = vec![(root_frn, PathBuf::from(&root_text))];
+        while let Some((frn, base)) = stack.pop() {
+            for (child_frn, name, attributes) in children.get(&frn).into_iter().flatten() {
+                let path = base.join(name);
+                if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    continue; // junctions/symlinks: the plain walker skips them too
+                }
+                if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+                    stack.push((*child_frn, path));
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        Ok(files)
+    }
+
+    /// NTFS file reference number of an existing directory (no access needed,
+    /// backup-semantics open).
+    fn file_reference_of(path: &Path) -> Result<u64, String> {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(format!("open {}: {}", path.display(), last_error()));
+        }
+        let owned = Handle(handle);
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(owned.0, &mut info) } == 0 {
+            return Err(last_error());
+        }
+        Ok(((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64)
+    }
 }
 
 fn is_unchanged(connection: &Connection, path: &Path) -> bool {
@@ -762,6 +1143,25 @@ fn is_image_path(path: &Path) -> bool {
     )
 }
 
+/// Present images without a stored fingerprint: the rebuild set produced by
+/// a fingerprint-format migration. SQL-side extension check mirrors
+/// `is_image_path` so the count matches what the scan will reprocess.
+fn count_fingerprint_rebuild(connection: &Connection) -> Result<u64, String> {
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM files f WHERE f.present=1 \
+             AND NOT EXISTS(SELECT 1 FROM photo_fingerprints p WHERE p.file_id=f.id) \
+             AND (lower(f.path) LIKE '%.jpg' OR lower(f.path) LIKE '%.jpeg' \
+               OR lower(f.path) LIKE '%.png' OR lower(f.path) LIKE '%.gif' \
+               OR lower(f.path) LIKE '%.webp' OR lower(f.path) LIKE '%.bmp' \
+               OR lower(f.path) LIKE '%.tif' OR lower(f.path) LIKE '%.tiff')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(count as u64)
+}
+
 fn write_entry(
     connection: &Connection,
     entry: &ProcessedEntry,
@@ -784,9 +1184,9 @@ fn write_entry(
         IndexOutcome::New
     };
     connection.execute(
-        "INSERT INTO files(path,size,modified,hash,protected,approved,present,scanned_at,quick_hash,dev,inode) VALUES(?1,?2,?3,?4,?5,0,1,?6,?7,?8,?9)
-         ON CONFLICT(path) DO UPDATE SET size=excluded.size,modified=excluded.modified,hash=excluded.hash,protected=excluded.protected,approved=0,present=1,scanned_at=excluded.scanned_at,quick_hash=excluded.quick_hash,dev=excluded.dev,inode=excluded.inode",
-        params![entry.path_text, entry.size, entry.modified, entry.hash, is_protected as i64, now, entry.quick_hash, entry.dev, entry.inode],
+        "INSERT INTO files(path,size,modified,hash,protected,approved,present,scanned_at,quick_hash,dev,inode,frn) VALUES(?1,?2,?3,?4,?5,0,1,?6,?7,?8,?9,?10)
+         ON CONFLICT(path) DO UPDATE SET size=excluded.size,modified=excluded.modified,hash=excluded.hash,protected=excluded.protected,approved=0,present=1,scanned_at=excluded.scanned_at,quick_hash=excluded.quick_hash,dev=excluded.dev,inode=excluded.inode,frn=CASE WHEN excluded.frn<>0 THEN excluded.frn ELSE files.frn END",
+        params![entry.path_text, entry.size, entry.modified, entry.hash, is_protected as i64, now, entry.quick_hash, entry.dev, entry.inode, entry.frn],
     )
     .map_err(|e| e.to_string())?;
     connection.execute(
@@ -801,11 +1201,11 @@ fn write_entry(
             |row| row.get(0),
         )
         .map_err(|e| e.to_string())?;
-    if let Some(photo) = entry.photo {
-        let parts = fingerprint_parts(photo);
+    if let Some((dhash, phash)) = entry.photo {
+        let parts = fingerprint_parts(dhash);
         connection.execute(
-            "INSERT INTO photo_fingerprints(file_id,dhash,part_a,part_b,part_c,part_d,part_e) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            params![file_id, photo as i64, parts[0], parts[1], parts[2], parts[3], parts[4]],
+            "INSERT INTO photo_fingerprints(file_id,dhash,phash,part_a,part_b,part_c,part_d,part_e) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![file_id, dhash as i64, phash as i64, parts[0], parts[1], parts[2], parts[3], parts[4]],
         )
         .map_err(|e| e.to_string())?;
     }
@@ -1118,20 +1518,182 @@ fn quick_hash_file(path: &Path) -> Result<String, String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-fn perceptual_hash(path: &Path) -> Option<u64> {
-    let image = image::ImageReader::open(path)
-        .ok()?
-        .decode()
-        .ok()?
+fn perceptual_hash(path: &Path) -> Option<(u64, u64)> {
+    let image = image::ImageReader::open(path).ok()?.decode().ok()?;
+    // dHash: gradient over a 9x8 luma grid.
+    let small = image
         .resize_exact(9, 8, image::imageops::FilterType::Triangle)
         .to_luma8();
-    let mut hash = 0_u64;
+    let mut dhash = 0_u64;
     for y in 0..8 {
         for x in 0..8 {
-            hash = (hash << 1) | u64::from(image.get_pixel(x, y)[0] > image.get_pixel(x + 1, y)[0]);
+            dhash =
+                (dhash << 1) | u64::from(small.get_pixel(x, y)[0] > small.get_pixel(x + 1, y)[0]);
         }
     }
-    Some(hash)
+    // pHash: 32x32 DCT-II, sign of the 8x8 low-frequency block against its
+    // median. Robust to resizing and recompression where the gradient hash
+    // alone is not.
+    let big = image
+        .resize_exact(32, 32, image::imageops::FilterType::Triangle)
+        .to_luma8();
+    let phash = dct_phash(&big);
+    Some((dhash, phash))
+}
+
+/// Sign bits of the 8x8 top-left DCT block versus its median (DC excluded).
+fn dct_phash(gray: &image::GrayImage) -> u64 {
+    const N: usize = 32;
+    // Separable DCT-II: rows first, then columns of the result.
+    let mut rows = [[0_f32; N]; N];
+    for (y, row) in rows.iter_mut().enumerate() {
+        for (u, cell) in row.iter_mut().enumerate() {
+            let sum: f32 = (0..N)
+                .map(|x| (f32::from(gray.get_pixel(x as u32, y as u32)[0]) - 128.0) * dct_cos(u, x))
+                .sum();
+            *cell = sum;
+        }
+    }
+    let mut block = [[0_f32; 8]; 8];
+    for v in 0..8 {
+        for u in 0..8 {
+            let sum: f32 = (0..N)
+                .map(|y| rows[y][v] * dct_cos(u, y))
+                .sum();
+            block[v][u] = sum;
+        }
+    }
+    block[0][0] = f32::NAN; // DC carries brightness, not structure.
+    let mut sorted: Vec<f32> = block
+        .iter()
+        .flat_map(|row| row.iter().copied())
+        .filter(|c| !c.is_nan())
+        .collect();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let median = sorted[sorted.len() / 2];
+    let mut hash = 0_u64;
+    for v in 0..8 {
+        for u in 0..8 {
+            hash = (hash << 1) | u64::from(block[v][u] > median);
+        }
+    }
+    hash
+}
+
+fn dct_cos(k: usize, n: usize) -> f32 {
+    const PI: f32 = std::f32::consts::PI;
+    let scale = if k == 0 { (0.5_f32).sqrt() } else { 1.0 };
+    scale * ((2 * n + 1) as f32 * k as f32 * PI / (2.0 * 32.0)).cos()
+}
+
+/// Definitive check for the "duplicate photos" view: decode both files and
+/// compare every pixel. Fingerprint equality (dHash 0 + pHash 0) is only
+/// a candidate signal — burst shots and recompressed copies can share a
+/// fingerprint while being different pictures, so the UI offers this verdict
+/// before the user deletes either side.
+pub fn photos_pixel_identical(first: &str, second: &str) -> Result<bool, String> {
+    let decode = |path: &str| -> Result<image::DynamicImage, String> {
+        image::ImageReader::open(path)
+            .map_err(|e| format!("cannot open {path}: {e}"))?
+            .decode()
+            .map_err(|e| format!("cannot decode {path}: {e}"))
+    };
+    let left = decode(first)?;
+    let right = decode(second)?;
+    if (left.width(), left.height()) != (right.width(), right.height()) {
+        return Ok(false);
+    }
+    // Same dimensions: compare one canonical RGBA buffer per side.
+    let left_rgba = left.to_rgba8();
+    let right_rgba = right.to_rgba8();
+    Ok(rgba_buffers_identical(&left_rgba, &right_rgba))
+}
+
+/// Row-by-row RGBA comparison with early exit: near-duplicates usually
+/// differ within the first rows, so bailing keeps rejected pairs cheap.
+fn rgba_buffers_identical(left: &image::RgbaImage, right: &image::RgbaImage) -> bool {
+    if left.dimensions() != right.dimensions() {
+        return false;
+    }
+    let stride = left.width() as usize * 4;
+    left.as_raw()
+        .chunks_exact(stride)
+        .zip(right.as_raw().chunks_exact(stride))
+        .all(|(l, r)| l == r)
+}
+
+/// One verification outcome for a candidate pair.
+#[derive(Debug, Clone)]
+pub struct PairVerdict {
+    pub first: String,
+    pub second: String,
+    pub identical: bool,
+}
+
+/// Header-only dimension read: pixel-identical images always share
+/// dimensions, so a mismatch settles the pair without any decode.
+fn photo_dimensions(path: &str) -> Option<(u32, u32)> {
+    image::ImageReader::open(path)
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
+fn verify_pair_pixels(first: &str, second: &str) -> bool {
+    if let (Some(a), Some(b)) = (photo_dimensions(first), photo_dimensions(second)) {
+        if a != b {
+            return false;
+        }
+    }
+    // Undecodable files can never be confirmed identical, so they count as
+    // "different" and drop out of the duplicate view.
+    photos_pixel_identical(first, second).unwrap_or(false)
+}
+
+/// Verify candidate photo pairs in parallel, publishing every verdict as
+/// soon as it is known so the UI can stream results in. `should_stop` is
+/// cooperative cancellation, checked between pairs. Returns
+/// (identical, different) totals for the pairs actually verified.
+pub fn verify_photo_pairs(
+    pairs: &[(String, String)],
+    on_verdict: &(dyn Fn(&PairVerdict) + Sync),
+    should_stop: &(dyn Fn() -> bool + Sync),
+) -> (usize, usize) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let same = AtomicUsize::new(0);
+    let different = AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(4)
+        .clamp(1, 6)
+        .min(pairs.len().max(1));
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                if should_stop() {
+                    return;
+                }
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some((first, second)) = pairs.get(index) else {
+                    return;
+                };
+                let identical = verify_pair_pixels(first, second);
+                let verdict = PairVerdict {
+                    first: first.clone(),
+                    second: second.clone(),
+                    identical,
+                };
+                if identical {
+                    same.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    different.fetch_add(1, Ordering::Relaxed);
+                }
+                on_verdict(&verdict);
+            });
+        }
+    });
+    (same.into_inner(), different.into_inner())
 }
 
 fn fingerprint_parts(hash: u64) -> [i64; 5] {
@@ -1260,6 +1822,44 @@ pub enum MarkStrategy {
     Newest,
     Oldest,
     Shortest,
+    /// Keeper by the heuristics of `keeper_score` (original naming, no
+    /// copy/social traces, earliest modification).
+    Scored,
+}
+
+/// Heuristic "which copy deserves to survive" score, mirroring the DESIGN §7
+/// direction: original camera naming helps (+15), copy/social traces hurt
+/// (-20), the earliest modification wins up to +10 (originals usually age).
+/// Scores are advisory only — they pick the suggested keeper, nothing moves
+/// without a human mark.
+pub fn keeper_score(file: &GroupFile, earliest: i64, latest: i64) -> i64 {
+    let path = file.path.to_ascii_lowercase();
+    let name = path.rsplit(['/', '\\']).next().unwrap_or("");
+    let stem = name.split_once('.').map(|(stem, _)| stem).unwrap_or(name);
+    let mut score: i64 = 0;
+    let camera_naming = stem.starts_with("img_")
+        || stem.starts_with("dsc")
+        || stem.starts_with("pxl")
+        || stem.starts_with("mvi")
+        || (stem.len() >= 8 && stem.chars().take(8).all(|c| c.is_ascii_digit()));
+    if camera_naming {
+        score += 15;
+    }
+    let copy_marked = stem.contains("(1)")
+        || stem.contains("copy")
+        || stem.contains("副本")
+        || stem.contains("mmexport")
+        || stem.contains("wx_camera")
+        || stem.contains("screenshot");
+    let social_dir = ["wechat", "weixin", "微信", "qq", "download", "下载"]
+        .iter()
+        .any(|mark| path.contains(mark));
+    if copy_marked || social_dir {
+        score -= 20;
+    }
+    let span = (latest - earliest).max(1);
+    score += 10 * (latest - file.modified) / span;
+    score
 }
 
 /// Keep-one-mark-the-rest applied to every duplicate group matching the
@@ -1267,11 +1867,14 @@ pub enum MarkStrategy {
 /// the frontend smart mark (strict comparison, first occurrence wins ties),
 /// so both paths select the same copy. Per-copy failures are collected;
 /// the sweep never aborts midway.
+#[allow(clippy::too_many_arguments)]
 pub fn approve_groups_except_keeper(
     database: &Path,
     strategy: MarkStrategy,
     min_size: i64,
     path_contains: &str,
+    kind: Option<&str>,
+    dir_contains: &str,
 ) -> Result<BatchOutcome, String> {
     let connection = open_database(database)?;
     ensure_initialized(&connection)?;
@@ -1280,9 +1883,11 @@ pub fn approve_groups_except_keeper(
     let mut query = GroupQuery {
         min_size,
         path_contains: (!pattern.is_empty()).then_some(pattern),
-        sort: GroupSort::Size,
+        sort: GroupSort::Recoverable,
         offset: 0,
         limit: 200,
+        kind,
+        dir_contains: (!dir_contains.is_empty()).then_some(dir_contains),
     };
     loop {
         let page = query_groups_with(&connection, &query)?;
@@ -1296,6 +1901,8 @@ pub fn approve_groups_except_keeper(
                 continue;
             }
             let mut keeper = pool[0];
+            let earliest = pool.iter().map(|f| f.modified).min().unwrap_or(0);
+            let latest = pool.iter().map(|f| f.modified).max().unwrap_or(0);
             for candidate in pool.clone() {
                 match strategy {
                     MarkStrategy::Newest => {
@@ -1310,6 +1917,13 @@ pub fn approve_groups_except_keeper(
                     }
                     MarkStrategy::Shortest => {
                         if candidate.path.len() < keeper.path.len() {
+                            keeper = candidate;
+                        }
+                    }
+                    MarkStrategy::Scored => {
+                        if keeper_score(candidate, earliest, latest)
+                            > keeper_score(keeper, earliest, latest)
+                        {
                             keeper = candidate;
                         }
                     }
@@ -1381,6 +1995,16 @@ pub fn trash(database: &Path, file_id: i64) -> Result<(), String> {
 /// every resulting operations row shares a single batch id so the recycle
 /// bin can present them as one cleanup.
 pub fn trash_batch(database: &Path, file_ids: &[i64]) -> BatchOutcome {
+    trash_batch_with_progress(database, file_ids, None)
+}
+
+/// Same as `trash_batch`, reporting (done, total) after every file so a UI
+/// can show live progress for large sweeps.
+pub fn trash_batch_with_progress(
+    database: &Path,
+    file_ids: &[i64],
+    progress: Option<&dyn Fn(usize, usize)>,
+) -> BatchOutcome {
     let mut outcome = BatchOutcome::default();
     if file_ids.is_empty() {
         return outcome;
@@ -1393,10 +2017,13 @@ pub fn trash_batch(database: &Path, file_ids: &[i64]) -> BatchOutcome {
         return outcome;
     }
     let batch_id = new_batch_id();
-    for file_id in file_ids {
+    for (done, file_id) in file_ids.iter().enumerate() {
         match trash_one(&connection, *file_id, Some(batch_id)) {
             Ok(()) => outcome.succeeded += 1,
             Err(error) => outcome.failures.push(format!("文件 #{file_id}：{error}")),
+        }
+        if let Some(progress) = progress {
+            progress(done + 1, file_ids.len());
         }
     }
     outcome
@@ -1414,6 +2041,9 @@ fn trash_one(connection: &Connection, file_id: i64, batch_id: Option<i64>) -> Re
     if hash_file(&source)? != file.hash {
         return Err("source no longer matches indexed hash; scan again".to_string());
     }
+    if strict_verify_enabled(connection) {
+        strict_verify_against_keeper(connection, &file)?;
+    }
     let destination = recycle_destination(connection, file.id, &source)?;
     move_verified(&source, &destination, &file.hash)?;
     connection.execute("INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at,batch_id) VALUES(?1,?2,?3,?4,'trashed',?5,?6)", params![file.id, file.path, destination.to_string_lossy(), file.hash, now_seconds()?, batch_id]).map_err(|e| e.to_string())?;
@@ -1430,7 +2060,20 @@ fn trash_one(connection: &Connection, file_id: i64, batch_id: Option<i64>) -> Re
 pub fn restore(database: &Path, operation_id: i64) -> Result<(), String> {
     let connection = open_database(database)?;
     ensure_initialized(&connection)?;
-    restore_with(&connection, operation_id)
+    restore_with(&connection, operation_id, None)
+}
+
+/// Restore into a chosen directory instead of the recorded original path
+/// (which may have been deleted or reoccupied). The file keeps its name; a
+/// name collision in the target directory refuses the restore.
+pub fn restore_to(
+    database: &Path,
+    operation_id: i64,
+    target_dir: &Path,
+) -> Result<(), String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    restore_with(&connection, operation_id, Some(target_dir))
 }
 
 /// Restore every still-recycled file from one bulk user action, sharing a
@@ -1457,7 +2100,7 @@ pub fn restore_batch(database: &Path, batch_id: i64) -> BatchOutcome {
     match ids {
         Ok(ids) => {
             for id in ids {
-                match restore_with(&connection, id) {
+                match restore_with(&connection, id, None) {
                     Ok(()) => outcome.succeeded += 1,
                     Err(error) => outcome.failures.push(format!("记录 #{id}：{error}")),
                 }
@@ -1468,7 +2111,11 @@ pub fn restore_batch(database: &Path, batch_id: i64) -> BatchOutcome {
     outcome
 }
 
-fn restore_with(connection: &Connection, operation_id: i64) -> Result<(), String> {
+fn restore_with(
+    connection: &Connection,
+    operation_id: i64,
+    target_dir: Option<&Path>,
+) -> Result<(), String> {
     let record: Option<(i64, String, String, String, String)> = connection
         .query_row(
             "SELECT file_id,source_path,trash_path,hash,state FROM operations WHERE id=?1",
@@ -1492,19 +2139,40 @@ fn restore_with(connection: &Connection, operation_id: i64) -> Result<(), String
     }
     let source = PathBuf::from(source);
     let trashed = PathBuf::from(trashed);
-    if source.exists() {
-        return Err(format!(
-            "restore refused: destination already exists: {}",
-            source.display()
-        ));
-    }
+    let destination = match target_dir {
+        Some(dir) => {
+            if !dir.is_dir() {
+                return Err(format!("target directory not found: {}", dir.display()));
+            }
+            let name = trashed
+                .file_name()
+                .ok_or_else(|| "recycle-bin file has no name".to_string())?;
+            let target = dir.join(name);
+            if target.exists() {
+                return Err(format!(
+                    "restore refused: destination already exists: {}",
+                    target.display()
+                ));
+            }
+            target
+        }
+        None => {
+            if source.exists() {
+                return Err(format!(
+                    "restore refused: destination already exists: {}",
+                    source.display()
+                ));
+            }
+            source.clone()
+        }
+    };
     if hash_file(&trashed)? != hash {
         return Err("recycle-bin file failed integrity check".to_string());
     }
-    if let Some(parent) = source.parent() {
+    if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create restore directory: {e}"))?;
     }
-    move_verified(&trashed, &source, &hash)?;
+    move_verified(&trashed, &destination, &hash)?;
     connection
         .execute(
             "UPDATE operations SET state='restored',restored_at=?1 WHERE id=?2",
@@ -1517,7 +2185,7 @@ fn restore_with(connection: &Connection, operation_id: i64) -> Result<(), String
             params![file_id],
         )
         .map_err(|e| e.to_string())?;
-    println!("Restored: {}", source.display());
+    println!("Restored: {}", destination.display());
     Ok(())
 }
 
@@ -1532,6 +2200,15 @@ pub fn delete_direct(database: &Path, file_id: i64) -> Result<(), String> {
 /// Permanently delete several approved duplicates from one user action,
 /// sharing a single batch id (see `trash_batch`).
 pub fn delete_approved_batch(database: &Path, file_ids: &[i64]) -> BatchOutcome {
+    delete_approved_batch_with_progress(database, file_ids, None)
+}
+
+/// Same as `delete_approved_batch`, reporting (done, total) per file.
+pub fn delete_approved_batch_with_progress(
+    database: &Path,
+    file_ids: &[i64],
+    progress: Option<&dyn Fn(usize, usize)>,
+) -> BatchOutcome {
     let mut outcome = BatchOutcome::default();
     if file_ids.is_empty() {
         return outcome;
@@ -1544,10 +2221,13 @@ pub fn delete_approved_batch(database: &Path, file_ids: &[i64]) -> BatchOutcome 
         return outcome;
     }
     let batch_id = new_batch_id();
-    for file_id in file_ids {
+    for (done, file_id) in file_ids.iter().enumerate() {
         match delete_one(&connection, *file_id, Some(batch_id)) {
             Ok(()) => outcome.succeeded += 1,
             Err(error) => outcome.failures.push(format!("文件 #{file_id}：{error}")),
+        }
+        if let Some(progress) = progress {
+            progress(done + 1, file_ids.len());
         }
     }
     outcome
@@ -1568,6 +2248,9 @@ fn delete_one(
     let source = PathBuf::from(&file.path);
     if hash_file(&source)? != file.hash {
         return Err("source no longer matches indexed hash; scan again".to_string());
+    }
+    if strict_verify_enabled(connection) {
+        strict_verify_against_keeper(connection, &file)?;
     }
     fs::remove_file(&source).map_err(|e| format!("delete file: {e}"))?;
     connection
@@ -1592,6 +2275,277 @@ fn delete_one(
 pub struct BatchOutcome {
     pub succeeded: usize,
     pub failures: Vec<String>,
+}
+
+// --- Strict mode (optional byte-for-byte recheck) ---------------------------
+
+/// Setting read/write for the strict pre-delete byte comparison. Off by
+/// default; the hash-based safety chain already runs without it.
+pub fn set_strict_verify(database: &Path, enabled: bool) -> Result<(), String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    set_setting(
+        &connection,
+        "strict_verify",
+        if enabled { "1" } else { "0" },
+    )
+}
+
+fn strict_verify_enabled(connection: &Connection) -> bool {
+    connection
+        .query_row(
+            "SELECT value FROM settings WHERE key='strict_verify'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+/// Stream-compare the doomed copy against another present copy of the same
+/// (hash, size). Reads 2x the file's bytes; enabled per setting.
+fn strict_verify_against_keeper(
+    connection: &Connection,
+    file: &IndexedFile,
+) -> Result<(), String> {
+    let keeper: Option<String> = connection
+        .query_row(
+            "SELECT path FROM files WHERE present=1 AND hash=?1 AND size=?2 AND id<>?3 \
+             ORDER BY id LIMIT 1",
+            params![file.hash, file.size, file.id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some(keeper) = keeper else {
+        return Ok(()); // no sibling survives: nothing to compare with
+    };
+    if !byte_identical(Path::new(&file.path), Path::new(&keeper))? {
+        return Err(
+            "strict check failed: content differs from the kept copy; operation aborted"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Byte-for-byte comparison in 1 MiB chunks. CPU cost is a memcmp; the I/O is
+/// two full reads, which is why it stays behind a setting.
+fn byte_identical(a: &Path, b: &Path) -> Result<bool, String> {
+    let mut left = File::open(a).map_err(|e| format!("open {}: {e}", a.display()))?;
+    let mut right = File::open(b).map_err(|e| format!("open {}: {e}", b.display()))?;
+    let (mut buf_a, mut buf_b) = (vec![0_u8; 1 << 20], vec![0_u8; 1 << 20]);
+    loop {
+        let na = read_fill(&mut left, &mut buf_a)?;
+        let nb = read_fill(&mut right, &mut buf_b)?;
+        if na != nb {
+            return Ok(false);
+        }
+        if na == 0 {
+            return Ok(true);
+        }
+        if buf_a[..na] != buf_b[..nb] {
+            return Ok(false);
+        }
+    }
+}
+
+/// Read until the buffer is full or EOF, so chunk boundaries never fake a
+/// mismatch.
+fn read_fill(file: &mut File, buffer: &mut [u8]) -> Result<usize, String> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match file.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(count) => filled += count,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(filled)
+}
+
+// --- Hardlink dedup ----------------------------------------------------------
+
+/// Replace each approved duplicate with a hard link to its kept copy: every
+/// path survives, the duplicated physical file is freed. Not routed through
+/// the recycle bin; the keeper copy is the safety net (hash-verified before
+/// the swap, same content by construction).
+pub fn hardlink(database: &Path, file_id: i64) -> Result<(), String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    hardlink_one(&connection, file_id, None)
+}
+
+/// Batch variant sharing one connection and one operations batch id (see
+/// `trash_batch`).
+pub fn hardlink_batch(database: &Path, file_ids: &[i64]) -> BatchOutcome {
+    hardlink_batch_with_progress(database, file_ids, None)
+}
+
+/// Same as `hardlink_batch`, reporting (done, total) per file.
+pub fn hardlink_batch_with_progress(
+    database: &Path,
+    file_ids: &[i64],
+    progress: Option<&dyn Fn(usize, usize)>,
+) -> BatchOutcome {
+    let mut outcome = BatchOutcome::default();
+    if file_ids.is_empty() {
+        return outcome;
+    }
+    let Ok(connection) = open_database(database).map_err(|e| outcome.failures.push(e)) else {
+        return outcome;
+    };
+    if let Err(error) = ensure_initialized(&connection) {
+        outcome.failures.push(error);
+        return outcome;
+    }
+    let batch_id = new_batch_id();
+    for (done, file_id) in file_ids.iter().enumerate() {
+        match hardlink_one(&connection, *file_id, Some(batch_id)) {
+            Ok(()) => outcome.succeeded += 1,
+            Err(error) => outcome.failures.push(format!("文件 #{file_id}：{error}")),
+        }
+        if let Some(progress) = progress {
+            progress(done + 1, file_ids.len());
+        }
+    }
+    outcome
+}
+
+fn hardlink_one(
+    connection: &Connection,
+    file_id: i64,
+    batch_id: Option<i64>,
+) -> Result<(), String> {
+    let file =
+        file_by_id(connection, file_id)?.ok_or_else(|| format!("unknown file id {file_id}"))?;
+    if file.protected || !file.approved || !is_exact_duplicate(connection, &file)? {
+        return Err(
+            "file must be an approved, unprotected member of an exact duplicate group".to_string(),
+        );
+    }
+    let source = PathBuf::from(&file.path);
+    if hash_file(&source)? != file.hash {
+        return Err("source no longer matches indexed hash; scan again".to_string());
+    }
+    // Keeper preference: unprotected first, then the shortest path (mirrors
+    // the shortest-path keep strategy).
+    let keeper: String = connection
+        .query_row(
+            "SELECT path FROM files WHERE present=1 AND hash=?1 AND size=?2 AND id<>?3 \
+             ORDER BY protected ASC, LENGTH(path) ASC, id ASC LIMIT 1",
+            params![file.hash, file.size, file.id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "no other present copy to link to".to_string())?;
+    let keeper = PathBuf::from(keeper);
+    if already_same_physical_file(connection, &file)? {
+        return Err("source is already a hard link of the kept copy".to_string());
+    }
+    if !same_volume(&source, &keeper)? {
+        return Err(
+            "source and kept copy are on different volumes; hard links cannot cross volumes"
+                .to_string(),
+        );
+    }
+    // Swap the name over via a temporary link: if anything fails before the
+    // final rename, the original name and file are untouched.
+    let file_name = source
+        .file_name()
+        .ok_or_else(|| "source path has no file name".to_string())?;
+    let mut temp_name = file_name.to_os_string();
+    temp_name.push(".flink-tmp");
+    let temp = source
+        .parent()
+        .ok_or_else(|| "source path has no parent".to_string())?
+        .join(temp_name);
+    let _ = fs::remove_file(&temp);
+    fs::hard_link(&keeper, &temp).map_err(|e| format!("create hard link: {e}"))?;
+    if let Err(error) = fs::remove_file(&source) {
+        let _ = fs::remove_file(&temp);
+        return Err(format!("remove original copy: {error}"));
+    }
+    if let Err(error) = fs::rename(&temp, &source) {
+        // The original name is gone but its content lives on at the keeper;
+        // try to restore the name as a plain hard link before giving up.
+        if fs::hard_link(&keeper, &source).is_err() {
+            return Err(format!(
+                "restoring the path failed ({error}); content remains at {}",
+                keeper.display()
+            ));
+        }
+    }
+    let (dev, inode) = fs::metadata(&source)
+        .map(|metadata| device_inode(&metadata))
+        .unwrap_or((0, 0));
+    connection
+        .execute(
+            "INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at,batch_id) VALUES(?1,?2,?3,?4,'hardlinked',?5,?6)",
+            params![file.id, file.path, keeper.to_string_lossy(), file.hash, now_seconds()?, batch_id],
+        )
+        .map_err(|e| e.to_string())?;
+    connection
+        .execute(
+            "UPDATE files SET approved=0, dev=?2, inode=?3 WHERE id=?1",
+            params![file.id, dev, inode],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// True when the index already records both names as one physical file
+/// (POSIX dev/inode; always false where that metadata is unavailable).
+fn already_same_physical_file(
+    connection: &Connection,
+    file: &IndexedFile,
+) -> Result<bool, String> {
+    if file.dev == 0 && file.inode == 0 {
+        return Ok(false);
+    }
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE present=1 AND hash=?1 AND size=?2 AND id<>?3 \
+             AND dev=?4 AND inode=?5",
+            params![file.hash, file.size, file.id, file.dev, file.inode],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(count > 0)
+}
+
+/// Same-volume test guarding the hardlink swap. POSIX compares device ids;
+/// Windows compares the drive/UNC share prefix, which is exact unless volume
+/// mount points hide behind one letter (rare on personal machines).
+fn same_volume(a: &Path, b: &Path) -> Result<bool, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let da = fs::metadata(a).map_err(|e| e.to_string())?.dev();
+        let db = fs::metadata(b).map_err(|e| e.to_string())?.dev();
+        Ok(da == db)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fs::metadata(a).map_err(|e| e.to_string())?;
+        let _ = fs::metadata(b).map_err(|e| e.to_string())?;
+        Ok(volume_prefix(a).eq_ignore_ascii_case(&volume_prefix(b)))
+    }
+}
+
+#[cfg(not(unix))]
+fn volume_prefix(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        let share: Vec<&str> = rest.splitn(3, ['\\', '/']).take(2).collect();
+        return format!(r"\\?\UNC\{}", share.join(r"\"));
+    }
+    if let Some(rest) = text.strip_prefix(r"\\") {
+        let share: Vec<&str> = rest.splitn(3, ['\\', '/']).take(2).collect();
+        return format!(r"\\{}", share.join(r"\"));
+    }
+    text.chars().take(2).collect()
 }
 
 /// Nanosecond timestamp as a batch identity: rows written by one user action
@@ -1624,6 +2578,320 @@ fn remove_paths(database: &Path, paths: &[String], to_trash: bool) -> Result<Bat
 /// There is no approval step like the exact-duplicate flow, but every path
 /// must be indexed, unprotected, and still hash-match the index before it is
 /// touched; every move is recorded in operations.
+#[derive(serde::Serialize, Default)]
+pub struct DirKeepOutcome {
+    /// Copies recycled (their content survives elsewhere or via the keeper).
+    pub recycled: usize,
+    /// Copies moved into the keep directory to preserve a last-of-content.
+    pub moved: usize,
+    pub failures: Vec<String>,
+}
+
+/// Recycle every duplicate candidate under `dir`. Contents whose removable
+/// copies ALL live inside `dir` would lose their last copy in a plain sweep,
+/// so one unprotected copy is first moved into `keep_dir` (the index records
+/// the new path, operations records the audit row) and only the remaining
+/// copies are recycled. Contents with a survivor elsewhere (or a protected
+/// copy anywhere) are recycled straight away; protected files are never
+/// touched.
+pub fn recycle_dir_keep_one(
+    database: &Path,
+    dir: &str,
+    keep_dir: &Path,
+) -> Result<DirKeepOutcome, String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    let canonical_dir = absolute_path(Path::new(dir.trim()))?;
+    let canonical_keep = absolute_path(keep_dir)?;
+    if canonical_keep.starts_with(&canonical_dir) {
+        return Err("保留目录不能位于被清理目录之内".to_string());
+    }
+    let dir_text = canonical_dir.to_string_lossy().into_owned();
+    let posix_pattern = format!("%{}%", like_escape(&format!("{dir_text}/")));
+    let windows_pattern = format!("%{}%", like_escape(&format!("{dir_text}\\")));
+    let mut statement = connection
+        .prepare(
+            "SELECT f.id,f.path,f.hash,f.protected FROM files f \
+             WHERE f.present=1 AND (f.path LIKE ?1 ESCAPE '\\' OR f.path LIKE ?2 ESCAPE '\\') \
+             AND EXISTS (SELECT 1 FROM files g WHERE g.present=1 \
+               AND g.hash=f.hash AND g.size=f.size AND g.id<>f.id)",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map(params![posix_pattern, windows_pattern], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)? != 0,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    drop(statement);
+
+    // Group the in-directory candidates by content hash.
+    let mut groups: HashMap<String, Vec<(i64, String, bool)>> = HashMap::new();
+    for (id, path, hash, protected) in rows {
+        groups.entry(hash).or_default().push((id, path, protected));
+    }
+
+    let mut outcome = DirKeepOutcome::default();
+    let batch_id = new_batch_id();
+    let mut recycle_list: Vec<String> = Vec::new();
+    for (hash, members) in groups {
+        // Live copies everywhere and how many of them are protected.
+        let total: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE present=1 AND hash=?1",
+                params![hash],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let in_dir = members.len() as i64;
+        let outside = total - in_dir;
+        let protected_in_dir = members.iter().filter(|(_, _, protected)| *protected).count() as i64;
+        // The content survives the sweep when copies exist outside the dir or
+        // a protected copy (untouchable by design) stays behind.
+        let survivor = outside > 0 || protected_in_dir > 0;
+        let mut unprotected: Vec<(i64, String)> = members
+            .iter()
+            .filter(|(_, _, protected)| !protected)
+            .map(|(id, path, _)| (*id, path.clone()))
+            .collect();
+        if !survivor {
+            if unprotected.is_empty() {
+                outcome
+                    .failures
+                    .push("目录内的候选均为受保护文件，无法处理".to_string());
+                continue;
+            }
+            // Keeper: the shortest path moves into the keep directory.
+            unprotected.sort_by_key(|(_, path)| path.len());
+            let (keeper_id, keeper_path) = unprotected.remove(0);
+            let source = PathBuf::from(&keeper_path);
+            if hash_file(&source)? != hash {
+                outcome
+                    .failures
+                    .push(format!("{keeper_path}: content no longer matches the index"));
+                continue;
+            }
+            if let Err(error) =
+                move_indexed_file_to(&connection, keeper_id, &source, keep_dir, &hash)
+            {
+                outcome.failures.push(format!("{keeper_path}: {error}"));
+                continue;
+            }
+            outcome.moved += 1;
+        }
+        for (_, path) in &unprotected {
+            recycle_list.push(path.clone());
+        }
+    }
+    if !recycle_list.is_empty() {
+        for path in &recycle_list {
+            match remove_indexed_path(&connection, path, true, Some(batch_id)) {
+                Ok(()) => outcome.recycled += 1,
+                Err(error) => outcome.failures.push(format!("{path}: {error}")),
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+/// Outcome of a directory merge.
+#[derive(serde::Serialize, Default)]
+pub struct DirMergeOutcome {
+    /// Losing copies recycled.
+    pub recycled: usize,
+    /// Winning copies moved into the target directory.
+    pub moved: usize,
+    /// Winning copies that already lived inside the target directory and
+    /// stayed where they are.
+    pub kept: usize,
+    /// Directories removed after the merge left them empty.
+    pub cleaned_dirs: Vec<String>,
+    pub failures: Vec<String>,
+}
+
+/// Unified directory merge for the duplicate-directory view: the caller has
+/// already decided a winner for every duplicate pair and passes each pair as
+/// `(loser, winner)`. The loser is recycled behind the standard per-file
+/// chain (index lookup, protection rules, content re-hash, audited move);
+/// the winner ends up inside `target_dir` — moved there when it lives
+/// elsewhere, left alone when it is already inside. A pair whose loser
+/// cannot be recycled keeps its winner in place: moving it would only
+/// create a fresh duplicate. After everything succeeded, every directory in
+/// `cleanup_dirs` is removed best-effort — `remove_dir` refuses on its own
+/// while non-duplicate files remain, so they are never at risk.
+pub fn merge_dir_pair(
+    database: &Path,
+    pairs: &[(String, String)],
+    target_dir: &str,
+    cleanup_dirs: &[String],
+) -> Result<DirMergeOutcome, String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    let target = absolute_path(Path::new(target_dir.trim()))?;
+    let target_text = target.to_string_lossy().into_owned();
+    let mut outcome = DirMergeOutcome::default();
+    if pairs.is_empty() {
+        return Ok(outcome);
+    }
+    let batch_id = new_batch_id();
+
+    // Phase 1: recycle the losing copies (deduplicated across pairs).
+    let mut recycled_ok: std::collections::HashSet<String> = Default::default();
+    let mut seen: std::collections::HashSet<String> = Default::default();
+    for (loser, _) in pairs {
+        if !seen.insert(loser.clone()) {
+            continue;
+        }
+        match remove_indexed_path(&connection, loser, true, Some(batch_id)) {
+            Ok(()) => {
+                outcome.recycled += 1;
+                recycled_ok.insert(loser.clone());
+            }
+            Err(error) => outcome.failures.push(format!("{loser}: {error}")),
+        }
+    }
+
+    // Phase 2: winners end up in the target directory — already there means
+    // kept, otherwise moved (once each, only when the pair's loser was
+    // recycled, otherwise the untouched twin would end up duplicated).
+    let mut handled_winners: std::collections::HashSet<String> = Default::default();
+    let mut all_moved = true;
+    for (loser, winner) in pairs {
+        if !recycled_ok.contains(loser) {
+            outcome
+                .failures
+                .push(format!("{winner}: kept, its duplicate could not be recycled"));
+            all_moved = false;
+            continue;
+        }
+        if winner.starts_with(&target_text)
+            && winner[target_text.len()..].starts_with(['/', '\\'])
+        {
+            outcome.kept += 1;
+            continue;
+        }
+        if !handled_winners.insert(winner.clone()) {
+            continue;
+        }
+        let row: Option<(i64, String)> = connection
+            .query_row(
+                "SELECT id,hash FROM files WHERE path=?1 AND present=1",
+                params![winner],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((file_id, hash)) = row else {
+            outcome
+                .failures
+                .push(format!("{winner}: not indexed or already gone"));
+            all_moved = false;
+            continue;
+        };
+        let source = PathBuf::from(winner);
+        match hash_file(&source) {
+            Ok(actual) if actual == hash => {}
+            Ok(_) => {
+                outcome
+                    .failures
+                    .push(format!("{winner}: content no longer matches the index"));
+                all_moved = false;
+                continue;
+            }
+            Err(error) => {
+                outcome.failures.push(format!("{winner}: {error}"));
+                all_moved = false;
+                continue;
+            }
+        }
+        match move_indexed_file_to(&connection, file_id, &source, &target, &hash) {
+            Ok(()) => outcome.moved += 1,
+            Err(error) => {
+                outcome.failures.push(format!("{winner}: {error}"));
+                all_moved = false;
+            }
+        }
+    }
+
+    // Phase 3: cleanup passed directories best-effort when everything
+    // worked; remove_dir refuses while non-duplicate files remain.
+    if all_moved && outcome.failures.is_empty() {
+        for dir in cleanup_dirs {
+            if let Ok(path) = absolute_path(Path::new(dir.trim())) {
+                if path != target && !target.starts_with(&path) {
+                    if fs::remove_dir(&path).is_ok() {
+                        outcome
+                            .cleaned_dirs
+                            .push(path.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+/// Move one indexed file into `keep_dir` (name kept; a collision appends a
+/// numeric suffix), verifying content against the index first and updating
+/// the indexed path so the next scan sees a rename instead of a disappearance.
+fn move_indexed_file_to(
+    connection: &Connection,
+    file_id: i64,
+    source: &Path,
+    keep_dir: &Path,
+    hash: &str,
+) -> Result<(), String> {
+    let name = source
+        .file_name()
+        .ok_or_else(|| "source has no file name".to_string())?;
+    let extension = Path::new(name)
+        .extension()
+        .map(|extension| format!(".{}", extension.to_string_lossy()))
+        .unwrap_or_default();
+    let full = name.to_string_lossy().into_owned();
+    let stem = match full.rfind(&extension) {
+        Some(index) if !extension.is_empty() => full[..index].to_string(),
+        _ => full.clone(),
+    };
+    fs::create_dir_all(keep_dir).map_err(|e| format!("create keep directory: {e}"))?;
+    let mut candidate = keep_dir.join(name);
+    let mut suffix = 1_u32;
+    while candidate.exists() {
+        candidate = keep_dir.join(format!("{stem} ({suffix}){extension}"));
+        suffix += 1;
+    }
+    move_verified(source, &candidate, hash)?;
+    // A recycled copy leaves a dead index row (present=0) still holding this
+    // path, and files.path is UNIQUE: rename the dead row aside so the moved
+    // file can take the path over while the row itself survives for the
+    // restore chain, which looks files up by id.
+    connection
+        .execute(
+            "UPDATE files SET path = path || '#replaced#' || id              WHERE path = ?2 AND present = 0 AND id <> ?1",
+            params![file_id, candidate.to_string_lossy()],
+        )
+        .map_err(|e| e.to_string())?;
+    connection
+        .execute(
+            "UPDATE files SET path=?2 WHERE id=?1",
+            params![file_id, candidate.to_string_lossy()],
+        )
+        .map_err(|e| e.to_string())?;
+    connection
+        .execute(
+            "INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at,batch_id) VALUES(?1,?2,'',?3,'moved',?4,NULL)",
+            params![file_id, source.to_string_lossy(), hash, now_seconds()?],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 pub fn trash_paths(database: &Path, paths: &[String]) -> Result<BatchOutcome, String> {
     remove_paths(database, paths, true)
 }
@@ -1833,6 +3101,31 @@ pub enum GroupSort {
     Size,
     Members,
     Path,
+    /// Sort by the space actually freed when every removable copy goes:
+    /// per-file size × (distinct physical copies − 1), so hardlinked
+    /// name-groups (which free nothing) sink instead of floating to the top.
+    Recoverable,
+}
+
+/// Coarse file-type buckets for the review filter; each maps to a fixed
+/// extension list matched against the lowercased path.
+pub fn kind_extensions(kind: &str) -> Option<&'static [&'static str]> {
+    match kind {
+        "image" => Some(&[
+            "jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "heic", "heif", "svg",
+            "ico",
+        ]),
+        "video" => Some(&[
+            "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "3gp",
+        ]),
+        "audio" => Some(&["mp3", "wav", "flac", "aac", "m4a", "ogg", "wma", "opus"]),
+        "document" => Some(&[
+            "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md", "csv", "json",
+            "xml", "html", "htm", "epub",
+        ]),
+        "archive" => Some(&["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso"]),
+        _ => None,
+    }
 }
 
 /// Filters and paging for `query_groups`.
@@ -1842,6 +3135,10 @@ pub struct GroupQuery<'a> {
     pub sort: GroupSort,
     pub offset: i64,
     pub limit: i64,
+    /// Coarse file-type bucket (`kind_extensions`); None = all.
+    pub kind: Option<&'a str>,
+    /// Directory filter: only groups with at least one copy under this path.
+    pub dir_contains: Option<&'a str>,
 }
 
 #[derive(serde::Serialize)]
@@ -1855,12 +3152,17 @@ pub struct GroupFile {
     /// (device, inode): the "duplicate" is another name for the same physical
     /// file, so removing it frees no space.
     pub hardlinked: bool,
+    /// Heuristic keeper suggestion (`keeper_score`); advisory only.
+    pub suggested: bool,
 }
 
 #[derive(serde::Serialize)]
 pub struct Group {
     pub hash: String,
     pub size: i64,
+    /// Bytes actually freed when every removable copy goes: per-file size ×
+    /// (distinct physical copies − 1); zero for hardlink-only groups.
+    pub recoverable: i64,
     pub files: Vec<GroupFile>,
 }
 
@@ -1884,35 +3186,85 @@ fn query_groups_with(connection: &Connection, query: &GroupQuery) -> Result<Grou
     let limit = query.limit.clamp(1, 200);
     let offset = query.offset.max(0);
     let min_size = query.min_size.max(0);
-    let pattern = format!(
-        "%{}%",
-        like_escape(query.path_contains.unwrap_or_default().trim())
+    // Row filters for kind/keyword/directory must stay at the GROUP level
+    // ("the group contains a matching member"), not row level — filtering
+    // rows first would collapse one-sided matches below the two-copy
+    // minimum and silently drop the whole group.
+    let mut values: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::Integer(min_size)];
+    let mut having: Vec<String> = vec!["COUNT(*) > 1".to_string()];
+    if let Some(extensions) = query.kind.and_then(kind_extensions) {
+        // SUM over the 0/1 LIKE results: any match inside the group passes.
+        let chain: Vec<String> = extensions
+            .iter()
+            .map(|extension| {
+                values.push(rusqlite::types::Value::Text(format!("%.{extension}")));
+                format!("SUM(lower(path) LIKE ?{})", values.len())
+            })
+            .collect();
+        having.push(format!("({}) > 0", chain.join(" + ")));
+    }
+    if let Some(dir) = query
+        .dir_contains
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+    {
+        values.push(rusqlite::types::Value::Text(format!(
+            "%{}%",
+            like_escape(dir)
+        )));
+        values.push(rusqlite::types::Value::Text("\\".to_string()));
+        having.push(format!(
+            "SUM(path LIKE ?{} ESCAPE ?{}) > 0",
+            values.len() - 1,
+            values.len()
+        ));
+    }
+    let keyword = query.path_contains.map(|value| {
+        format!("%{}%", like_escape(value.trim()))
+    });
+    if let Some(pattern) = &keyword {
+        values.push(rusqlite::types::Value::Text(pattern.clone()));
+        having.push(format!("SUM(path LIKE ?{} ESCAPE '\\') > 0", values.len()));
+    }
+    let group_sql = format!(
+        "FROM files WHERE present=1 AND size>=?1 GROUP BY hash,size HAVING {}",
+        having.join(" AND ")
     );
-    // LIKE is ASCII-case-insensitive by default, close enough for a search box.
-    let filter_sql =
-        "FROM files WHERE present=1 GROUP BY hash,size \
-         HAVING COUNT(*) > 1 AND size >= ?1 AND SUM(path LIKE ?2 ESCAPE '\\') > 0";
+    // Distinct physical copies: hardlinked names collapse to one, so the
+    // recoverable size of a hardlink-only group correctly comes out as zero.
+    const PHYSICAL_SQL: &str =
+        "COUNT(DISTINCT CASE WHEN dev!=0 OR inode!=0 THEN printf('%d:%d',dev,inode) ELSE 'i'||id END)";
+    let total: i64 = connection
+        .query_row(
+            &format!("SELECT COUNT(*) FROM (SELECT 1 {group_sql})"),
+            rusqlite::params_from_iter(values.iter()),
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
     let order_sql = match query.sort {
         GroupSort::Size => "size DESC, members DESC",
         GroupSort::Members => "members DESC, size DESC",
         GroupSort::Path => "first_path",
+        GroupSort::Recoverable => "freed DESC, size DESC, members DESC",
     };
-    let total: i64 = connection
-        .query_row(
-            &format!("SELECT COUNT(*) FROM (SELECT 1 {filter_sql})"),
-            params![min_size, pattern],
-            |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())?;
+    values.push(rusqlite::types::Value::Integer(limit));
+    values.push(rusqlite::types::Value::Integer(offset));
     let mut statement = connection
         .prepare(&format!(
-            "SELECT hash,size,COUNT(*) AS members,MIN(path) AS first_path {filter_sql} \
-             ORDER BY {order_sql} LIMIT ?3 OFFSET ?4"
+            "SELECT hash,size,COUNT(*) AS members,{PHYSICAL_SQL} AS physical, \
+             MIN(path) AS first_path,{PHYSICAL_SQL}*size AS freed \
+             {group_sql} ORDER BY {order_sql} LIMIT ?{} OFFSET ?{}",
+            values.len() - 1,
+            values.len()
         ))
         .map_err(|e| e.to_string())?;
     let keys = statement
-        .query_map(params![min_size, pattern, limit, offset], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(3)?,
+            ))
         })
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
@@ -1925,7 +3277,7 @@ fn query_groups_with(connection: &Connection, query: &GroupQuery) -> Result<Grou
     if !keys.is_empty() {
         let mut conditions = String::new();
         let mut values: Vec<rusqlite::types::Value> = Vec::new();
-        for (hash, size) in &keys {
+        for (hash, size, _) in &keys {
             if !conditions.is_empty() {
                 conditions.push_str(" OR ");
             }
@@ -1936,7 +3288,7 @@ fn query_groups_with(connection: &Connection, query: &GroupQuery) -> Result<Grou
         let mut statement = connection
             .prepare(&format!(
                 "SELECT hash,size,id,path,protected,approved,modified,dev,inode FROM files \
-                 WHERE present=1 AND ({conditions}) ORDER BY path"
+                 WHERE present=1 AND ({conditions}) ORDER BY modified DESC, path ASC"
             ))
             .map_err(|e| e.to_string())?;
         let rows = statement
@@ -1950,6 +3302,7 @@ fn query_groups_with(connection: &Connection, query: &GroupQuery) -> Result<Grou
                     approved: row.get::<_, i64>(5)? != 0,
                     modified: row.get(6)?,
                     hardlinked: false,
+                    suggested: false,
                 };
                 Ok((hash, size, file, row.get::<_, i64>(7)?, row.get::<_, i64>(8)?))
             })
@@ -1962,7 +3315,7 @@ fn query_groups_with(connection: &Connection, query: &GroupQuery) -> Result<Grou
 
     let groups = keys
         .into_iter()
-        .map(|(hash, size)| {
+        .map(|(hash, size, physical)| {
             let members = members.remove(&(hash.clone(), size)).unwrap_or_default();
             // A (dev, inode) pair appearing twice inside one group means two
             // of the "duplicates" are names for the same physical file.
@@ -1972,15 +3325,36 @@ fn query_groups_with(connection: &Connection, query: &GroupQuery) -> Result<Grou
                     *identities.entry((*dev, *inode)).or_default() += 1;
                 }
             }
+            // Keeper suggestion: highest heuristic score among unprotected
+            // members; every other member stays untouched (advisory only).
+            let earliest = members.iter().map(|(f, _, _)| f.modified).min().unwrap_or(0);
+            let latest = members.iter().map(|(f, _, _)| f.modified).max().unwrap_or(0);
+            let mut best: Option<(i64, usize)> = None; // (score, member index)
+            for (index, (file, _, _)) in members.iter().enumerate() {
+                if file.protected {
+                    continue;
+                }
+                let score = keeper_score(file, earliest, latest);
+                if best.map(|(best_score, _)| score > best_score).unwrap_or(true) {
+                    best = Some((score, index));
+                }
+            }
             let files = members
                 .into_iter()
-                .map(|(mut file, dev, inode)| {
+                .enumerate()
+                .map(|(index, (mut file, dev, inode))| {
                     file.hardlinked =
                         identities.get(&(dev, inode)).copied().unwrap_or(0) > 1;
+                    file.suggested = best.map(|(_, index_)| index_ == index).unwrap_or(false);
                     file
                 })
                 .collect();
-            Group { hash, size, files }
+            Group {
+                hash,
+                size,
+                recoverable: size * (physical - 1).max(0),
+                files,
+            }
         })
         .collect();
     Ok(GroupsPage { total, groups })
@@ -2010,6 +3384,7 @@ fn move_verified(source: &Path, destination: &Path, expected_hash: &str) -> Resu
     match fs::rename(source, destination) {
         Ok(()) => Ok(()),
         Err(_) => {
+            copy_file(source, destination)?;
             copy_file(source, destination)?;
             if hash_file(destination)? != expected_hash {
                 let _ = fs::remove_file(destination);
@@ -2073,6 +3448,46 @@ pub fn trash_list(database: &Path) -> Result<(), String> {
         println!("[{id}] {created_at}\t{source}\t{trashed}");
     }
     Ok(())
+}
+
+#[derive(serde::Serialize)]
+pub struct DirCount {
+    pub dir: String,
+    pub count: i64,
+}
+
+/// Distinct parent directories of files that belong to any exact-duplicate
+/// group, busiest first — the review page's directory filter options.
+pub fn group_dirs(database: &Path) -> Result<Vec<DirCount>, String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT path FROM files f WHERE present=1 \
+             AND EXISTS (SELECT 1 FROM files g WHERE g.present=1 \
+               AND g.hash=f.hash AND g.size=f.size AND g.id<>f.id)",
+        )
+        .map_err(|e| e.to_string())?;
+    let paths = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    drop(statement);
+    let mut counts: HashMap<String, i64> = HashMap::new();
+    for path in paths {
+        let dir = match path.rsplit_once(['/', '\\']) {
+            Some((parent, _)) => parent.to_string(),
+            None => continue,
+        };
+        *counts.entry(dir).or_default() += 1;
+    }
+    let mut dirs: Vec<DirCount> = counts
+        .into_iter()
+        .map(|(dir, count)| DirCount { dir, count })
+        .collect();
+    dirs.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.dir.cmp(&b.dir)));
+    Ok(dirs)
 }
 
 /// Export every member of the currently indexed duplicate groups as CSV for
@@ -2174,7 +3589,7 @@ fn csv_field(value: &str) -> String {
 
 fn file_by_id(connection: &Connection, id: i64) -> Result<Option<IndexedFile>, String> {    connection
         .query_row(
-            "SELECT id,path,size,hash,protected,approved FROM files WHERE id=?1 AND present=1",
+            "SELECT id,path,size,hash,protected,approved,dev,inode FROM files WHERE id=?1 AND present=1",
             params![id],
             |r| {
                 Ok(IndexedFile {
@@ -2184,6 +3599,8 @@ fn file_by_id(connection: &Connection, id: i64) -> Result<Option<IndexedFile>, S
                     hash: r.get(3)?,
                     protected: r.get::<_, i64>(4)? != 0,
                     approved: r.get::<_, i64>(5)? != 0,
+                    dev: r.get(6)?,
+                    inode: r.get(7)?,
                 })
             },
         )
@@ -2340,7 +3757,7 @@ mod tests {
             connection
                 .query_row(
                     "SELECT id FROM files WHERE path LIKE ?1",
-                    [format!("%/{name}.txt")],
+                    [format!("%{name}.txt")],
                     |row| row.get(0),
                 )
                 .unwrap()
@@ -2431,7 +3848,7 @@ mod tests {
 
         // Group one keeps the newest copy and marks the old one; group two's
         // only unprotected copy IS the keeper, so nothing is marked there.
-        let outcome = approve_groups_except_keeper(&database, MarkStrategy::Newest, 0, "").unwrap();
+        let outcome = approve_groups_except_keeper(&database, MarkStrategy::Newest, 0, "", None, "").unwrap();
         assert_eq!(outcome.succeeded, 1);
         assert!(outcome.failures.is_empty());
 
@@ -2956,6 +4373,8 @@ mod tests {
                 min_size: 0,
                 path_contains: None,
                 sort: GroupSort::Size,
+                kind: None,
+                dir_contains: None,
                 offset: 0,
                 limit: 50,
             },
@@ -3011,6 +4430,8 @@ mod tests {
                 min_size: 0,
                 path_contains: None,
                 sort: GroupSort::Size,
+                kind: None,
+                dir_contains: None,
                 offset: 0,
                 limit: 10,
             },
@@ -3139,6 +4560,8 @@ mod tests {
                 min_size: 0,
                 path_contains: None,
                 sort: GroupSort::Size,
+                kind: None,
+                dir_contains: None,
                 offset: 0,
                 limit: 10,
             },
@@ -3165,6 +4588,8 @@ mod tests {
                 min_size: 0,
                 path_contains: None,
                 sort: GroupSort::Size,
+                kind: None,
+                dir_contains: None,
                 offset: 0,
                 limit: 10,
             },
@@ -3227,6 +4652,9 @@ mod tests {
     }
 
     #[test]
+    // Hard-link identity comes from POSIX dev/inode metadata; on Windows the
+    // feature degrades to "unknown" by design, so the marking can't be asserted.
+    #[cfg(unix)]
     fn hardlinked_names_are_marked_in_groups() {
         let directory = test_directory("hardlinks");
         let source = directory.join("source");
@@ -3250,6 +4678,8 @@ mod tests {
                 min_size: 0,
                 path_contains: None,
                 sort: GroupSort::Path,
+                kind: None,
+                dir_contains: None,
                 offset: 0,
                 limit: 10,
             },
@@ -3316,6 +4746,8 @@ mod tests {
                 min_size: 0,
                 path_contains: None,
                 sort: GroupSort::Size,
+                kind: None,
+                dir_contains: None,
                 offset: 0,
                 limit: 10,
             },
@@ -3367,7 +4799,7 @@ mod tests {
             connection
                 .query_row(
                     "SELECT id FROM files WHERE path LIKE ?1",
-                    [format!("%/{name}.txt")],
+                    [format!("%{name}.txt")],
                     |row| row.get(0),
                 )
                 .unwrap()
@@ -3466,6 +4898,164 @@ mod tests {
     }
 
     #[test]
+    fn recycle_dir_keep_one_preserves_last_copy() {
+        let directory = test_directory("dir-keep-one");
+        let doomed = directory.join("doomed");
+        let other = directory.join("other");
+        let keep = directory.join("keep");
+        fs::create_dir_all(&doomed).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::create_dir_all(&keep).unwrap();
+        // Content X: two copies inside the doomed dir only — a plain sweep
+        // would erase it, so one copy must move into the keep dir first.
+        fs::write(doomed.join("x1.png"), b"content X").unwrap();
+        fs::write(doomed.join("x2.png"), b"content X").unwrap();
+        // Content Y: one copy inside + one outside — recycling the inside
+        // copy leaves the outside copy alive, so nothing needs moving.
+        fs::write(doomed.join("y1.png"), b"content Y").unwrap();
+        fs::write(other.join("y2.png"), b"content Y").unwrap();
+        // Content Z: protected copies inside — untouchable by design.
+        fs::write(doomed.join("z1.png"), b"content Z").unwrap();
+        fs::write(doomed.join("z2.png"), b"content Z").unwrap();
+        let database = directory.join("index.db");
+        init(&database, &directory.join("recycle")).unwrap();
+        scan(
+            &database,
+            &[doomed.clone(), other.clone()],
+            &["z1.png".to_string()],
+        )
+        .unwrap();
+
+        let outcome = recycle_dir_keep_one(&database, &doomed.to_string_lossy(), &keep).unwrap();
+        assert_eq!(outcome.moved, 1, "content X keeps one via a move");
+        // x2 (non-keeper of X), y1 (outside copy survives), and z2 (its
+        // protected sibling z1 keeps content Z alive) are all recycled.
+        assert_eq!(outcome.recycled, 3);
+
+        // Content X survives exactly once, inside the keep dir.
+        let kept: Vec<_> = fs::read_dir(&keep)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(kept.len(), 1, "one keeper moved: {kept:?}");
+        assert_eq!(fs::read(&kept[0]).unwrap(), b"content X");
+        // Content Y keeps its outside copy; the inside copy is recycled.
+        assert!(!doomed.join("y1.png").exists());
+        assert!(other.join("y2.png").exists());
+        // Content Z: the protected copy survives in place; the unprotected
+        // sibling was recycled (recoverable from the recycle bin).
+        assert!(doomed.join("z1.png").exists());
+        assert!(!doomed.join("z2.png").exists());
+        // The moved file's index row points at its new home.
+        let connection = open_database(&database).unwrap();
+        let moved_path: String = connection
+            .query_row(
+                "SELECT path FROM files WHERE path LIKE ?1",
+                [format!("%{}%", keep.to_string_lossy())],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(moved_path.starts_with(keep.to_string_lossy().as_ref()));
+        drop(connection);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn recoverable_sort_and_hardlink_correction() {
+        let directory = test_directory("recoverable-sort");
+        let source = directory.join("source");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&source).unwrap();
+        // Group A: four hardlinked names (one physical file) — frees nothing.
+        fs::write(source.join("h1.txt"), vec![b'H'; 512]).unwrap();
+        fs::hard_link(source.join("h1.txt"), source.join("h2.txt")).unwrap();
+        fs::hard_link(source.join("h1.txt"), source.join("h3.txt")).unwrap();
+        fs::hard_link(source.join("h1.txt"), source.join("h4.txt")).unwrap();
+        // Group B: two genuine copies of different content — frees one full
+        // copy.
+        fs::write(source.join("r1.txt"), vec![b'R'; 512]).unwrap();
+        fs::write(source.join("r2.txt"), vec![b'R'; 512]).unwrap();
+        let database = directory.join("index.db");
+        init(&database, &recycle).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+
+        #[cfg(unix)]
+        {
+            // On POSIX the two groups report identical per-file size, so the
+            // recoverable sort must sink the hardlink-only group to zero and
+            // put the real duplicates first.
+            let page = query_groups(
+                &database,
+                &GroupQuery {
+                    min_size: 0,
+                    path_contains: None,
+                    sort: GroupSort::Recoverable,
+                    offset: 0,
+                    limit: 50,
+                    kind: None,
+                    dir_contains: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(page.groups.len(), 2);
+            assert_eq!(page.groups[0].recoverable, 512, "real copies first");
+            assert_eq!(page.groups[0].files[0].path, source.join("r1.txt").to_string_lossy());
+            assert_eq!(page.groups[1].recoverable, 0, "hardlinked names free nothing");
+        }
+
+        // Kind filter narrows the queue to the .txt groups only.
+        let images = query_groups(
+            &database,
+            &GroupQuery {
+                min_size: 0,
+                path_contains: None,
+                sort: GroupSort::Size,
+                offset: 0,
+                limit: 50,
+                kind: Some("image"),
+                dir_contains: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(images.total, 0, "no image files were indexed");
+        let text = query_groups(
+            &database,
+            &GroupQuery {
+                min_size: 0,
+                path_contains: None,
+                sort: GroupSort::Size,
+                offset: 0,
+                limit: 50,
+                kind: Some("document"),
+                dir_contains: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(text.total, 2, "both groups hold .txt documents");
+
+        // Directory filter narrows the same queue to one parent directory.
+        let dirs = group_dirs(&database).unwrap();
+        assert!(dirs.len() >= 1);
+        let source_dir = &dirs[0].dir;
+        let scoped = query_groups(
+            &database,
+            &GroupQuery {
+                min_size: 0,
+                path_contains: None,
+                sort: GroupSort::Size,
+                offset: 0,
+                limit: 50,
+                kind: None,
+                dir_contains: Some(source_dir),
+            },
+        )
+        .unwrap();
+        assert_eq!(scoped.total, 2, "all duplicates share one directory here");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn query_groups_filters_sorts_and_counts() {
         let directory = test_directory("query-groups");
         let source = directory.join("source");
@@ -3490,6 +5080,8 @@ mod tests {
                 min_size: 0,
                 path_contains: None,
                 sort: GroupSort::Size,
+                kind: None,
+                dir_contains: None,
                 offset: 0,
                 limit: 50,
             },
@@ -3508,6 +5100,8 @@ mod tests {
                 min_size: 0,
                 path_contains: Some("大.txt"),
                 sort: GroupSort::Size,
+                kind: None,
+                dir_contains: None,
                 offset: 0,
                 limit: 50,
             },
@@ -3524,6 +5118,8 @@ mod tests {
                 min_size: 100,
                 path_contains: None,
                 sort: GroupSort::Size,
+                kind: None,
+                dir_contains: None,
                 offset: 0,
                 limit: 50,
             },
@@ -3539,6 +5135,8 @@ mod tests {
                 min_size: 0,
                 path_contains: None,
                 sort: GroupSort::Members,
+                kind: None,
+                dir_contains: None,
                 offset: 0,
                 limit: 1,
             },
@@ -3552,6 +5150,8 @@ mod tests {
                 min_size: 0,
                 path_contains: None,
                 sort: GroupSort::Members,
+                kind: None,
+                dir_contains: None,
                 offset: 1,
                 limit: 1,
             },
@@ -3589,9 +5189,475 @@ mod tests {
             }
         });
         image.save(&path).unwrap();
-        let hash = perceptual_hash(&path).unwrap();
-        assert_eq!(hash, perceptual_hash(&path).unwrap());
-        assert_eq!(fingerprint_parts(hash).len(), 5);
+        let (dhash, phash) = perceptual_hash(&path).unwrap();
+        let (dhash_again, phash_again) = perceptual_hash(&path).unwrap();
+        assert_eq!(dhash, dhash_again);
+        assert_eq!(phash, phash_again);
+        assert_eq!(fingerprint_parts(dhash).len(), 5);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn phash_distinguishes_unrelated_images() {
+        let directory = test_directory("phash-distinct");
+        let plain = directory.join("plain.png");
+        let noisy = directory.join("noisy.png");
+        image::RgbImage::from_fn(64, 64, |_, _| image::Rgb([200, 200, 200]))
+            .save(&plain)
+            .unwrap();
+        image::RgbImage::from_fn(64, 64, |x, y| {
+            image::Rgb([
+                ((x * 7 + y * 13) % 256) as u8,
+                ((x * 3 + y * 29) % 256) as u8,
+                ((x * 11 + y * 5) % 256) as u8,
+            ])
+        })
+        .save(&noisy)
+        .unwrap();
+        let (_, plain_phash) = perceptual_hash(&plain).unwrap();
+        let (_, noisy_phash) = perceptual_hash(&noisy).unwrap();
+        let distance = (plain_phash ^ noisy_phash).count_ones();
+        assert!(distance > 8, "unrelated images too close: {distance}/64");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn merge_dir_pair_recycles_one_side_and_moves_the_other() {
+        let directory = test_directory("dir-merge");
+        let left = directory.join("left");
+        let right = directory.join("right");
+        fs::create_dir_all(&left).unwrap();
+        fs::create_dir_all(&right).unwrap();
+        // Two confirmed duplicate pairs across the directories, plus one
+        // file unique to the left directory.
+        fs::write(left.join("a.txt"), b"same").unwrap();
+        fs::write(right.join("a.txt"), b"same").unwrap();
+        fs::write(left.join("pair.txt"), b"pair").unwrap();
+        fs::write(right.join("pair.txt"), b"pair").unwrap();
+        fs::write(left.join("solo.txt"), b"left unique").unwrap();
+        let database = directory.join("index.db");
+        init(&database, &directory.join("recycle")).unwrap();
+        scan(&database, &[left.clone(), right.clone()], &[]).unwrap();
+
+        // Merge one pair toward the left: the left copy loses (recycled),
+        // the right file wins and takes its place. The right directory
+        // keeps its other file, so the cleanup leaves it alone.
+        let outcome = merge_dir_pair(
+            &database,
+            &[(
+                left.join("a.txt").to_string_lossy().into_owned(),
+                right.join("a.txt").to_string_lossy().into_owned(),
+            )],
+            &left.to_string_lossy(),
+            &[right.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+        assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+        assert_eq!(1, outcome.recycled);
+        assert_eq!(1, outcome.moved);
+        assert_eq!(0, outcome.kept);
+        assert!(outcome.cleaned_dirs.is_empty());
+        assert_eq!(b"same", fs::read(left.join("a.txt")).unwrap().as_slice());
+        assert!(!right.join("a.txt").exists());
+        assert!(right.join("pair.txt").exists());
+        assert!(left.join("solo.txt").exists(), "unrelated file untouched");
+
+        // A protected loser blocks the whole pair: its winner stays put —
+        // moving it would create a fresh duplicate inside the target.
+        let connection = open_database(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE files SET protected=1 WHERE path LIKE '%left%pair.txt'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let outcome = merge_dir_pair(
+            &database,
+            &[(
+                left.join("pair.txt").to_string_lossy().into_owned(),
+                right.join("pair.txt").to_string_lossy().into_owned(),
+            )],
+            &left.to_string_lossy(),
+            &[right.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+        assert_eq!(0, outcome.recycled);
+        assert_eq!(0, outcome.moved);
+        assert_eq!(2, outcome.failures.len(), "both phases report the skip");
+        assert!(left.join("pair.txt").exists());
+        assert!(right.join("pair.txt").exists());
+
+        // Unprotected again: the merge now empties the right directory and
+        // the cleanup removes it, leaving the target with the moved files.
+        let connection = open_database(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE files SET protected=0 WHERE path LIKE '%left%pair.txt'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let outcome = merge_dir_pair(
+            &database,
+            &[(
+                left.join("pair.txt").to_string_lossy().into_owned(),
+                right.join("pair.txt").to_string_lossy().into_owned(),
+            )],
+            &left.to_string_lossy(),
+            &[right.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+        assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+        assert_eq!(1, outcome.recycled);
+        assert_eq!(1, outcome.moved);
+        assert_eq!(
+            &[right.to_string_lossy().into_owned()],
+            outcome.cleaned_dirs.as_slice()
+        );
+        assert!(!right.exists());
+        assert_eq!(b"pair", fs::read(left.join("pair.txt")).unwrap().as_slice());
+        // The index tracks the moved files at their new location.
+        let connection = open_database(&database).unwrap();
+        let live_in_left: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE present=1 AND path LIKE '%left%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(3, live_in_left);
+        let live_in_right: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE present=1 AND path LIKE '%right%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(0, live_in_right);
+        let trashed: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM operations WHERE state='trashed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(2, trashed, "both replaced copies are recoverable");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn verify_photo_pairs_streams_verdicts_and_stops_on_request() {
+        let directory = test_directory("pair-verify-batch");
+        let same_a = directory.join("same-a.png");
+        let same_b = directory.join("same-b.png");
+        let other = directory.join("other.png");
+        let image = image::RgbImage::from_fn(36, 20, |x, y| {
+            image::Rgb([((x * 7) % 256) as u8, ((y * 11) % 256) as u8, 60])
+        });
+        image.save(&same_a).unwrap();
+        image.save(&same_b).unwrap();
+        image::RgbImage::from_fn(36, 20, |x, y| {
+            image::Rgb([((x * 7) % 256) as u8, ((y * 11) % 256) as u8, 190])
+        })
+        .save(&other)
+        .unwrap();
+        let pa = same_a.to_string_lossy().to_string();
+        let pb = same_b.to_string_lossy().to_string();
+        let po = other.to_string_lossy().to_string();
+        let mut pairs = Vec::new();
+        for _ in 0..6 {
+            pairs.push((pa.clone(), pb.clone()));
+        }
+        for _ in 0..3 {
+            pairs.push((pa.clone(), po.clone()));
+        }
+        let verdicts = std::sync::Mutex::new(Vec::new());
+        let (same, different) = verify_photo_pairs(
+            &pairs,
+            &|verdict: &PairVerdict| {
+                verdicts
+                    .lock()
+                    .unwrap()
+                    .push((verdict.second == pb, verdict.identical));
+            },
+            &|| false,
+        );
+        let collected = verdicts.lock().unwrap();
+        assert_eq!(pairs.len(), collected.len(), "every pair gets a verdict");
+        assert_eq!(6, same);
+        assert_eq!(3, different);
+        // A pair is identical exactly when its second side is same-b.png.
+        for &(second_is_b, identical) in collected.iter() {
+            assert_eq!(second_is_b, identical, "verdict must follow the pair");
+        }
+        drop(collected);
+
+        // Cooperative stop: flipping the flag inside the callback keeps the
+        // remaining pairs from being verified.
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let (same, _different) = verify_photo_pairs(
+            &vec![(pa.clone(), pb.clone()); 80],
+            &|_verdict: &PairVerdict| {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            },
+            &|| stop.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        assert!(same < 80, "cancellation must leave most pairs unverified");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn photos_pixel_identical_checks_exact_pixels() {
+        let directory = test_directory("pixel-identical");
+        let copy = directory.join("copy.png");
+        let other_size = directory.join("other-size.png");
+        let other_pixels = directory.join("other-pixels.png");
+        // Same pixels saved twice: identical verdict despite separate files.
+        let image = image::RgbImage::from_fn(40, 24, |x, y| {
+            image::Rgb([((x * 5) % 256) as u8, ((y * 9) % 256) as u8, 77])
+        });
+        image.save(&copy).unwrap();
+        image.save(directory.join("copy2.png")).unwrap();
+        assert!(photos_pixel_identical(
+            &copy.to_string_lossy(),
+            &directory.join("copy2.png").to_string_lossy()
+        )
+        .unwrap());
+        // Different dimensions: never pixel-identical.
+        image::RgbImage::from_fn(24, 40, |x, y| {
+            image::Rgb([((x * 5) % 256) as u8, ((y * 9) % 256) as u8, 77])
+        })
+        .save(&other_size)
+        .unwrap();
+        assert!(!photos_pixel_identical(
+            &copy.to_string_lossy(),
+            &other_size.to_string_lossy()
+        )
+        .unwrap());
+        // Same dimensions, different pixels: rejected.
+        image::RgbImage::from_fn(40, 24, |x, y| {
+            image::Rgb([((x * 5) % 256) as u8, ((y * 9) % 256) as u8, 200])
+        })
+        .save(&other_pixels)
+        .unwrap();
+        assert!(!photos_pixel_identical(
+            &copy.to_string_lossy(),
+            &other_pixels.to_string_lossy()
+        )
+        .unwrap());
+        // Undecodable input surfaces an error instead of a silent verdict.
+        let broken = directory.join("broken.png");
+        fs::write(&broken, b"not an image").unwrap();
+        assert!(photos_pixel_identical(&copy.to_string_lossy(), &broken.to_string_lossy()).is_err());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn scan_fingerprints_images_with_phash_and_rebuilds_when_rows_vanish() {
+        let directory = test_directory("phash-rebuild");
+        let source = directory.join("source");
+        fs::create_dir_all(&source).unwrap();
+        image::RgbImage::from_fn(48, 48, |x, y| {
+            if (x + y) % 2 == 0 {
+                image::Rgb([250, 60, 60])
+            } else {
+                image::Rgb([10, 10, 90])
+            }
+        })
+        .save(source.join("pic.png"))
+        .unwrap();
+        let database = directory.join("index.db");
+        init(&database, &directory.join("recycle")).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        let connection = open_database(&database).unwrap();
+        let first: i64 = connection
+            .query_row("SELECT phash FROM photo_fingerprints", [], |r| r.get(0))
+            .unwrap();
+        assert_ne!(0, first, "pHash must be stored");
+        // Simulate a fingerprint algorithm bump: rows removed, the image
+        // itself untouched. The next scan must rebuild the fingerprint even
+        // though size/mtime are unchanged.
+        connection.execute("DELETE FROM photo_fingerprints", []).unwrap();
+        drop(connection);
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        let connection = open_database(&database).unwrap();
+        let second: i64 = connection
+            .query_row("SELECT phash FROM photo_fingerprints", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(first, second, "recomputed pHash must be deterministic");
+    }
+
+    #[test]
+    fn hardlink_dedup_preserves_paths_and_records_the_operation() {
+        let directory = test_directory("hardlink-dedup");
+        let source = directory.join("source");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("a.txt"), b"same content").unwrap();
+        fs::write(source.join("b.txt"), b"same content").unwrap();
+        let database = directory.join("index.db");
+        init(&database, &recycle).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        let connection = open_database(&database).unwrap();
+        let b: i64 = connection
+            .query_row(
+                "SELECT id FROM files WHERE path LIKE ?1",
+                ["%b.txt"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(connection);
+        set_approval(&database, b, true).unwrap();
+        hardlink(&database, b).unwrap();
+
+        // Both paths still exist and hold the keeper's bytes.
+        let kept = fs::read(source.join("a.txt")).unwrap();
+        let linked = fs::read(source.join("b.txt")).unwrap();
+        assert_eq!(kept, linked);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta_a = fs::metadata(source.join("a.txt")).unwrap();
+            let meta_b = fs::metadata(source.join("b.txt")).unwrap();
+            assert_eq!(meta_a.ino(), meta_b.ino(), "names must share one inode");
+            assert_eq!(meta_a.nlink(), 2);
+        }
+        let connection = open_database(&database).unwrap();
+        let (present, approved): (i64, i64) = connection
+            .query_row(
+                "SELECT COUNT(*), SUM(approved) FROM files WHERE present=1 AND path LIKE ?1",
+                [format!("%b.txt")],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((present, approved), (1, 0));
+        let (state, keeper): (String, String) = connection
+            .query_row(
+                "SELECT state,trash_path FROM operations WHERE source_path LIKE ?1",
+                [format!("%b.txt")],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "hardlinked");
+        assert!(keeper.ends_with("a.txt"), "operation records the keeper: {keeper}");
+        drop(connection);
+        // Re-running on an already-linked name: POSIX detects the shared
+        // inode and refuses; Windows cannot tell and the idempotent swap
+        // simply succeeds with the same end state.
+        set_approval(&database, b, true).unwrap();
+        #[cfg(unix)]
+        {
+            let error = hardlink(&database, b).unwrap_err();
+            assert!(error.contains("already a hard link"), "{error}");
+        }
+        #[cfg(not(unix))]
+        {
+            hardlink(&database, b).unwrap();
+        }
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn hardlink_rejects_diverged_content_without_touching_it() {
+        let directory = test_directory("hardlink-tampered");
+        let source = directory.join("source");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("a.txt"), b"original").unwrap();
+        fs::write(source.join("b.txt"), b"original").unwrap();
+        let database = directory.join("index.db");
+        init(&database, &recycle).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        let connection = open_database(&database).unwrap();
+        let b: i64 = connection
+            .query_row("SELECT id FROM files WHERE path LIKE ?1", ["%b.txt"], |r| r.get(0))
+            .unwrap();
+        drop(connection);
+        fs::write(source.join("b.txt"), b"edited").unwrap();
+        set_approval(&database, b, true).unwrap();
+        let error = hardlink(&database, b).unwrap_err();
+        assert!(error.contains("no longer matches indexed hash"), "{error}");
+        assert_eq!(
+            fs::read(source.join("b.txt")).unwrap(),
+            b"edited",
+            "the file must be untouched"
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn strict_verify_roundtrips_and_keeps_the_chain_working() {
+        let directory = test_directory("strict-verify");
+        let source = directory.join("source");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("a.txt"), b"pair").unwrap();
+        fs::write(source.join("b.txt"), b"pair").unwrap();
+        let database = directory.join("index.db");
+        init(&database, &recycle).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        set_strict_verify(&database, true).unwrap();
+        let connection = open_database(&database).unwrap();
+        let enabled: String = connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='strict_verify'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(enabled, "1");
+        let b: i64 = connection
+            .query_row("SELECT id FROM files WHERE path LIKE ?1", ["%b.txt"], |r| r.get(0))
+            .unwrap();
+        drop(connection);
+        set_approval(&database, b, true).unwrap();
+        // With strict mode on, the full trash chain must still succeed for
+        // genuinely identical content.
+        trash(&database, b).unwrap();
+        assert!(!source.join("b.txt").exists());
+        set_strict_verify(&database, false).unwrap();
+        let connection = open_database(&database).unwrap();
+        let enabled: String = connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='strict_verify'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(enabled, "0");
+        drop(connection);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn usn_setting_on_still_scans_correctly_through_fallback() {
+        let directory = test_directory("usn-fallback");
+        let source = directory.join("source");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("keep.txt"), b"content").unwrap();
+        fs::write(source.join("drop.txt"), b"ok").unwrap();
+        let database = directory.join("index.db");
+        init(&database, &recycle).unwrap();
+        set_usn_scan(&database, true).unwrap();
+        // Whether the USN listing is available (elevated) or refused
+        // (non-admin), the scan must index exactly the right files.
+        scan_with_options(
+            &database,
+            std::slice::from_ref(&source),
+            &[],
+            &[],
+            4,
+            false,
+        )
+        .unwrap();
+        let connection = open_database(&database).unwrap();
+        let indexed: i64 = connection
+            .query_row("SELECT COUNT(*) FROM files WHERE present=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(indexed, 1, "only keep.txt passes the minimum size");
+        drop(connection);
         let _ = fs::remove_dir_all(directory);
     }
 }
