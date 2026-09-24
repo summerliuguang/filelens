@@ -8,7 +8,7 @@ Tauri 2 + React 19 + TypeScript(strict) + Rust。纯本地：扫描/哈希/删�
 - 根 `src/main.rs` — **核心库**（扫描管线、BLAKE3 哈希、相似检测、回收站、安全链）+ CLI + 全部单元测试。不依赖 tauri。
 - `src/lib.rs` — 核心库导出清单；新增公开函数后要同步在这里 re-export。
 - `src-tauri/src/main.rs` — **薄命令层**：`#[tauri::command]`、serde 结构体、缩略图缓存。业务逻辑不写在这里，放进核心库（可测试）。
-- `src/main.tsx` — App 外壳与全局状态（约 500 行）；页面视图在 `src/ui/views.tsx`，
+- `src/main.tsx` — App 外壳与全局状态（约 570 行）；页面视图在 `src/ui/views.tsx`，
   通用组件（ConfirmDialog/PreviewModal/Empty/ScanProgress）在 `src/ui/components.tsx`，
   跨层类型镜像与格式化在 `src/lib/{types,format}.ts`；`src/styles.css` 全部样式。
 - `IMPROVEMENT.md` — 本地改进清单（P0–P3），经 `.git/info/exclude` 排除、**不入库**。
