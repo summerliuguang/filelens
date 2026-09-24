@@ -1,3 +1,7 @@
+// Hide the console window in release builds (it would otherwise shadow the
+// app with a black terminal); keep it in debug so logs stay visible.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -24,6 +28,10 @@ struct Status {
     last_scan_at: Option<i64>,
     groups: i64,
     recoverable_bytes: i64,
+    photo_candidates: i64,
+    photo_candidate_bytes: i64,
+    document_candidates: i64,
+    document_candidate_bytes: i64,
 }
 
 #[derive(Serialize)]
@@ -31,11 +39,30 @@ struct SimilarPhoto {
     first_path: String,
     second_path: String,
     distance: u32,
+    phash_distance: u32,
     first_size: i64,
     first_modified: i64,
     second_size: i64,
     second_modified: i64,
 }
+#[derive(Serialize)]
+struct SimilarPhotosPage {
+    pairs: Vec<SimilarPhoto>,
+    /// Pairs kept after the hard cap; when truncated the true total is only
+    /// known to be larger.
+    total: usize,
+    truncated: bool,
+}
+
+#[derive(Serialize, Clone)]
+struct BulkState {
+    running: bool,
+    kind: String,
+    done: u64,
+    total: u64,
+    message: String,
+}
+
 #[derive(Serialize)]
 struct SimilarDocument {
     first_path: String,
@@ -83,6 +110,8 @@ struct ProjectState {
     min_file_size: i64,
     trash_retention_days: i64,
     auto_scan: bool,
+    strict_verify: bool,
+    usn_scan: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -111,6 +140,21 @@ struct ScanTask {
     state: Arc<Mutex<ScanState>>,
     errors: Arc<filelens::ScanErrorLog>,
     hash_progress: Arc<filelens::HashProgress>,
+}
+
+/// A long bulk sweep (recycle / hardlink / permanent delete) running on its
+/// own thread, so the webview never blocks on thousands of files.
+struct BulkTask {
+    kind: String,
+    progress: Arc<Mutex<BulkProgress>>,
+}
+
+#[derive(Clone, Serialize)]
+struct BulkProgress {
+    done: u64,
+    total: u64,
+    finished: bool,
+    message: String,
 }
 
 fn open_database(path: &str) -> Result<Connection, String> {
@@ -190,6 +234,8 @@ fn open_project(app: tauri::AppHandle) -> Result<ProjectState, String> {
             .unwrap_or(0),
         trash_retention_days: filelens::trash_retention_days(&connection),
         auto_scan: setting_flag(&connection, "auto_scan_on_start", true),
+        strict_verify: setting_flag(&connection, "strict_verify", false),
+        usn_scan: setting_flag(&connection, "usn_scan", false),
     })
 }
 
@@ -295,6 +341,12 @@ fn start_scan(
                 Ok(summary) => {
                     current.state = "completed".into();
                     let mut message = "扫描完成，索引已更新。".to_string();
+                    if summary.fingerprint_rebuild > 0 {
+                        message.push_str(&format!(
+                            " 本次重建了 {} 张照片的指纹（指纹格式升级后的一次性处理）。",
+                            summary.fingerprint_rebuild
+                        ));
+                    }
                     if summary.pruned > 0 {
                         message.push_str(&format!(
                             " 已清理 {} 个超期回收文件。",
@@ -640,8 +692,11 @@ fn approve_filtered(
     strategy: String,
     min_size: i64,
     path_contains: String,
+    kind: Option<String>,
+    dir_contains: Option<String>,
 ) -> Result<String, String> {
     let strategy = match strategy.as_str() {
+        "scored" => filelens::MarkStrategy::Scored,
         "newest" => filelens::MarkStrategy::Newest,
         "oldest" => filelens::MarkStrategy::Oldest,
         "shortest" => filelens::MarkStrategy::Shortest,
@@ -652,6 +707,8 @@ fn approve_filtered(
         strategy,
         min_size.max(0),
         &path_contains,
+        kind.as_deref().filter(|value| *value != "all"),
+        dir_contains.as_deref().unwrap_or(""),
     )?;
     if outcome.failures.is_empty() {
         Ok(format!("已标记 {} 个副本待处理。", outcome.succeeded))
@@ -755,7 +812,15 @@ fn status(database: String) -> Result<Status, String> {
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
-    let recoverable_bytes = connection.query_row("SELECT COALESCE(SUM((n - 1) * size),0) FROM (SELECT COUNT(*) AS n, size FROM files WHERE present=1 GROUP BY hash,size HAVING n > 1)", [], |row| row.get(0)).map_err(|error| error.to_string())?;
+    // Hardlink-aware recoverable size: names sharing one physical file count
+    // once, so hardlink-only groups do not inflate the estimate.
+    let recoverable_bytes = connection.query_row(
+        "SELECT COALESCE(SUM((physical - 1) * size),0) FROM (SELECT size, \
+         COUNT(DISTINCT CASE WHEN dev!=0 OR inode!=0 THEN printf('%d:%d',dev,inode) ELSE 'i'||id END) AS physical \
+         FROM files WHERE present=1 GROUP BY hash,size HAVING COUNT(*) > 1)",
+        [],
+        |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
     let in_trash = connection
         .query_row(
             "SELECT COUNT(*) FROM operations WHERE state='trashed'",
@@ -779,6 +844,16 @@ fn status(database: String) -> Result<Status, String> {
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
+    // Photo / document candidates: distinct removable files across all
+    // accepted pairs, with their combined size (advisory — a human still
+    // confirms every removal).
+    let photo_entries = load_fingerprints(&connection, "photo_fingerprints", "dhash", Some("phash"))?;
+    let (photo_pairs, _) = similar_pairs(&photo_entries, &PHOTO_CHUNKS, 0, 4, Some(PHASH_MAX_DISTANCE));
+    let (photo_candidates, photo_candidate_bytes) = candidate_totals(&photo_entries, &photo_pairs);
+    let document_entries = load_fingerprints(&connection, "document_fingerprints", "simhash", None)?;
+    let (document_pairs, _) = similar_pairs(&document_entries, &DOCUMENT_CHUNKS, 0, 8, None);
+    let (document_candidates, document_candidate_bytes) =
+        candidate_totals(&document_entries, &document_pairs);
     Ok(Status {
         files,
         duplicates,
@@ -787,7 +862,26 @@ fn status(database: String) -> Result<Status, String> {
         last_scan_at,
         groups,
         recoverable_bytes,
+        photo_candidates,
+        photo_candidate_bytes,
+        document_candidates,
+        document_candidate_bytes,
     })
+}
+
+/// Distinct files across accepted pairs and their combined size.
+fn candidate_totals(entries: &[FingerprintEntry], pairs: &[(usize, usize, u32)]) -> (i64, i64) {
+    let mut seen: HashSet<usize> = HashSet::new();
+    let (mut count, mut bytes) = (0_i64, 0_i64);
+    for &(a, b, _) in pairs {
+        for index in [a, b] {
+            if seen.insert(index) {
+                count += 1;
+                bytes += entries[index].size.max(0);
+            }
+        }
+    }
+    (count, bytes)
 }
 
 #[tauri::command]
@@ -798,6 +892,8 @@ fn groups(
     min_size: Option<i64>,
     path_contains: Option<String>,
     sort: Option<String>,
+    kind: Option<String>,
+    dir_contains: Option<String>,
 ) -> Result<filelens::GroupsPage, String> {
     let query = filelens::GroupQuery {
         min_size: min_size.unwrap_or(0),
@@ -808,18 +904,42 @@ fn groups(
         sort: match sort.as_deref() {
             Some("members") => filelens::GroupSort::Members,
             Some("path") => filelens::GroupSort::Path,
+            Some("recoverable") => filelens::GroupSort::Recoverable,
             _ => filelens::GroupSort::Size,
         },
         offset: offset.unwrap_or(0),
         limit: limit.unwrap_or(50),
+        kind: kind.as_deref().filter(|value| *value != "all"),
+        dir_contains: dir_contains
+            .as_deref()
+            .filter(|value| !value.is_empty() && *value != "all"),
     };
     filelens::query_groups(&PathBuf::from(database), &query)
+}
+
+#[derive(Serialize)]
+struct GroupDir {
+    dir: String,
+    count: i64,
+}
+
+#[tauri::command]
+fn group_dirs(database: String) -> Result<Vec<GroupDir>, String> {
+    Ok(filelens::group_dirs(&PathBuf::from(database))?
+        .into_iter()
+        .map(|entry| GroupDir {
+            dir: entry.dir,
+            count: entry.count,
+        })
+        .collect())
 }
 
 struct FingerprintEntry {
     path: String,
     hash: String,
     value: u64,
+    /// Secondary fingerprint (pHash for photos, absent for documents).
+    extra: u64,
     size: i64,
     modified: i64,
 }
@@ -846,16 +966,23 @@ const DOCUMENT_CHUNKS: [(u32, u64); 8] = [
 ];
 const SIMILAR_MAX_BUCKET: usize = 256;
 const SIMILAR_RESULT_LIMIT: usize = 5000;
+/// pHash (DCT) secondary threshold: common practice for "same photo,
+/// recompressed/resized" is well inside 10/64.
+const PHASH_MAX_DISTANCE: u32 = 10;
 
 fn load_fingerprints(
     connection: &Connection,
     table: &str,
     column: &str,
+    extra_column: Option<&str>,
 ) -> Result<Vec<FingerprintEntry>, String> {
+    let extra_expression = extra_column
+        .map(|column| format!("f.{column}"))
+        .unwrap_or_else(|| "0".to_string());
     let mut statement = connection
         .prepare(&format!(
-            "SELECT a.path, a.hash, f.{column}, a.size, a.modified FROM {table} f \
-             JOIN files a ON a.id = f.file_id WHERE a.present = 1"
+            "SELECT a.path, a.hash, f.{column}, {extra_expression}, a.size, a.modified \
+             FROM {table} f JOIN files a ON a.id = f.file_id WHERE a.present = 1"
         ))
         .map_err(|e| e.to_string())?;
     statement
@@ -864,8 +991,9 @@ fn load_fingerprints(
                 path: row.get(0)?,
                 hash: row.get(1)?,
                 value: row.get::<_, i64>(2)? as u64,
-                size: row.get(3)?,
-                modified: row.get(4)?,
+                extra: row.get::<_, i64>(3)? as u64,
+                size: row.get(4)?,
+                modified: row.get(5)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -878,7 +1006,8 @@ fn similar_pairs(
     chunks: &[(u32, u64)],
     min_distance: u32,
     max_distance: u32,
-) -> Vec<(usize, usize, u32)> {
+    extra_max_distance: Option<u32>,
+) -> (Vec<(usize, usize, u32)>, usize) {
     let mut seen: HashSet<(usize, usize)> = HashSet::new();
     let mut result: Vec<(usize, usize, u32)> = Vec::new();
     for &(shift, mask) in chunks {
@@ -909,10 +1038,19 @@ fn similar_pairs(
                         continue;
                     }
                     let distance = (first.value ^ second.value).count_ones();
-                    if distance >= min_distance && distance <= max_distance {
-                        seen.insert(key);
-                        result.push((key.0, key.1, distance));
+                    if distance < min_distance || distance > max_distance {
+                        continue;
                     }
+                    if let Some(max) = extra_max_distance {
+                        // Secondary fingerprint must agree too: cuts the
+                        // gradient-hash false positives substantially.
+                        if (first.extra ^ second.extra).count_ones() > max {
+                            seen.insert(key);
+                            continue;
+                        }
+                    }
+                    seen.insert(key);
+                    result.push((key.0, key.1, distance));
                 }
             }
         }
@@ -921,49 +1059,192 @@ fn similar_pairs(
         a.2.cmp(&b.2)
             .then_with(|| entries[a.0].path.cmp(&entries[b.0].path))
     });
+    let total = result.len();
     result.truncate(SIMILAR_RESULT_LIMIT);
-    result
+    (result, total)
 }
 
-/// kind = "duplicate": identical pixels, differing bytes (a copy whose EXIF
-/// or metadata drifted). kind = "similar": near-identical pixels (dHash
-/// distance 1-4). Both exclude byte-identical exact duplicates.
+/// kind = "duplicate": both fingerprints exactly equal (dHash 0 + pHash 0) —
+/// a near-certain pixel copy, still subject to the background per-pair pixel
+/// verification (start_duplicate_verify) before the UI shows it. kind =
+/// "similar": near-identical pixels (dHash distance 1-4) with a pHash gate.
+/// Both exclude byte-identical exact duplicates.
 #[tauri::command]
 fn similar_photos(
     database: String,
     kind: Option<String>,
-) -> Result<Vec<SimilarPhoto>, String> {
+) -> Result<SimilarPhotosPage, String> {
     let connection = open_database(&database)?;
-    let entries = load_fingerprints(&connection, "photo_fingerprints", "dhash")?;
-    let (min_distance, max_distance) = if kind.as_deref() == Some("duplicate") {
-        (0, 0)
+    let entries = load_fingerprints(&connection, "photo_fingerprints", "dhash", Some("phash"))?;
+    let (min_distance, max_distance, extra_max_distance) = if kind.as_deref() == Some("duplicate")
+    {
+        (0, 0, Some(0))
     } else {
-        (1, 4)
+        (1, 4, Some(PHASH_MAX_DISTANCE))
     };
-    Ok(similar_pairs(
+    let (pairs, total) = similar_pairs(
         &entries,
         &PHOTO_CHUNKS,
         min_distance,
         max_distance,
-    )
-    .into_iter()
-    .map(|(a, b, distance)| SimilarPhoto {
-        first_path: entries[a].path.clone(),
-        second_path: entries[b].path.clone(),
-        distance,
-        first_size: entries[a].size,
-        first_modified: entries[a].modified,
-        second_size: entries[b].size,
-        second_modified: entries[b].modified,
+        extra_max_distance,
+    );
+    Ok(SimilarPhotosPage {
+        pairs: pairs
+            .into_iter()
+            .map(|(a, b, distance)| SimilarPhoto {
+                first_path: entries[a].path.clone(),
+                second_path: entries[b].path.clone(),
+                distance,
+                phash_distance: (entries[a].extra ^ entries[b].extra).count_ones(),
+                first_size: entries[a].size,
+                first_modified: entries[a].modified,
+                second_size: entries[b].size,
+                second_modified: entries[b].modified,
+            })
+            .collect(),
+        total,
+        truncated: total > SIMILAR_RESULT_LIMIT,
     })
-    .collect())
+}
+
+/// Definitive pixel comparison for one candidate pair. The duplicate-photos
+/// view is fingerprint-based, so it can contain near-identical burst shots;
+/// the compare modal runs this before the user deletes either side.
+#[tauri::command]
+fn verify_photo_pair(first: String, second: String) -> Result<bool, String> {
+    filelens::photos_pixel_identical(&first, &second)
+}
+
+#[derive(Clone, Serialize)]
+struct VerifyPairVerdict {
+    first: String,
+    second: String,
+    identical: bool,
+}
+
+#[derive(Clone, Serialize, Default)]
+struct DuplicateVerifyState {
+    running: bool,
+    done: usize,
+    total: usize,
+    same: usize,
+    different: usize,
+    results: Vec<VerifyPairVerdict>,
+}
+
+struct DuplicateVerifyTask {
+    cancel: Arc<AtomicBool>,
+    state: Arc<Mutex<DuplicateVerifyState>>,
+}
+
+/// Recompute the duplicate-view candidate list: both fingerprints exactly
+/// equal. Shared by the query command and the background verification task so
+/// the verified set always matches what the UI fetched.
+fn duplicate_photo_candidates(database: &str) -> Result<Vec<(String, String)>, String> {
+    let connection = open_database(database)?;
+    let entries = load_fingerprints(&connection, "photo_fingerprints", "dhash", Some("phash"))?;
+    let (pairs, _) = similar_pairs(&entries, &PHOTO_CHUNKS, 0, 0, Some(0));
+    Ok(pairs
+        .into_iter()
+        .map(|(a, b, _)| (entries[a].path.clone(), entries[b].path.clone()))
+        .collect())
+}
+
+/// Verify every duplicate-view candidate pixel by pixel on background
+/// threads. Idempotent: while a run is active, starting again just reports
+/// its current state. The verdicts stream into `results` as they are
+/// computed, so the UI can filter progressively.
+#[tauri::command]
+fn start_duplicate_verify(
+    state: tauri::State<'_, Mutex<Option<DuplicateVerifyTask>>>,
+    database: String,
+) -> Result<DuplicateVerifyState, String> {
+    let mut slot = state
+        .lock()
+        .map_err(|_| "duplicate verify lock failed")?;
+    if let Some(task) = slot.as_ref() {
+        if !task.cancel.load(Ordering::Relaxed) {
+            return Ok(task
+                .state
+                .lock()
+                .map_err(|_| "duplicate verify lock failed")?
+                .clone());
+        }
+    }
+    let pairs = duplicate_photo_candidates(&database)?;
+    let task_state = Arc::new(Mutex::new(DuplicateVerifyState {
+        running: true,
+        total: pairs.len(),
+        ..Default::default()
+    }));
+    let cancel = Arc::new(AtomicBool::new(false));
+    *slot = Some(DuplicateVerifyTask {
+        cancel: cancel.clone(),
+        state: task_state.clone(),
+    });
+    drop(slot);
+    let task_state_for_thread = task_state.clone();
+    std::thread::spawn(move || {
+        let publish = |verdict: &filelens::PairVerdict| {
+            if let Ok(mut guard) = task_state_for_thread.lock() {
+                guard.done += 1;
+                if verdict.identical {
+                    guard.same += 1;
+                } else {
+                    guard.different += 1;
+                }
+                guard.results.push(VerifyPairVerdict {
+                    first: verdict.first.clone(),
+                    second: verdict.second.clone(),
+                    identical: verdict.identical,
+                });
+            }
+        };
+        let should_stop = || cancel.load(Ordering::Relaxed);
+        let _ = filelens::verify_photo_pairs(&pairs, &publish, &should_stop);
+        if let Ok(mut guard) = task_state_for_thread.lock() {
+            guard.running = false;
+        }
+    });
+    task_state
+        .lock()
+        .map_err(|_| "duplicate verify lock failed".to_string())
+        .map(|guard| guard.clone())
+}
+
+#[tauri::command]
+fn duplicate_verify_state(
+    state: tauri::State<'_, Mutex<Option<DuplicateVerifyTask>>>,
+) -> Result<DuplicateVerifyState, String> {
+    let slot = state
+        .lock()
+        .map_err(|_| "duplicate verify lock failed")?;
+    Ok(slot
+        .as_ref()
+        .and_then(|task| task.state.lock().ok().map(|guard| guard.clone()))
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+fn cancel_duplicate_verify(
+    state: tauri::State<'_, Mutex<Option<DuplicateVerifyTask>>>,
+) -> Result<(), String> {
+    let slot = state
+        .lock()
+        .map_err(|_| "duplicate verify lock failed")?;
+    if let Some(task) = slot.as_ref() {
+        task.cancel.store(true, Ordering::Relaxed);
+    }
+    Ok(())
 }
 
 #[tauri::command]
 fn similar_documents(database: String) -> Result<Vec<SimilarDocument>, String> {
     let connection = open_database(&database)?;
-    let entries = load_fingerprints(&connection, "document_fingerprints", "simhash")?;
-    Ok(similar_pairs(&entries, &DOCUMENT_CHUNKS, 0, 8)
+    let entries = load_fingerprints(&connection, "document_fingerprints", "simhash", None)?;
+    let (pairs, _) = similar_pairs(&entries, &DOCUMENT_CHUNKS, 0, 8, None);
+    Ok(pairs
         .into_iter()
         .map(|(a, b, distance)| SimilarDocument {
             first_path: entries[a].path.clone(),
@@ -1034,15 +1315,25 @@ fn history(
     database: String,
     offset: Option<i64>,
     limit: Option<i64>,
+    state_filter: Option<String>,
 ) -> Result<Vec<HistoryItem>, String> {
     let limit = limit.unwrap_or(100).clamp(1, 500);
     let offset = offset.unwrap_or(0).max(0);
     let connection = open_database(&database)?;
+    // Optional state filter (trashed/restored/deleted/hardlinked); an
+    // unrecognized value is ignored rather than erroring.
+    let state_sql = state_filter
+        .as_deref()
+        .filter(|state| {
+            matches!(*state, "trashed" | "restored" | "deleted" | "hardlinked")
+        })
+        .map(|state| format!("WHERE state='{state}'"))
+        .unwrap_or_default();
     let mut statement = connection
-        .prepare(
+        .prepare(&format!(
             "SELECT id,created_at,source_path,trash_path,state,restored_at \
-             FROM operations ORDER BY created_at DESC, id DESC LIMIT ?1 OFFSET ?2",
-        )
+             FROM operations {state_sql} ORDER BY created_at DESC, id DESC LIMIT ?1 OFFSET ?2"
+        ))
         .map_err(|error| error.to_string())?;
     statement
         .query_map(params![limit, offset], |row| {
@@ -1058,6 +1349,16 @@ fn history(
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn restore_to(
+    database: String,
+    operation_id: i64,
+    target_dir: String,
+) -> Result<String, String> {
+    filelens::restore_to(&PathBuf::from(database), operation_id, Path::new(&target_dir))
+        .map(|_| "文件已恢复到指定目录。".into())
 }
 
 #[tauri::command]
@@ -1103,9 +1404,216 @@ fn set_auto_scan(database: String, enabled: bool) -> Result<String, String> {
     })
 }
 
+/// Replace approved duplicates with hard links to their kept copies: every
+/// path survives, the duplicated content is freed immediately. Cross-volume
+/// or otherwise unlinkable copies are skipped and reported per file.
+#[tauri::command]
+fn hardlink_approved(database: String, file_ids: Vec<i64>) -> Result<String, String> {
+    let outcome = filelens::hardlink_batch(&PathBuf::from(&database), &file_ids);
+    Ok(format!(
+        "已转为硬链接 {} 个，{} 个失败：{}",
+        outcome.succeeded,
+        outcome.failures.len(),
+        outcome.failures.join("；")
+    ))
+}
+
+#[tauri::command]
+fn set_strict_verify(database: String, enabled: bool) -> Result<String, String> {
+    filelens::set_strict_verify(&PathBuf::from(&database), enabled)?;
+    Ok(if enabled {
+        "已开启严格模式：删除前将逐字节复核内容。".into()
+    } else {
+        "已关闭严格模式。".into()
+    })
+}
+
+#[tauri::command]
+fn set_usn_scan(database: String, enabled: bool) -> Result<String, String> {
+    filelens::set_usn_scan(&PathBuf::from(&database), enabled)?;
+    Ok(if enabled {
+        "已开启 USN 快速扫描（需要管理员权限运行，否则自动回退普通扫描）。".into()
+    } else {
+        "已关闭 USN 快速扫描。".into()
+    })
+}
+
+/// Recycle the candidate photos of one directory; pairs whose both sides
+/// live in that directory keep one copy alive by first moving it into the
+/// user-chosen keep directory.
+#[tauri::command]
+fn recycle_dir_keep_one(
+    database: String,
+    dir: String,
+    keep_dir: String,
+) -> Result<String, String> {
+    let outcome = filelens::recycle_dir_keep_one(&PathBuf::from(&database), &dir, Path::new(&keep_dir))?;
+    let mut message = format!(
+        "已移入回收站 {} 个，{} 张移入保留目录。",
+        outcome.recycled, outcome.moved
+    );
+    if !outcome.failures.is_empty() {
+        message.push_str(&format!(
+            " 失败 {} 个：{}",
+            outcome.failures.len(),
+            outcome.failures.join("；")
+        ));
+    }
+    Ok(message)
+}
+
+/// Directory merge from the duplicate-directory view: for every pair the
+/// frontend has decided a winner via the user's retention rules — the loser
+/// is recycled, the winner ends up in the target folder. Emptied source
+/// directories are cleaned up best-effort.
+#[tauri::command]
+fn merge_dir_pair(
+    database: String,
+    pairs: Vec<(String, String)>,
+    target_dir: String,
+    cleanup_dirs: Vec<String>,
+) -> Result<String, String> {
+    let outcome =
+        filelens::merge_dir_pair(&PathBuf::from(&database), &pairs, &target_dir, &cleanup_dirs)?;
+    let mut message = format!(
+        "已移入回收站 {} 个，{} 张移动到目标目录，{} 张原地保留。",
+        outcome.recycled, outcome.moved, outcome.kept
+    );
+    if !outcome.cleaned_dirs.is_empty() {
+        message.push_str(&format!(
+            " 已删除清空的空目录 {} 个。",
+            outcome.cleaned_dirs.len()
+        ));
+    }
+    if !outcome.failures.is_empty() {
+        message.push_str(&format!(
+            " 失败 {} 个：{}",
+            outcome.failures.len(),
+            outcome.failures.join("；")
+        ));
+    }
+    Ok(message)
+}
+
+/// Kick off a bulk sweep (kind: "trash" | "hardlink" | "delete") on a
+/// background thread with live progress; the frontend polls `bulk_state`.
+#[tauri::command]
+fn start_bulk(
+    bulk: tauri::State<'_, Mutex<Option<BulkTask>>>,
+    database: String,
+    kind: String,
+    file_ids: Vec<i64>,
+) -> Result<String, String> {
+    if file_ids.is_empty() {
+        return Err("没有选择要处理的文件".into());
+    }
+    if !matches!(kind.as_str(), "trash" | "hardlink" | "delete") {
+        return Err(format!("未知的批量类型：{kind}"));
+    }
+    let mut slot = bulk.lock().map_err(|_| "bulk task lock failed")?;
+    if slot
+        .as_ref()
+        .map(|task| !task.progress.lock().map(|p| p.finished).unwrap_or(true))
+        .unwrap_or(false)
+    {
+        return Err("已有批量任务正在运行".into());
+    }
+    let total = file_ids.len() as u64;
+    let progress = Arc::new(Mutex::new(BulkProgress {
+        done: 0,
+        total,
+        finished: false,
+        message: "正在准备批量操作...".into(),
+    }));
+    let worker_progress = progress.clone();
+    let task_database = database.clone();
+    let task_kind = kind.clone();
+    std::thread::spawn(move || {
+        let report = {
+            let worker_progress = worker_progress.clone();
+            move |done: usize, total_count: usize| {
+                if let Ok(mut guard) = worker_progress.lock() {
+                    guard.done = done as u64;
+                    guard.total = total_count as u64;
+                    guard.message = format!("正在处理 {}/{}...", done, total_count);
+                }
+            }
+        };
+        let outcome = match task_kind.as_str() {
+            "trash" => {
+                filelens::trash_batch_with_progress(&PathBuf::from(&task_database), &file_ids, Some(&report))
+            }
+            "hardlink" => {
+                filelens::hardlink_batch_with_progress(&PathBuf::from(&task_database), &file_ids, Some(&report))
+            }
+            _ => {
+                filelens::delete_approved_batch_with_progress(&PathBuf::from(&task_database), &file_ids, Some(&report))
+            }
+        };
+        let mut summary = format!(
+            "批量{}完成：成功 {} 个，失败 {} 个。",
+            if task_kind == "trash" {
+                "移入回收站"
+            } else if task_kind == "hardlink" {
+                "硬链接替换"
+            } else {
+                "永久删除"
+            },
+            outcome.succeeded,
+            outcome.failures.len()
+        );
+        if !outcome.failures.is_empty() {
+            let preview: Vec<String> = outcome.failures.iter().take(3).cloned().collect();
+            summary.push_str(&format!(" 失败原因：{}", preview.join("；")));
+            if outcome.failures.len() > 3 {
+                summary.push_str(&format!(" 等 {} 条", outcome.failures.len()));
+            }
+        }
+        if let Ok(mut guard) = worker_progress.lock() {
+            guard.done = total;
+            guard.finished = true;
+            guard.message = summary;
+        }
+    });
+    *slot = Some(BulkTask { kind, progress });
+    Ok("批量任务已在后台启动，进度见提示。".into())
+}
+
+/// Snapshot of the bulk sweep for polling; `finished` stays true until a new
+/// sweep starts, so a missed poll can still read the outcome.
+#[tauri::command]
+fn bulk_state(bulk: tauri::State<'_, Mutex<Option<BulkTask>>>) -> Result<BulkState, String> {
+    let slot = bulk.lock().map_err(|_| "bulk task lock failed")?;
+    Ok(match slot.as_ref() {
+        Some(task) => {
+            let progress = task
+                .progress
+                .lock()
+                .map_err(|_| "bulk progress lock failed")?
+                .clone();
+            BulkState {
+                running: !progress.finished,
+                kind: task.kind.clone(),
+                done: progress.done,
+                total: progress.total,
+                message: progress.message,
+            }
+        }
+        None => BulkState {
+            running: false,
+            kind: String::new(),
+            done: 0,
+            total: 0,
+            message: String::new(),
+        },
+    })
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(Mutex::new(None::<ScanTask>))
+        .manage(Mutex::new(None::<BulkTask>))
+        .manage(Mutex::new(None::<DuplicateVerifyTask>))
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             open_project,
@@ -1117,6 +1625,10 @@ fn main() {
             status,
             groups,
             similar_photos,
+            verify_photo_pair,
+            start_duplicate_verify,
+            duplicate_verify_state,
+            cancel_duplicate_verify,
             similar_documents,
             detector_status,
             approve,
@@ -1144,6 +1656,15 @@ fn main() {
             restore_batch,
             protect_preview,
             approve_filtered,
+            hardlink_approved,
+            set_strict_verify,
+            set_usn_scan,
+            start_bulk,
+            bulk_state,
+            restore_to,
+            group_dirs,
+            recycle_dir_keep_one,
+            merge_dir_pair,
             trash_list
         ])
         .run(tauri::generate_context!())
