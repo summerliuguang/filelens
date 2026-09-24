@@ -21,19 +21,35 @@ export type GroupFile = {
   modified: number;
   /** Another group member shares this file's (dev, inode): removing it frees no space. */
   hardlinked: boolean;
+  /** Heuristic keeper suggestion; advisory only. */
+  suggested: boolean;
 };
 
-export type Group = { hash: string; size: number; files: GroupFile[] };
+export type Group = {
+  hash: string;
+  size: number;
+  /** Bytes actually freed by removing all removable copies (hardlink-aware). */
+  recoverable: number;
+  files: GroupFile[];
+};
 
 export type GroupsPage = { total: number; groups: Group[] };
 
 export type GroupFilters = {
   search: string;
   minSize: number;
-  sort: "size" | "members" | "path";
+  sort: "recoverable" | "size" | "members" | "path";
+  kind: string;
+  dir: string;
 };
 
-export type Toast = { id: number; kind: "ok" | "error"; text: string };
+export type Toast = {
+  id: number;
+  kind: "ok" | "error";
+  text: string;
+  /** Optional follow-up (e.g. "open the recycle bin") rendered as a button. */
+  action?: { label: string; run: () => void };
+};
 
 export type Status = {
   files: number;
@@ -43,6 +59,24 @@ export type Status = {
   last_scan_at: number | null;
   groups: number;
   recoverable_bytes: number;
+  photo_candidates: number;
+  photo_candidate_bytes: number;
+  document_candidates: number;
+  document_candidate_bytes: number;
+};
+
+export type SimilarPhotosPage = {
+  pairs: SimilarPhoto[];
+  total: number;
+  truncated: boolean;
+};
+
+export type BulkState = {
+  running: boolean;
+  kind: string;
+  done: number;
+  total: number;
+  message: string;
 };
 
 export type TrashItem = {
@@ -76,6 +110,8 @@ export type ProjectState = ProjectConfig & {
   min_file_size: number;
   trash_retention_days: number;
   auto_scan: boolean;
+  strict_verify: boolean;
+  usn_scan: boolean;
 };
 
 export type ScanErrorSample = { path: string; error: string };
@@ -101,10 +137,25 @@ export type SimilarPhoto = {
   first_path: string;
   second_path: string;
   distance: number;
+  phash_distance: number;
   first_size: number;
   first_modified: number;
   second_size: number;
   second_modified: number;
+};
+
+/** Background pixel verification of the duplicate-photo candidates. */
+export type DuplicateVerifyState = {
+  running: boolean;
+  done: number;
+  total: number;
+  same: number;
+  different: number;
+  results: {
+    first: string;
+    second: string;
+    identical: boolean;
+  }[];
 };
 
 export type SimilarDocument = {

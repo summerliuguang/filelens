@@ -13,6 +13,7 @@ import {
   formatEta,
   formatFileTime,
   formatRate,
+  friendlyError,
 } from "../lib/format";
 import type { ScanState, SimilarPhoto } from "../lib/types";
 
@@ -97,6 +98,8 @@ export type ConfirmOption = {
   label: string;
   kind?: "primary" | "secondary" | "danger";
   action: () => void;
+  /** Rendered unclickable (e.g. nothing actionable until a choice is made). */
+  disabled?: boolean;
 };
 
 // Unified confirmation dialog: explicit cancel button (the only exit in the
@@ -137,7 +140,7 @@ export function ConfirmDialog({
             <button
               key={option.label}
               className={option.kind ?? "secondary"}
-              disabled={busy}
+              disabled={busy || option.disabled}
               onClick={option.action}
             >
               {option.label}
@@ -237,13 +240,42 @@ export function PreviewModal({
 // can be compared at full size without flipping between single previews.
 export function SimilarCompareModal({
   photo,
+  expectIdentical = false,
   onClose,
 }: {
   photo: SimilarPhoto;
+  /** Duplicate view: fingerprints claimed "same photo", so verify the pixels
+   * for real while the user looks at the pair. */
+  expectIdentical?: boolean;
   onClose: () => void;
 }) {
   const dialogRef = useRef<HTMLDivElement | null>(null);
   useModalFocus(dialogRef, onClose);
+  const [verdict, setVerdict] = useState<
+    "checking" | "same" | "different" | "failed" | null
+  >(expectIdentical ? "checking" : null);
+  const [verdictError, setVerdictError] = useState("");
+  useEffect(() => {
+    if (!expectIdentical) return;
+    let cancelled = false;
+    setVerdict("checking");
+    invoke<boolean>("verify_photo_pair", {
+      first: photo.first_path,
+      second: photo.second_path,
+    })
+      .then((same) => {
+        if (!cancelled) setVerdict(same ? "same" : "different");
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setVerdictError(friendlyError(error));
+          setVerdict("failed");
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [expectIdentical, photo.first_path, photo.second_path]);
   return (
     <div className="modal-backdrop" onClick={onClose} role="presentation">
       <div
@@ -251,18 +283,13 @@ export function SimilarCompareModal({
         className="modal compare-modal"
         role="dialog"
         aria-modal="true"
-        aria-label="相似照片对比"
+        aria-label="照片对比"
         onClick={(event) => event.stopPropagation()}
       >
         <div className="modal-head">
           <div>
-            <b>相似照片对比</b>
-            <span>
-              {photo.distance === 0
-                ? "像素级一致（字节不同）"
-                : `dHash 差异 ${photo.distance}/64`}
-              {" · "}Esc 关闭
-            </span>
+            <b>{expectIdentical ? "重复照片对比" : "相似照片对比"}</b>
+            <span>{`dHash 差异 ${photo.distance}/64 · pHash 差异 ${photo.phash_distance}/64 · Esc 关闭`}</span>
           </div>
           <div className="modal-actions">
             <button className="secondary" onClick={onClose}>
@@ -270,6 +297,21 @@ export function SimilarCompareModal({
             </button>
           </div>
         </div>
+        {verdict && (
+          <div
+            className={`verify-banner${
+              verdict === "checking" || verdict === "same" ? "" : ` ${verdict}`
+            }`}
+            role="status"
+          >
+            {verdict === "checking" && "正在逐像素校验两张照片是否完全一致…"}
+            {verdict === "same" &&
+              "已校验：两张照片每个像素完全一致，仅拍摄信息（EXIF）等元数据不同。移除任意一侧都安全，且可从应用回收站恢复。"}
+            {verdict === "different" &&
+              "校验结果：两张照片像素不同——它们是两张相似的照片，并不是同一张的复制。移除前请再确认要删的是哪一张。"}
+            {verdict === "failed" && `无法完成像素校验：${verdictError}`}
+          </div>
+        )}
         <div className="compare-grid">
           <ComparePane
             label="左图"

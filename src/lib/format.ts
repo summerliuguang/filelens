@@ -56,6 +56,7 @@ export function friendlyError(error: unknown) {
     [/file changed while hashing/, "扫描期间文件内容发生了变化，将在下次扫描时重试。"],
     [/must be an approved/, "只有已确认的精确重复副本才能移入回收站。"],
     [/is not a directory/, "扫描目录无效或已不存在，请重新添加。"],
+    [/cannot decode/, "文件无法解码成图片，可能已损坏或格式不受支持。"],
     [/restore refused/, "原位置已存在文件，恢复被拒绝以避免覆盖。"],
     [/unknown file id/, "该文件已不在索引中，请刷新后重试。"],
   ];

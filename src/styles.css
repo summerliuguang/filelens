@@ -61,26 +61,27 @@
 }
 
 :root[data-theme="light"] {
-  --color-accent: #828519;
-  --color-accent-soft: #6d711a;
-  --color-accent-contrast: #fdfdf2;
-  --color-bg-page: #f4f5ef;
-  --color-bg-sidebar: #eceee3;
-  --color-bg-surface: #fbfcf7;
-  --color-bg-card: #f1f3e8;
-  --color-bg-panel: #e8ebdb;
-  --color-bg-raised: #dfe3d1;
-  --color-bg-inset: #e3e6d7;
-  --color-bg-subtle: #edf0e1;
-  --color-bg-active: #e0e5c9;
-  --color-bg-hover: #e5e8d8;
-  --color-text-primary: #24271e;
-  --color-text-muted: #5c6253;
-  --color-text-faint: #7c8274;
-  --color-text-label: #3f4437;
-  --color-line: #d5d9c6;
-  --color-line-strong: #b8bea6;
-  --color-line-input: #c1c6b0;
+  /* Neutral white palette: white surfaces, zinc-gray accents. */
+  --color-accent: #3f3f46;
+  --color-accent-soft: #71717a;
+  --color-accent-contrast: #ffffff;
+  --color-bg-page: #f7f7f8;
+  --color-bg-sidebar: #f1f1f3;
+  --color-bg-surface: #ffffff;
+  --color-bg-card: #ffffff;
+  --color-bg-panel: #ffffff;
+  --color-bg-raised: #ececee;
+  --color-bg-inset: #f1f1f3;
+  --color-bg-subtle: #f6f6f7;
+  --color-bg-active: #e4e4e7;
+  --color-bg-hover: #eeeff0;
+  --color-text-primary: #18181b;
+  --color-text-muted: #52525b;
+  --color-text-faint: #a1a1aa;
+  --color-text-label: #3f3f46;
+  --color-line: #e4e4e7;
+  --color-line-strong: #d4d4d8;
+  --color-line-input: #d4d4d8;
   --color-danger: #b0493d;
   --color-danger-bg: #e5c5c0;
   --color-danger-bg-soft: #f6ebe9;
@@ -93,11 +94,11 @@
   --color-note-text: #7d5a1c;
   --color-note-border: #c08a3e;
   --color-note-bg: #f5ebd6;
-  --color-overlay: rgba(38, 42, 30, 0.5);
-  --color-scrim: rgba(38, 42, 30, 0.55);
-  --color-shadow: rgba(45, 50, 35, 0.28);
-  --color-orbit-1: #dde3c6;
-  --color-orbit-2: #eaedd9;
+  --color-overlay: rgba(9, 9, 11, 0.5);
+  --color-scrim: rgba(9, 9, 11, 0.55);
+  --color-shadow: rgba(9, 9, 11, 0.16);
+  --color-orbit-1: #e4e4e7;
+  --color-orbit-2: #f4f4f5;
 }
 * {
   box-sizing: border-box;
@@ -315,6 +316,17 @@ nav button em {
   margin: 6px 0;
   font-size: 0.78rem;
 }
+.side-help {
+  margin-top: 10px;
+  width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--color-line-strong);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--color-text-muted);
+  font-size: 0.74rem;
+  font-weight: 650;
+}
 main {
   max-width: 1320px;
   width: 100%;
@@ -327,6 +339,9 @@ header,
   justify-content: space-between;
   gap: 24px;
   align-items: flex-start;
+  /* Chromium (WebView2) squeezes the text column to min-content — one
+     character per line for CJK — when head-actions overflows; wrap instead. */
+  flex-wrap: wrap;
 }
 header {
   align-items: center;
@@ -390,8 +405,15 @@ h3 {
   line-height: 1.65;
   max-width: 610px;
 }
-.hero button {
+.hero-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
   margin-top: 21px;
+}
+.hero-actions button {
+  margin-top: 0;
 }
 .hero-orbit {
   display: grid;
@@ -709,6 +731,15 @@ h3 {
 .onboarding button {
   min-width: 180px;
 }
+.onboarding-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.onboarding-actions .text-button {
+  min-width: 0;
+}
 .onboarding-steps {
   counter-reset: step;
 }
@@ -807,6 +838,64 @@ h3 {
   align-content: start;
   gap: 17px;
 }
+/* In-app user guide (settings → 使用帮助). */
+.help-page {
+  display: grid;
+  gap: 14px;
+}
+.help-section {
+  display: grid;
+  gap: 8px;
+  padding: 14px 16px;
+  border: 1px solid var(--color-line);
+  border-radius: 10px;
+  background: var(--color-bg-panel);
+}
+.help-section h3 {
+  margin: 0;
+  font-size: 0.95rem;
+  color: var(--color-text-primary);
+}
+.help-section p,
+.help-section li {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: 0.82rem;
+  line-height: 1.65;
+}
+.help-section ol,
+.help-section ul {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 5px;
+}
+.help-section b {
+  color: var(--color-text-primary);
+}
+.help-section kbd {
+  padding: 1px 6px;
+  border: 1px solid var(--color-line-strong);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  background: var(--color-bg-subtle);
+  color: var(--color-text-primary);
+  font-size: 0.74rem;
+  font-family: inherit;
+}
+.help-faq {
+  display: grid;
+  gap: 6px;
+}
+.help-faq summary {
+  cursor: pointer;
+  color: var(--color-text-primary);
+  font-size: 0.84rem;
+  font-weight: 650;
+}
+.help-faq p {
+  margin-top: 6px;
+}
 .settings-page label {
   display: grid;
   gap: 7px;
@@ -834,6 +923,305 @@ h3 {
   align-items: center;
   gap: 10px;
   flex: 0 0 auto;
+  flex-wrap: wrap;
+  /* Stay inside the panel so wrapping kicks in instead of horizontal scroll. */
+  max-width: 100%;
+}
+/* Native selects otherwise render with a system arrow and height that clash
+   with the joined pill buttons around them. */
+:root {
+  --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23a8afa1' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+:root[data-theme="light"] {
+  --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%2352525b' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+.head-actions select,
+.filter-bar select {
+  appearance: none;
+  -webkit-appearance: none;
+  max-width: 340px;
+  padding: 9px 30px 9px 12px;
+  border: 1px solid var(--color-line);
+  border-radius: 7px;
+  background: var(--color-bg-inset) var(--select-chevron) no-repeat right 11px
+    center;
+  color: var(--color-text-primary);
+  font-size: 0.8rem;
+  font-weight: 650;
+  cursor: pointer;
+}
+.dir-groups {
+  display: grid;
+  gap: 14px;
+}
+.dir-group {
+  display: grid;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--color-line);
+  border-radius: 10px;
+  background: var(--color-bg-panel);
+}
+.dir-group-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.dir-group-hint {
+  color: var(--color-text-muted);
+  font-size: 0.74rem;
+}
+/* Per-side column headers: each remove button sits directly above the
+   column it would recycle, so the target directory is never ambiguous. */
+.dir-pair-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.dir-side-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+  background: var(--color-bg-subtle);
+}
+.dir-side-head b {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.82rem;
+}
+.dir-side-meta {
+  flex: 0 0 auto;
+  color: var(--color-text-muted);
+  font-size: 0.74rem;
+  white-space: nowrap;
+}
+.dir-side-head .dir-side-merge,
+.dir-side-head .dir-side-remove {
+  flex: 0 0 auto;
+  padding: 7px 10px;
+  font-size: 0.75rem;
+}
+.dir-side-head .dir-side-merge {
+  color: var(--color-text-primary);
+  background: var(--color-bg-active);
+}
+.dir-side-head .dir-side-remove {
+  margin-left: auto;
+}
+/* Selective merge dialog: target directory row, prefix checkboxes. */
+.merge-field {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+  text-align: left;
+}
+.merge-field > b {
+  font-size: 0.8rem;
+  color: var(--color-text-primary);
+}
+.merge-target-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.merge-target-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 7px 10px;
+  border: 1px solid var(--color-line);
+  border-radius: 7px;
+  background: var(--color-bg-inset);
+  color: var(--color-text-muted);
+  font-size: 0.76rem;
+}
+.merge-warn {
+  color: var(--color-danger-text);
+}
+.merge-prefixes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.merge-prefixes label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  border: 1px solid var(--color-line);
+  border-radius: 999px;
+  background: var(--color-bg-inset);
+  color: var(--color-text-muted);
+  font-size: 0.76rem;
+  cursor: pointer;
+}
+.merge-prefixes label.on {
+  border-color: var(--color-accent);
+  background: var(--color-bg-active);
+  color: var(--color-text-primary);
+}
+.merge-prefixes label small {
+  opacity: 0.75;
+}
+.merge-add-prefix {
+  display: flex;
+  gap: 8px;
+}
+.merge-add-prefix input {
+  padding: 7px 10px;
+  font-size: 0.78rem;
+}
+.merge-add-prefix button {
+  padding: 7px 12px;
+  font-size: 0.75rem;
+}
+.merge-radio {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--color-text-muted);
+  font-size: 0.78rem;
+  cursor: pointer;
+  min-width: 0;
+}
+.merge-radio input {
+  width: auto;
+  flex: 0 0 auto;
+}
+.merge-condition {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+  background: var(--color-bg-subtle);
+}
+.merge-condition > .merge-order {
+  display: grid;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+.merge-condition .merge-order button {
+  padding: 1px 7px;
+  font-size: 0.72rem;
+  line-height: 1.3;
+  background: var(--color-bg-inset);
+  color: var(--color-text-muted);
+}
+.merge-condition .merge-order button:disabled {
+  opacity: 0.35;
+}
+.merge-enable {
+  flex: 0 0 auto;
+  padding-top: 3px;
+}
+.merge-enable input {
+  width: auto;
+}
+.merge-condition-body {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+}
+.merge-condition-body > b {
+  color: var(--color-text-primary);
+  font-size: 0.78rem;
+}
+.merge-condition-body select {
+  padding: 6px 10px;
+  border: 1px solid var(--color-line);
+  border-radius: 7px;
+  background: var(--color-bg-inset);
+  color: var(--color-text-primary);
+  font-size: 0.78rem;
+  max-width: 100%;
+}
+.dir-pair-list {
+  display: grid;
+  gap: 10px;
+}
+.dir-pair-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.dir-slot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+  background: var(--color-bg-subtle);
+  min-width: 0;
+}
+.dir-slot .thumbnail-button {
+  flex: 0 0 auto;
+}
+.dir-slot .thumbnail {
+  width: 110px;
+  height: 82px;
+  border-radius: 6px;
+}
+.dir-slot .photo-info {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dir-check {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+}
+.toast-action {
+  margin-left: 10px;
+  padding: 4px 10px;
+  border: 1px solid currentColor;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.72rem;
+  font-weight: 650;
+}
+.toast-action:hover {
+  opacity: 0.8;
+}
+.file-row.cursor {
+  outline: 2px solid var(--color-accent);
+  outline-offset: -2px;
+  border-radius: 6px;
+}
+.dir-filter-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.78rem;
+  color: var(--color-text-muted);
+  white-space: nowrap;
+}
+.secondary.on {
+  background: var(--color-bg-active);
+  color: var(--color-text-primary);
+}
+@media (max-width: 900px) {
+  .dir-pair-row,
+  .dir-pair-cols {
+    grid-template-columns: 1fr;
+  }
 }
 .trash-actions {
   display: flex;
@@ -1324,14 +1712,6 @@ footer.error {
   flex: 1;
   min-width: 220px;
 }
-.filter-bar select {
-  padding: 8px 10px;
-  border: 1px solid var(--color-line);
-  border-radius: 7px;
-  background: var(--color-bg-inset);
-  color: var(--color-text-primary);
-  font-size: 0.8rem;
-}
 .smart-row {
   display: flex;
   align-items: center;
@@ -1356,6 +1736,27 @@ footer.error {
   background: var(--color-bg-active);
   color: var(--color-accent);
   font-size: 0.72rem;
+}
+/* Pixel-verification verdict shown at the top of the compare modal. */
+.verify-banner {
+  margin: 0 18px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--color-accent);
+  border-radius: 8px;
+  background: var(--color-bg-subtle);
+  color: var(--color-text-primary);
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+.verify-banner.different {
+  border-left-color: var(--color-warn-text);
+  background: var(--color-warn-bg);
+  color: var(--color-warn-text);
+}
+.verify-banner.failed {
+  border-left-color: var(--color-danger-text);
+  background: var(--color-danger-bg-soft);
+  color: var(--color-danger-text);
 }
 @media (max-width: 900px) {
   .app-shell,

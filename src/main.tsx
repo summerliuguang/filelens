@@ -15,6 +15,7 @@ import {
 } from "./ui/views";
 import { friendlyError } from "./lib/format";
 import type {
+  BulkState,
   DetectorStatus,
   Group,
   GroupFilters,
@@ -24,6 +25,8 @@ import type {
   ScanState,
   SimilarDocument,
   SimilarPhoto,
+  SimilarPhotosPage,
+  DuplicateVerifyState,
   Status,
   ThemeSetting,
   Toast,
@@ -72,9 +75,24 @@ function App() {
   const [minFileSize, setMinFileSize] = useState(0);
   const [retentionDays, setRetentionDays] = useState(30);
   const [autoScan, setAutoScan] = useState(true);
+  const [strictVerify, setStrictVerify] = useState(false);
+  const [usnScan, setUsnScan] = useState(false);
   const [rootInput, setRootInput] = useState("");
   const [status, setStatus] = useState<Status | null>(null);
   const [theme, setTheme] = useState<ThemeSetting>(loadThemeSetting);
+  // Settings page tab, lifted so any page (onboarding, sidebar) can jump
+  // straight into the help view.
+  const [settingsTab, setSettingsTab] = useState<"project" | "help">(() =>
+    localStorage.getItem("filelens-settings-tab") === "help" ? "help" : "project",
+  );
+  function changeSettingsTab(tab: "project" | "help") {
+    setSettingsTab(tab);
+    localStorage.setItem("filelens-settings-tab", tab);
+  }
+  function openHelp() {
+    changeSettingsTab("help");
+    setPage("settings");
+  }
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(
     () => localStorage.getItem("filelens-sidebar") === "collapsed",
   );
@@ -84,13 +102,27 @@ function App() {
   const [groupFilters, setGroupFilters] = useState<GroupFilters>({
     search: "",
     minSize: 0,
-    sort: "size",
+    sort: "recoverable",
+    kind: "all",
+    dir: "all",
   });
   const [trashItems, setTrashItems] = useState<TrashItem[]>([]);
-  const [similarPhotos, setSimilarPhotos] = useState<SimilarPhoto[]>([]);
-  const [duplicatePhotos, setDuplicatePhotos] = useState<SimilarPhoto[]>([]);
+  const [similarPhotos, setSimilarPhotos] = useState<SimilarPhotosPage>({
+    pairs: [],
+    total: 0,
+    truncated: false,
+  });
+  const [duplicatePhotos, setDuplicatePhotos] = useState<SimilarPhotosPage>({
+    pairs: [],
+    total: 0,
+    truncated: false,
+  });
+  const [duplicateVerify, setDuplicateVerify] =
+    useState<DuplicateVerifyState | null>(null);
   const [similarDocuments, setSimilarDocuments] = useState<SimilarDocument[]>([]);
   const [detectors, setDetectors] = useState<DetectorStatus[]>([]);
+  const [bulkProgress, setBulkProgress] = useState<BulkState | null>(null);
+  const consumedBulk = useRef("");
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [booting, setBooting] = useState(true);
   const [busyKeys, setBusyKeys] = useState<ReadonlySet<string>>(new Set());
@@ -107,9 +139,9 @@ function App() {
   });
   const progressHistory = useRef<{ t: number; processed: number }[]>([]);
   const toastSeq = useRef(0);
-  // Global busy = any tracked action in flight; per-section keys let each
-  // button disable only for its own operation.
-  const busy = busyKeys.size > 0;
+  // Global busy = any tracked action in flight (or a bulk sweep running);
+  // per-section keys let each button disable only for its own operation.
+  const busy = busyKeys.size > 0 || (bulkProgress?.running ?? false);
 
   function setKeyBusy(key: string, on: boolean) {
     setBusyKeys((current) => {
@@ -120,10 +152,14 @@ function App() {
     });
   }
 
-  function notify(kind: Toast["kind"], text: string) {
+  function notify(
+    kind: Toast["kind"],
+    text: string,
+    action?: Toast["action"],
+  ) {
     const id = ++toastSeq.current;
     // Keep the stack short; successes self-dismiss, errors stay until closed.
-    setToasts((current) => [...current.slice(-3), { id, kind, text }]);
+    setToasts((current) => [...current.slice(-3), { id, kind, text, action }]);
     if (kind === "ok") {
       window.setTimeout(() => dismissToast(id), 3600);
     }
@@ -144,10 +180,13 @@ function App() {
         setMinFileSize(project.min_file_size);
         setRetentionDays(project.trash_retention_days);
         setAutoScan(project.auto_scan);
+        setStrictVerify(project.strict_verify);
+        setUsnScan(project.usn_scan);
+        // Show the existing index right away; an auto scan then refreshes it
+        // in the background instead of leaving the queue empty meanwhile.
+        void refresh(project.database, { silent: true });
         if (project.auto_scan && project.roots.length > 0) {
           void startScan(project.database, project.roots, project.protect_rules);
-        } else {
-          void refresh(project.database);
         }
       })
       .catch((error) =>
@@ -156,6 +195,86 @@ function App() {
       .finally(() => setBooting(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Bulk sweep (recycle/hardlink/delete of many files) runs on a background
+  // thread; poll its progress, surface it as a busy toast and refresh when
+  // the sweep completes. `message` doubles as the consumed-marker because it
+  // stays readable after completion.
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      invoke<BulkState>("bulk_state")
+        .then((bulk) => {
+          if (bulk.running) {
+            setBulkProgress(bulk);
+            return;
+          }
+          setBulkProgress(null);
+          if (bulk.message && consumedBulk.current !== bulk.message) {
+            consumedBulk.current = bulk.message;
+            notify(
+              bulk.message.includes("失败 0 个") ? "ok" : "error",
+              bulk.message,
+            );
+            void refresh(undefined, { silent: true });
+          }
+        })
+        .catch(() => {});
+    }, 400);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Live results during a scan: a quiet refresh every few seconds so new
+  // groups appear while the scan is still running.
+  useEffect(() => {
+    if (scanState.state !== "running") return;
+    const refreshTimer = window.setInterval(() => {
+      void refresh(undefined, { silent: true });
+    }, 5000);
+    return () => window.clearInterval(refreshTimer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scanState.state]);
+
+  // Pixel verification for the duplicate-photos view: fingerprint equality
+  // is only a candidate signal, so a background pass verifies every pair and
+  // the view keeps only confirmed-identical ones. Restart whenever the
+  // candidate list changed and no run covers it (first load, scan, action).
+  useEffect(() => {
+    if (!database || duplicatePhotos.pairs.length === 0) {
+      setDuplicateVerify(null);
+      return;
+    }
+    let cancelled = false;
+    let timer = 0;
+    const tick = async () => {
+      try {
+        let state = await invoke<DuplicateVerifyState>("duplicate_verify_state");
+        const keys = new Set(
+          duplicatePhotos.pairs.map(
+            (pair) => `${pair.first_path}|${pair.second_path}`,
+          ),
+        );
+        const covered = state.results.filter((result) =>
+          keys.has(`${result.first}|${result.second}`),
+        ).length;
+        if (!state.running && (covered < keys.size || covered < state.results.length)) {
+          state = await invoke<DuplicateVerifyState>("start_duplicate_verify", {
+            database,
+          });
+        }
+        if (cancelled) return;
+        setDuplicateVerify(state);
+        if (state.running) timer = window.setTimeout(tick, 700);
+      } catch {
+        // Verification is best-effort; retried on the next list change.
+      }
+    };
+    void tick();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [duplicatePhotos, database]);
 
   useEffect(() => {
     if (scanState.state !== "running") return;
@@ -209,10 +328,14 @@ function App() {
     );
   }, [sidebarCollapsed]);
 
-  async function execute(action: () => Promise<string>, key = "app") {
+  async function execute(
+    action: () => Promise<string>,
+    key = "app",
+    toastAction?: Toast["action"],
+  ) {
     setKeyBusy(key, true);
     try {
-      notify("ok", await action());
+      notify("ok", await action(), toastAction);
     } catch (error) {
       notify("error", friendlyError(error));
     } finally {
@@ -228,20 +351,25 @@ function App() {
       minSize: groupFilters.minSize,
       pathContains: groupFilters.search.trim() || undefined,
       sort: groupFilters.sort,
+      kind: groupFilters.kind,
+      dirContains: groupFilters.dir,
     };
   }
 
-  async function refresh(target = database) {
+  async function refresh(
+    target = database,
+    options: { silent?: boolean } = {},
+  ) {
     if (!target) return;
-    await execute(async () => {
+    const run = async () => {
       const [nextStatus, page, nextTrash, nextSimilarPhotos, nextDuplicatePhotos, nextDocuments, nextDetectors] = await Promise.all([
         invoke<Status>("status", { database: target }),
         // Reload as many groups as are already on screen so an action taken
         // deep in the list does not snap the queue back to its first page.
         invoke<GroupsPage>("groups", groupsInvokeArgs(target, 0, Math.max(GROUPS_PAGE, groups.length))),
         invoke<TrashItem[]>("trash_list", { database: target }),
-        invoke<SimilarPhoto[]>("similar_photos", { database: target, kind: "similar" }),
-        invoke<SimilarPhoto[]>("similar_photos", { database: target, kind: "duplicate" }),
+        invoke<SimilarPhotosPage>("similar_photos", { database: target, kind: "similar" }),
+        invoke<SimilarPhotosPage>("similar_photos", { database: target, kind: "duplicate" }),
         invoke<SimilarDocument[]>("similar_documents", { database: target }),
         invoke<DetectorStatus[]>("detector_status"),
       ]);
@@ -255,7 +383,17 @@ function App() {
       setSimilarDocuments(nextDocuments);
       setDetectors(nextDetectors);
       return `索引已更新：${nextStatus.groups} 个精确重复组待审核。`;
-    });
+    };
+    if (options.silent) {
+      try {
+        await run();
+      } catch {
+        // Silent refresh (boot/live): failures surface on the next explicit
+        // refresh instead of toasting every 5 seconds.
+      }
+      return;
+    }
+    await execute(run);
   }
 
   async function applyGroupFilters(next: GroupFilters) {
@@ -270,6 +408,8 @@ function App() {
         minSize: next.minSize,
         pathContains: next.search.trim() || undefined,
         sort: next.sort,
+        kind: next.kind,
+        dirContains: next.dir,
       });
       setGroups(page.groups);
       setGroupsTotal(page.total);
@@ -406,6 +546,12 @@ function App() {
               {item.id === "review" && status && status.duplicates > 0 && (
                 <em>{status.duplicates}</em>
               )}
+              {item.id === "similar" &&
+                similarPhotos.pairs.length + duplicatePhotos.pairs.length > 0 && (
+                  <em>
+                    {similarPhotos.pairs.length + duplicatePhotos.pairs.length}
+                  </em>
+                )}
               {item.id === "trash" && trashItems.length > 0 && (
                 <em>{trashItems.length}</em>
               )}
@@ -416,6 +562,9 @@ function App() {
           <span>安全模式</span>
           <b>仅人工确认后移动</b>
           <small>完整哈希二次校验</small>
+          <button className="side-help" onClick={openHelp}>
+            使用帮助
+          </button>
         </div>
       </aside>
       <main>
@@ -455,6 +604,7 @@ function App() {
                 groups={groups}
                 selected={selected}
                 onNavigate={setPage}
+                onOpenHelp={openHelp}
               />
             </div>
             <div className={page === "sources" ? "page-layer page-active" : "page-layer"}>
@@ -466,6 +616,7 @@ function App() {
                 removeRoot={removeRootPath}
                 scan={() => startScan(database, roots, protectRules)}
                 disabled={busy || !database || scanState.state === "running"}
+                onOpenHelp={openHelp}
               />
             </div>
             <div className={page === "review" ? "page-layer page-active" : "page-layer"}>
@@ -483,13 +634,18 @@ function App() {
                 onLoadMore={loadMoreGroups}
                 indexedFiles={status?.files ?? 0}
                 onNavigate={setPage}
+                scanning={scanState.state === "running"}
+                active={page === "review"}
+                goTrash={() => setPage("trash")}
               />
             </div>
             <div className={page === "similar" ? "page-layer page-active" : "page-layer"}>
               <SimilarPhotos
                 database={database}
-                photos={similarPhotos}
-                duplicates={duplicatePhotos}
+                photosPage={similarPhotos}
+                duplicatesPage={duplicatePhotos}
+                duplicateVerify={duplicateVerify}
+                scanning={scanState.state === "running"}
                 busy={busy}
                 busyKeys={busyKeys}
                 execute={execute}
@@ -497,7 +653,11 @@ function App() {
               />
             </div>
             <div className={page === "documents" ? "page-layer page-active" : "page-layer"}>
-              <SimilarDocuments documents={similarDocuments} execute={execute} />
+              <SimilarDocuments
+                documents={similarDocuments}
+                execute={execute}
+                scanning={scanState.state === "running"}
+              />
             </div>
             <div className={page === "detectors" ? "page-layer page-active" : "page-layer"}>
               <Detectors detectors={detectors} />
@@ -521,11 +681,17 @@ function App() {
                 trash={trash}
                 theme={theme}
                 setTheme={setTheme}
+                settingsTab={settingsTab}
+                onSettingsTabChange={changeSettingsTab}
                 protectRules={protectRules}
                 excludeRules={excludeRules}
                 minFileSize={minFileSize}
                 retentionDays={retentionDays}
                 autoScan={autoScan}
+                strictVerify={strictVerify}
+                setStrictVerify={setStrictVerify}
+                usnScan={usnScan}
+                setUsnScan={setUsnScan}
                 setDatabase={setDatabase}
                 setTrash={setTrash}
                 setProtectRules={setProtectRules}
@@ -550,6 +716,17 @@ function App() {
                 className={toast.kind === "error" ? "toast error" : "toast"}
               >
                 <span>{toast.text}</span>
+                {toast.action && (
+                  <button
+                    className="toast-action"
+                    onClick={() => {
+                      toast.action?.run();
+                      dismissToast(toast.id);
+                    }}
+                  >
+                    {toast.action.label}
+                  </button>
+                )}
                 <button
                   className="toast-close"
                   aria-label="关闭通知"
@@ -559,7 +736,13 @@ function App() {
                 </button>
               </div>
             ))}
-            {busy && <div className="toast busy">正在处理，请不要关闭程序...</div>}
+            {busy && (
+              <div className="toast busy">
+                {bulkProgress?.running
+                  ? `${bulkProgress.message} 请不要关闭程序...`
+                  : "正在处理，请不要关闭程序..."}
+              </div>
+            )}
           </div>
         )}
       </main>
