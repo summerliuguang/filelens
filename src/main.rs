@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// Latest schema version this build understands. Older databases are
 /// upgraded stepwise through MIGRATIONS on open; newer ones are rejected so a
 /// downgrade can never misread an unknown schema.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const COPY_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const QUICK_HASH_CHUNK: u64 = 64 * 1024;
 /// Files above this size get the two-stage hash: quick fingerprint first,
@@ -56,6 +56,21 @@ const MIGRATIONS: &[&str] = &[
      ALTER TABLE photo_fingerprints_new RENAME TO photo_fingerprints;
      CREATE INDEX IF NOT EXISTS photo_fingerprints_parts ON photo_fingerprints(part_a, part_b, part_c, part_d, part_e);
      ALTER TABLE files ADD COLUMN frn INTEGER NOT NULL DEFAULT 0;",
+    // v5 -> v6: cache pixel-verification verdicts for duplicate-photo pairs.
+    // Rows are keyed by the two paths and the index sizes/mtimes at check
+    // time; any rescan that changes either file invalidates the row through
+    // the join used on lookup, so nothing needs active eviction.
+    "CREATE TABLE IF NOT EXISTS photo_pair_verdicts (
+       path_a TEXT NOT NULL,
+       size_a INTEGER NOT NULL,
+       mtime_a INTEGER NOT NULL,
+       path_b TEXT NOT NULL,
+       size_b INTEGER NOT NULL,
+       mtime_b INTEGER NOT NULL,
+       identical INTEGER NOT NULL,
+       checked_at INTEGER NOT NULL,
+       PRIMARY KEY (path_a, path_b)
+     );",
 ];
 
 fn create_schema_sql() -> &'static str {
@@ -108,7 +123,18 @@ fn create_schema_sql() -> &'static str {
        batch_id INTEGER,
        FOREIGN KEY(file_id) REFERENCES files(id)
      );
-     CREATE INDEX IF NOT EXISTS operations_batch ON operations(batch_id);"
+     CREATE INDEX IF NOT EXISTS operations_batch ON operations(batch_id);
+     CREATE TABLE IF NOT EXISTS photo_pair_verdicts (
+       path_a TEXT NOT NULL,
+       size_a INTEGER NOT NULL,
+       mtime_a INTEGER NOT NULL,
+       path_b TEXT NOT NULL,
+       size_b INTEGER NOT NULL,
+       mtime_b INTEGER NOT NULL,
+       identical INTEGER NOT NULL,
+       checked_at INTEGER NOT NULL,
+       PRIMARY KEY (path_a, path_b)
+     );"
 }
 
 #[derive(Parser)]
@@ -2837,6 +2863,103 @@ pub fn merge_dir_pair(
     Ok(outcome)
 }
 
+/// Cached pixel-verification verdicts for duplicate-photo candidate pairs.
+/// A cached row only counts while both files still carry the exact size and
+/// mtime recorded at check time — any rescan that touches either file
+/// invalidates the entry through the join, so stale rows are never served.
+/// Pairs are canonicalized (lexicographically smaller path first) so the
+/// same content pair hits one row regardless of orientation.
+pub fn cached_pair_verdicts(
+    database: &Path,
+    pairs: &[(String, String)],
+) -> Result<Vec<Option<bool>>, String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    let mut verdicts = Vec::with_capacity(pairs.len());
+    for (first, second) in pairs {
+        let (path_a, path_b) = canonical_pair(first, second);
+        let row: Option<i64> = connection
+            .query_row(
+                "SELECT v.identical FROM photo_pair_verdicts v \
+                 JOIN files f1 ON f1.path = v.path_a AND f1.present = 1 \
+                 JOIN files f2 ON f2.path = v.path_b AND f2.present = 1 \
+                 WHERE v.path_a = ?1 AND v.path_b = ?2 \
+                   AND v.size_a = f1.size AND v.mtime_a = f1.modified \
+                   AND v.size_b = f2.size AND v.mtime_b = f2.modified",
+                params![path_a, path_b],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        verdicts.push(row.map(|identical| identical != 0));
+    }
+    Ok(verdicts)
+}
+
+/// Persist pixel-verification verdicts. Sizes and mtimes come from the
+/// index (the same source the candidate list was built from); pairs with a
+/// missing or absent file are skipped — they will re-verify next time.
+/// Returns how many rows were written.
+pub fn store_pair_verdicts(
+    database: &Path,
+    verdicts: &[(String, String, bool)],
+) -> Result<usize, String> {
+    let mut connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    let checked_at = now_seconds()?;
+    let tx = connection.transaction().map_err(|e| e.to_string())?;
+    let mut stored = 0;
+    for (first, second, identical) in verdicts {
+        let (path_a, path_b) = canonical_pair(first, second);
+        let row: Option<(i64, i64, i64, i64)> = tx
+            .query_row(
+                "SELECT f1.size, f1.modified, f2.size, f2.modified FROM files f1, files f2 \
+                 WHERE f1.path = ?1 AND f1.present = 1 \
+                   AND f2.path = ?2 AND f2.present = 1",
+                params![path_a, path_b],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((size_a, mtime_a, size_b, mtime_b)) = row else {
+            continue;
+        };
+        tx.execute(
+            "INSERT INTO photo_pair_verdicts \
+               (path_a, size_a, mtime_a, path_b, size_b, mtime_b, identical, checked_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT(path_a, path_b) DO UPDATE SET \
+               size_a = excluded.size_a, mtime_a = excluded.mtime_a, \
+               size_b = excluded.size_b, mtime_b = excluded.mtime_b, \
+               identical = excluded.identical, checked_at = excluded.checked_at",
+            params![
+                path_a,
+                size_a,
+                mtime_a,
+                path_b,
+                size_b,
+                mtime_b,
+                i64::from(*identical),
+                checked_at
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        stored += 1;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(stored)
+}
+
+/// Lexicographically smaller path first, so a content pair maps to one row
+/// no matter which side of the candidate pair came first.
+fn canonical_pair<'a>(first: &'a str, second: &'a str) -> (&'a str, &'a str) {
+    if first <= second {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+
 /// Move one indexed file into `keep_dir` (name kept; a collision appends a
 /// numeric suffix), verifying content against the index first and updating
 /// the indexed path so the next scan sees a rename instead of a disappearance.
@@ -5218,6 +5341,54 @@ mod tests {
         let (_, noisy_phash) = perceptual_hash(&noisy).unwrap();
         let distance = (plain_phash ^ noisy_phash).count_ones();
         assert!(distance > 8, "unrelated images too close: {distance}/64");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn pair_verdict_cache_roundtrips_and_invalidates() {
+        let directory = test_directory("pair-verdict-cache");
+        let left = directory.join("left");
+        fs::create_dir_all(&left).unwrap();
+        fs::write(left.join("a.txt"), b"same").unwrap();
+        fs::write(left.join("b.txt"), b"same").unwrap();
+        let database = directory.join("index.db");
+        init(&database, &directory.join("recycle")).unwrap();
+        scan(&database, std::slice::from_ref(&left), &[]).unwrap();
+        let path_a = left.join("a.txt").to_string_lossy().into_owned();
+        let path_b = left.join("b.txt").to_string_lossy().into_owned();
+
+        // Store in one orientation, read back in the other: the cache is
+        // canonicalized so both hit the same row.
+        assert_eq!(
+            1,
+            store_pair_verdicts(&database, &[(path_a.clone(), path_b.clone(), true)]).unwrap()
+        );
+        let verdicts = cached_pair_verdicts(
+            &database,
+            &[
+                (path_a.clone(), path_b.clone()),
+                (path_b.clone(), path_a.clone()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(vec![Some(true), Some(true)], verdicts);
+
+        // Touching one file's content changes its size: the row must stop
+        // being served.
+        fs::write(left.join("a.txt"), b"same but longer").unwrap();
+        scan(&database, std::slice::from_ref(&left), &[]).unwrap();
+        let verdicts = cached_pair_verdicts(&database, &[(path_a.clone(), path_b.clone())]).unwrap();
+        assert_eq!(vec![None], verdicts, "changed file must invalidate");
+
+        // Restoring the original content re-validates the same verdict.
+        fs::write(left.join("a.txt"), b"same").unwrap();
+        scan(&database, std::slice::from_ref(&left), &[]).unwrap();
+        assert_eq!(
+            1,
+            store_pair_verdicts(&database, &[(path_b.clone(), path_a.clone(), false)]).unwrap()
+        );
+        let verdicts = cached_pair_verdicts(&database, &[(path_a, path_b)]).unwrap();
+        assert_eq!(vec![Some(false)], verdicts);
         let _ = fs::remove_dir_all(directory);
     }
 

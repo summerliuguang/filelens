@@ -1173,11 +1173,37 @@ fn start_duplicate_verify(
         }
     }
     let pairs = duplicate_photo_candidates(&database)?;
-    let task_state = Arc::new(Mutex::new(DuplicateVerifyState {
+    // Serve cached verdicts instantly; only pairs whose either file changed
+    // since the last check go through the decoder again. Fresh verdicts are
+    // written back so the next pass is a cache hit.
+    let cached = filelens::cached_pair_verdicts(Path::new(&database), &pairs)?;
+    let mut seeded = Vec::new();
+    let mut pending = Vec::new();
+    for ((first, second), verdict) in pairs.iter().zip(&cached) {
+        match verdict {
+            Some(identical) => seeded.push(VerifyPairVerdict {
+                first: first.clone(),
+                second: second.clone(),
+                identical: *identical,
+            }),
+            None => pending.push((first.clone(), second.clone())),
+        }
+    }
+    let mut initial = DuplicateVerifyState {
         running: true,
         total: pairs.len(),
         ..Default::default()
-    }));
+    };
+    for verdict in &seeded {
+        initial.done += 1;
+        if verdict.identical {
+            initial.same += 1;
+        } else {
+            initial.different += 1;
+        }
+    }
+    initial.results = seeded;
+    let task_state = Arc::new(Mutex::new(initial));
     let cancel = Arc::new(AtomicBool::new(false));
     *slot = Some(DuplicateVerifyTask {
         cancel: cancel.clone(),
@@ -1186,7 +1212,33 @@ fn start_duplicate_verify(
     drop(slot);
     let task_state_for_thread = task_state.clone();
     std::thread::spawn(move || {
+        let database_for_store = database.clone();
+        // Workers publish from several threads; buffer verdicts and flush to
+        // the cache in batches instead of paying a connection per pair.
+        let buffer: std::sync::Mutex<Vec<(String, String, bool)>> =
+            std::sync::Mutex::new(Vec::new());
+        let flush = |buffer: &std::sync::Mutex<Vec<(String, String, bool)>>| {
+            if let Ok(mut buffered) = buffer.lock() {
+                if buffered.is_empty() {
+                    return;
+                }
+                let batch: Vec<_> = buffered.drain(..).collect();
+                let _ = filelens::store_pair_verdicts(Path::new(&database_for_store), &batch);
+            }
+        };
         let publish = |verdict: &filelens::PairVerdict| {
+            if let Ok(mut buffered) = buffer.lock() {
+                buffered.push((
+                    verdict.first.clone(),
+                    verdict.second.clone(),
+                    verdict.identical,
+                ));
+                if buffered.len() >= 64 {
+                    let batch: Vec<_> = buffered.drain(..).collect();
+                    let _ =
+                        filelens::store_pair_verdicts(Path::new(&database_for_store), &batch);
+                }
+            }
             if let Ok(mut guard) = task_state_for_thread.lock() {
                 guard.done += 1;
                 if verdict.identical {
@@ -1202,7 +1254,8 @@ fn start_duplicate_verify(
             }
         };
         let should_stop = || cancel.load(Ordering::Relaxed);
-        let _ = filelens::verify_photo_pairs(&pairs, &publish, &should_stop);
+        let _ = filelens::verify_photo_pairs(&pending, &publish, &should_stop);
+        flush(&buffer);
         if let Ok(mut guard) = task_state_for_thread.lock() {
             guard.running = false;
         }
