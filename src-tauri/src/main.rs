@@ -1214,6 +1214,7 @@ fn duplicate_photo_candidates(database: &str) -> Result<Vec<(String, String)>, S
 #[tauri::command]
 fn start_duplicate_verify(
     state: tauri::State<'_, Mutex<Option<DuplicateVerifyTask>>>,
+    scan_slot: tauri::State<'_, Arc<Mutex<Option<ScanTask>>>>,
     database: String,
 ) -> Result<DuplicateVerifyState, String> {
     let mut slot = state
@@ -1267,6 +1268,7 @@ fn start_duplicate_verify(
     });
     drop(slot);
     let task_state_for_thread = task_state.clone();
+    let scan_slot_for_thread = scan_slot.inner().clone();
     std::thread::spawn(move || {
         let database_for_store = database.clone();
         // Workers publish from several threads; buffer verdicts and flush to
@@ -1282,7 +1284,14 @@ fn start_duplicate_verify(
                 let _ = filelens::store_pair_verdicts(Path::new(&database_for_store), &batch);
             }
         };
+        // Pairs whose verdict has been published drop out here, so an
+        // interrupted pass can resume with exactly what is left.
+        let remaining: std::sync::Mutex<std::collections::HashSet<(String, String)>> =
+            std::sync::Mutex::new(pending.iter().cloned().collect());
         let publish = |verdict: &filelens::PairVerdict| {
+            if let Ok(mut left) = remaining.lock() {
+                left.remove(&(verdict.first.clone(), verdict.second.clone()));
+            }
             if let Ok(mut buffered) = buffer.lock() {
                 buffered.push((
                     verdict.first.clone(),
@@ -1309,8 +1318,33 @@ fn start_duplicate_verify(
                 });
             }
         };
-        let should_stop = || cancel.load(Ordering::Relaxed);
-        let _ = filelens::verify_photo_pairs(&pending, &publish, &should_stop);
+        let should_stop = || {
+            cancel.load(Ordering::Relaxed)
+                || scan_slot_for_thread
+                    .lock()
+                    .map(|task| task.is_some())
+                    .unwrap_or(false)
+        };
+        while !cancel.load(Ordering::Relaxed) {
+            // A running scan keeps every core busy with hashing: yield until
+            // it finishes, then continue with the remaining pairs.
+            let scan_running = scan_slot_for_thread
+                .lock()
+                .map(|task| task.is_some())
+                .unwrap_or(false);
+            if scan_running {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                continue;
+            }
+            let slice: Vec<(String, String)> = match remaining.lock() {
+                Ok(mut left) => left.drain().collect(),
+                Err(_) => break,
+            };
+            if slice.is_empty() {
+                break;
+            }
+            let _ = filelens::verify_photo_pairs(&slice, &publish, &should_stop);
+        }
         flush(&buffer);
         if let Ok(mut guard) = task_state_for_thread.lock() {
             guard.running = false;
