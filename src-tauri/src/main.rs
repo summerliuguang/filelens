@@ -1570,13 +1570,21 @@ fn set_watch_scan(
             Ok(watcher) => watcher,
             Err(_) => return,
         };
+        let mut watched_any = false;
         for root in &roots {
-            if watcher
-                .watch(Path::new(root), notify::RecursiveMode::Recursive)
-                .is_err()
+            // A root that does not exist (yet) is skipped rather than fatal:
+            // the remaining roots stay monitored, and re-toggling the
+            // setting picks the missing one up later.
+            if Path::new(root).is_dir()
+                && watcher
+                    .watch(Path::new(root), notify::RecursiveMode::Recursive)
+                    .is_ok()
             {
-                return;
+                watched_any = true;
             }
+        }
+        if !watched_any {
+            return;
         }
         let relevant = |kind: &EventKind| !matches!(kind, EventKind::Access(_));
         let mut dirty = false;

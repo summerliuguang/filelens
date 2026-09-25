@@ -78,8 +78,8 @@ const MIGRATIONS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS files_frn ON files(frn);
      CREATE INDEX IF NOT EXISTS files_dev_ino ON files(dev, inode);",
     // v7 -> v8: EXIF capture time for images (unix seconds, 0 = unknown),
-    // parsed during the scan for containers that carry EXIF. Kept sticky on
-    // rescan (a failed parse does not erase a previously read value).
+    // parsed during the scan for containers that carry EXIF. A failed
+    // re-parse keeps the previous value while the content stays identical.
     "ALTER TABLE files ADD COLUMN exif_taken INTEGER NOT NULL DEFAULT 0;",
 ];
 
@@ -1301,7 +1301,7 @@ fn write_entry(
     };
     connection.execute(
         "INSERT INTO files(path,size,modified,hash,protected,approved,present,scanned_at,quick_hash,dev,inode,frn,exif_taken) VALUES(?1,?2,?3,?4,?5,0,1,?6,?7,?8,?9,?10,?11)
-         ON CONFLICT(path) DO UPDATE SET size=excluded.size,modified=excluded.modified,hash=excluded.hash,protected=excluded.protected,approved=0,present=1,scanned_at=excluded.scanned_at,quick_hash=excluded.quick_hash,dev=excluded.dev,inode=excluded.inode,frn=CASE WHEN excluded.frn<>0 THEN excluded.frn ELSE files.frn END,exif_taken=CASE WHEN excluded.exif_taken<>0 THEN excluded.exif_taken ELSE files.exif_taken END",
+         ON CONFLICT(path) DO UPDATE SET size=excluded.size,modified=excluded.modified,hash=excluded.hash,protected=excluded.protected,approved=0,present=1,scanned_at=excluded.scanned_at,quick_hash=excluded.quick_hash,dev=excluded.dev,inode=excluded.inode,frn=CASE WHEN excluded.frn<>0 THEN excluded.frn ELSE files.frn END,exif_taken=CASE WHEN excluded.exif_taken<>0 THEN excluded.exif_taken WHEN excluded.hash<>files.hash THEN 0 ELSE files.exif_taken END",
         params![entry.path_text, entry.size, entry.modified, entry.hash, is_protected as i64, now, entry.quick_hash, entry.dev, entry.inode, entry.frn, entry.exif_taken],
     )
     .map_err(|e| e.to_string())?;
@@ -3078,6 +3078,14 @@ pub fn store_pair_verdicts(
     ensure_initialized(&connection)?;
     let checked_at = now_seconds()?;
     let tx = connection.transaction().map_err(|e| e.to_string())?;
+    // Housekeeping: rows not refreshed for 90 days are for pairs that no
+    // longer exist or stopped matching; drop them so the cache cannot grow
+    // without bound.
+    tx.execute(
+        "DELETE FROM photo_pair_verdicts WHERE checked_at < ?1",
+        params![checked_at - 90 * 86_400],
+    )
+    .map_err(|e| e.to_string())?;
     let mut stored = 0;
     for (first, second, identical) in verdicts {
         let (path_a, path_b) = canonical_pair(first, second);
