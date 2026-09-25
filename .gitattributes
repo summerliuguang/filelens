@@ -1,0 +1,5 @@
+# Keep every text file at LF in the repository and the working tree:
+# with a fixed eol, git stops flip-flopping CRLF conversions on Windows
+# (the source of the per-commit "LF will be replaced by CRLF" warnings).
+# Binary files are auto-detected and left untouched.
+* text=auto eol=lf
