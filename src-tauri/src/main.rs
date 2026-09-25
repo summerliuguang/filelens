@@ -13,6 +13,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use notify::{EventKind, Watcher as _};
 use image::ImageDecoder as _;
 use rusqlite::{Connection, params};
 use serde::Serialize;
@@ -115,6 +116,7 @@ struct ProjectState {
     auto_scan: bool,
     strict_verify: bool,
     usn_scan: bool,
+    watch_scan: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -150,6 +152,12 @@ struct ScanTask {
 struct BulkTask {
     kind: String,
     progress: Arc<Mutex<BulkProgress>>,
+}
+
+/// The real-time directory watcher: one background thread per enable,
+/// cancelled through the flag when the setting is turned off.
+struct WatchTask {
+    cancel: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Serialize)]
@@ -239,6 +247,7 @@ fn open_project(app: tauri::AppHandle) -> Result<ProjectState, String> {
         auto_scan: setting_flag(&connection, "auto_scan_on_start", true),
         strict_verify: setting_flag(&connection, "strict_verify", false),
         usn_scan: setting_flag(&connection, "usn_scan", false),
+        watch_scan: setting_flag(&connection, "watch_scan", false),
     })
 }
 
@@ -283,24 +292,48 @@ fn save_roots(
 
 #[tauri::command]
 fn start_scan(
-    task: tauri::State<'_, Mutex<Option<ScanTask>>>,
+    task: tauri::State<'_, Arc<Mutex<Option<ScanTask>>>>,
     database: String,
     roots: Vec<String>,
     protect_rules: Vec<String>,
     exclude_rules: Vec<String>,
     min_file_size: i64,
 ) -> Result<String, String> {
+    launch_scan(
+        &task,
+        &database,
+        &roots,
+        &protect_rules,
+        &exclude_rules,
+        min_file_size,
+    )?;
+    Ok("扫描任务已在后台启动。".into())
+}
+
+/// Spawn the background scan. Shared by the manual command and the
+/// real-time watcher (which skips quietly when a scan is already running).
+fn launch_scan(
+    task: &Mutex<Option<ScanTask>>,
+    database: &str,
+    roots: &[String],
+    protect_rules: &[String],
+    exclude_rules: &[String],
+    min_file_size: i64,
+) -> Result<(), String> {
     let mut task = task.lock().map_err(|_| "scan task lock failed")?;
     if task.is_some() {
         return Err("已有扫描任务正在运行".into());
     }
     {
-        let connection = open_database(&database)?;
-        save_setting_list(&connection, "roots", &roots)?;
-        save_setting_list(&connection, "protect_rules", &protect_rules)?;
-        save_setting_list(&connection, "exclude_rules", &exclude_rules)?;
+        let connection = open_database(database)?;
+        save_setting_list(&connection, "roots", roots)?;
+        save_setting_list(&connection, "protect_rules", protect_rules)?;
+        save_setting_list(&connection, "exclude_rules", exclude_rules)?;
     }
-    let roots = roots.into_iter().map(PathBuf::from).collect::<Vec<_>>();
+    let roots = roots.iter().map(PathBuf::from).collect::<Vec<_>>();
+    let protect_rules: Vec<String> = protect_rules.to_vec();
+    let exclude_rules: Vec<String> = exclude_rules.to_vec();
+    let database: String = database.to_string();
     let cancelled = Arc::new(AtomicBool::new(false));
     let state = Arc::new(Mutex::new(ScanState {
         state: "running".into(),
@@ -387,11 +420,13 @@ fn start_scan(
         errors,
         hash_progress,
     });
-    Ok("扫描任务已在后台启动。".into())
+    Ok(())
 }
 
 #[tauri::command]
-fn scan_state(task: tauri::State<'_, Mutex<Option<ScanTask>>>) -> Result<ScanState, String> {
+fn scan_state(
+    task: tauri::State<'_, Arc<Mutex<Option<ScanTask>>>>,
+) -> Result<ScanState, String> {
     let mut task = task.lock().map_err(|_| "scan task lock failed")?;
     let Some(current) = task.as_ref() else {
         return Ok(ScanState {
@@ -1489,6 +1524,113 @@ fn set_strict_verify(database: String, enabled: bool) -> Result<String, String> 
     })
 }
 
+/// Real-time watch mode: persist the preference and (re)start a background
+/// directory watcher per enable. Changes settle for three seconds, then a
+/// debounced incremental scan runs unless one is already in progress.
+#[tauri::command]
+fn set_watch_scan(
+    scan_slot: tauri::State<'_, Arc<Mutex<Option<ScanTask>>>>,
+    watch_slot: tauri::State<'_, Arc<Mutex<Option<WatchTask>>>>,
+    database: String,
+    enabled: bool,
+) -> Result<(), String> {
+    filelens::set_watch_scan(Path::new(&database), enabled)?;
+    // A previous watcher is cancelled before anything else: a re-enable
+    // restarts it with the current roots and rules.
+    if let Some(task) = watch_slot
+        .lock()
+        .map_err(|_| "watch lock failed")?
+        .as_ref()
+    {
+        task.cancel.store(true, Ordering::Relaxed);
+    }
+    if !enabled {
+        return Ok(());
+    }
+    let (roots, protect_rules, exclude_rules, min_file_size) = {
+        let connection = open_database(&database)?;
+        (
+            setting_list(&connection, "roots")?,
+            setting_list(&connection, "protect_rules")?,
+            setting_list(&connection, "exclude_rules")?,
+            setting_value(&connection, "min_file_size")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
+        )
+    };
+    if roots.is_empty() {
+        return Ok(());
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    let watcher_cancel = cancel.clone();
+    let scan_slot = scan_slot.inner().clone();
+    std::thread::spawn(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(tx) {
+            Ok(watcher) => watcher,
+            Err(_) => return,
+        };
+        for root in &roots {
+            if watcher
+                .watch(Path::new(root), notify::RecursiveMode::Recursive)
+                .is_err()
+            {
+                return;
+            }
+        }
+        let relevant = |kind: &EventKind| !matches!(kind, EventKind::Access(_));
+        let mut dirty = false;
+        loop {
+            if watcher_cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            match rx.recv_timeout(std::time::Duration::from_millis(2000)) {
+                Ok(Ok(event)) => {
+                    if relevant(&event.kind) {
+                        dirty = true;
+                    }
+                }
+                Ok(Err(_)) => dirty = true,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if !dirty {
+                        continue;
+                    }
+                    // Settle window: keep collecting until the tree stays
+                    // quiet for three seconds, so bulk copies produce one
+                    // scan instead of hundreds.
+                    loop {
+                        match rx.recv_timeout(std::time::Duration::from_millis(3000)) {
+                            Ok(_) => {}
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                        if watcher_cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                    }
+                    dirty = false;
+                    if watcher_cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let _ = launch_scan(
+                        &scan_slot,
+                        &database,
+                        &roots,
+                        &protect_rules,
+                        &exclude_rules,
+                        min_file_size,
+                    );
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
+    if let Ok(mut slot) = watch_slot.lock() {
+        *slot = Some(WatchTask { cancel });
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn set_usn_scan(database: String, enabled: bool) -> Result<String, String> {
     filelens::set_usn_scan(&PathBuf::from(&database), enabled)?;
@@ -1672,8 +1814,9 @@ fn bulk_state(bulk: tauri::State<'_, Mutex<Option<BulkTask>>>) -> Result<BulkSta
 
 fn main() {
     tauri::Builder::default()
-        .manage(Mutex::new(None::<ScanTask>))
+        .manage(Arc::new(Mutex::new(None::<ScanTask>)))
         .manage(Mutex::new(None::<BulkTask>))
+        .manage(Arc::new(Mutex::new(None::<WatchTask>)))
         .manage(Mutex::new(None::<DuplicateVerifyTask>))
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -1720,6 +1863,7 @@ fn main() {
             hardlink_approved,
             set_strict_verify,
             set_usn_scan,
+            set_watch_scan,
             start_bulk,
             bulk_state,
             restore_to,

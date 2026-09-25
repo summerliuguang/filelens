@@ -10,6 +10,7 @@ pub use implementation::{
     prune_expired_trash, query_groups, recycle_dir_keep_one, restore, restore_batch, restore_to,
     store_pair_verdicts, verify_photo_pairs,
     scan, scan_with_control, scan_with_options, set_approval, set_strict_verify, set_usn_scan,
+    set_watch_scan,
     trash, trash_batch, trash_batch_with_progress, trash_list, trash_paths,
     trash_retention_days, BatchOutcome, DirCount, Group, GroupFile, GroupQuery, GroupSort,
     GroupsPage, HashProgress, MarkStrategy, PairVerdict, ProtectPreview, ScanErrorLog,

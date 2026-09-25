@@ -77,6 +77,7 @@ function App() {
   const [autoScan, setAutoScan] = useState(true);
   const [strictVerify, setStrictVerify] = useState(false);
   const [usnScan, setUsnScan] = useState(false);
+  const [watchScan, setWatchScan] = useState(false);
   const [rootInput, setRootInput] = useState("");
   const [status, setStatus] = useState<Status | null>(null);
   const [theme, setTheme] = useState<ThemeSetting>(loadThemeSetting);
@@ -182,6 +183,15 @@ function App() {
         setAutoScan(project.auto_scan);
         setStrictVerify(project.strict_verify);
         setUsnScan(project.usn_scan);
+        setWatchScan(project.watch_scan);
+        // The watcher lives in the backend layer; after an app restart it
+        // needs one start call, which is a no-op when already watching.
+        if (project.watch_scan) {
+          invoke("set_watch_scan", {
+            database: project.database,
+            enabled: true,
+          }).catch(() => {});
+        }
         // Show the existing index right away; an auto scan then refreshes it
         // in the background instead of leaving the queue empty meanwhile.
         void refresh(project.database, { silent: true });
@@ -692,6 +702,8 @@ function App() {
                 setStrictVerify={setStrictVerify}
                 usnScan={usnScan}
                 setUsnScan={setUsnScan}
+                watchScan={watchScan}
+                setWatchScan={setWatchScan}
                 setDatabase={setDatabase}
                 setTrash={setTrash}
                 setProtectRules={setProtectRules}

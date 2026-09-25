@@ -3053,6 +3053,8 @@ export function Settings({
   setStrictVerify,
   usnScan,
   setUsnScan,
+  watchScan,
+  setWatchScan,
   setDatabase,
   setTrash,
   setProtectRules,
@@ -3081,6 +3083,8 @@ export function Settings({
   setStrictVerify: (value: boolean) => void;
   usnScan: boolean;
   setUsnScan: (value: boolean) => void;
+  watchScan: boolean;
+  setWatchScan: (value: boolean) => void;
   setDatabase: (value: string) => void;
   setTrash: (value: string) => void;
   setProtectRules: (value: string[]) => void;
@@ -3178,6 +3182,20 @@ export function Settings({
       setUsnScan(next);
       return result;
     }, "usn-scan");
+  }
+
+  function toggleWatchScan() {
+    const next = !watchScan;
+    void execute(async () => {
+      await invoke("set_watch_scan", {
+        database,
+        enabled: next,
+      });
+      setWatchScan(next);
+      return next
+        ? "实时监控已开启：扫描目录有变化时会自动增量扫描。"
+        : "实时监控已关闭。";
+    }, "watch-scan");
   }
 
   // The input is in MB for readability; the setting stores bytes.
@@ -3460,6 +3478,19 @@ export function Settings({
           USN 快速扫描（Windows 实验性）
           <small>
             以管理员身份运行时从 NTFS 变更日志读取文件列表，加速大目录扫描；权限不足时自动回退普通扫描，不影响结果。
+          </small>
+        </span>
+      </label>
+      <label className="toggle-row">
+        <input
+          type="checkbox"
+          checked={watchScan}
+          onChange={toggleWatchScan}
+        />
+        <span>
+          实时监控扫描目录（实验性）
+          <small>
+            扫描目录里出现新增、修改或移动后，静置约三秒自动做一次增量扫描，无需手动刷新；关闭应用后监控随之停止。
           </small>
         </span>
       </label>

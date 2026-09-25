@@ -968,6 +968,14 @@ pub fn set_usn_scan(database: &Path, enabled: bool) -> Result<(), String> {
     set_setting(&connection, "usn_scan", if enabled { "1" } else { "0" })
 }
 
+/// Persist the real-time watch preference; the desktop layer owns the actual
+/// watcher lifecycle.
+pub fn set_watch_scan(database: &Path, enabled: bool) -> Result<(), String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    set_setting(&connection, "watch_scan", if enabled { "1" } else { "0" })
+}
+
 /// File list for one root from the NTFS change journal. `None` off Windows;
 /// `Some(Err(..))` whenever the journal cannot be read (permissions, non-NTFS
 /// volume) so the caller can walk the directory tree instead.

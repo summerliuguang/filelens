@@ -112,6 +112,7 @@ export type ProjectState = ProjectConfig & {
   auto_scan: boolean;
   strict_verify: boolean;
   usn_scan: boolean;
+  watch_scan: boolean;
 };
 
 export type ScanErrorSample = { path: string; error: string };
