@@ -371,6 +371,9 @@ pub struct ScanSummary {
     pub errors: u64,
     pub missing: u64,
     pub pruned: u64,
+    /// Long-absent index rows (90 days, never touched by an operation)
+    /// removed as housekeeping after this scan.
+    pub index_pruned: u64,
     /// Present images whose photo fingerprint had to be recomputed this scan
     /// (e.g. after a fingerprint-algorithm migration), so the UI can explain
     /// why a routine incremental scan takes longer than usual.
@@ -527,17 +530,19 @@ pub fn scan_with_control(
     }
     let removed = mark_missing_absent(&connection, &scanned_roots, scan_started)?;
     let pruned = prune_expired_trash_with(&connection, now_seconds()?)?;
+    let index_pruned = prune_absent_rows(&connection)?;
     set_setting(&connection, "last_scan_at", &now_seconds()?.to_string())?;
     if !silent {
         println!(
-            "Scanned: {} new, {} unchanged, {} updated, {} skipped, {} errors, {} missing, {} expired recycled.",
+            "Scanned: {} new, {} unchanged, {} updated, {} skipped, {} errors, {} missing, {} expired recycled, {} stale index rows.",
             counters.new,
             counters.unchanged,
             counters.updated,
             counters.skipped,
             counters.errors,
             removed,
-            pruned
+            pruned,
+            index_pruned
         );
         if !failed_roots.is_empty() {
             println!("Skipped missing roots: {}", failed_roots.join(", "));
@@ -551,6 +556,7 @@ pub fn scan_with_control(
         errors: counters.errors,
         missing: removed,
         pruned,
+        index_pruned,
         fingerprint_rebuild,
         failed_roots,
     })
@@ -630,6 +636,37 @@ fn mark_missing_absent(
         removed += changed as u64;
     }
     Ok(removed)
+}
+
+/// Index housekeeping: absent rows (present = 0) that have stayed stale for
+/// 90 days are dropped — but only when no operation ever referenced them, so
+/// the recycle-history anchors that restore depends on are never touched.
+/// Rows merely disappeared externally (deleted outside the app) re-hash for
+/// free if they ever come back after this horizon.
+fn prune_absent_rows(connection: &Connection) -> Result<u64, String> {
+    let cutoff = now_seconds()? - 90 * 86_400;
+    connection.execute(
+        "DELETE FROM photo_fingerprints WHERE file_id IN \
+           (SELECT id FROM files WHERE present = 0 AND scanned_at < ?1 \
+             AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.file_id = files.id))",
+        params![cutoff],
+    )
+    .map_err(|e| e.to_string())?;
+    connection.execute(
+        "DELETE FROM document_fingerprints WHERE file_id IN \
+           (SELECT id FROM files WHERE present = 0 AND scanned_at < ?1 \
+             AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.file_id = files.id))",
+        params![cutoff],
+    )
+    .map_err(|e| e.to_string())?;
+    let changed = connection
+        .execute(
+            "DELETE FROM files WHERE present = 0 AND scanned_at < ?1 \
+             AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.file_id = files.id)",
+            params![cutoff],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(changed as u64)
 }
 
 fn like_escape(value: &str) -> String {
@@ -5519,6 +5556,77 @@ mod tests {
         let (_, noisy_phash) = perceptual_hash(&noisy).unwrap();
         let distance = (plain_phash ^ noisy_phash).count_ones();
         assert!(distance > 8, "unrelated images too close: {distance}/64");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn stale_absent_rows_are_pruned_but_history_anchors_survive() {
+        let directory = test_directory("absent-prune");
+        let source = directory.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("gone.txt"), b"vanishing content").unwrap();
+        fs::write(source.join("keeper.txt"), b"kept content").unwrap();
+        let database = directory.join("index.db");
+        init(&database, &directory.join("recycle")).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+
+        // Both files vanish externally; the scan marks their rows absent.
+        // Absence marking compares scanned_at < scan_started with second
+        // granularity, so the follow-up scan must land in a later second.
+        fs::remove_file(source.join("gone.txt")).unwrap();
+        fs::remove_file(source.join("keeper.txt")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+
+        // Backdate the absent rows past the 90-day horizon, then anchor
+        // keeper.txt the way a real recycle would: an operations row.
+        let connection = open_database(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE files SET scanned_at = scanned_at - 91*86400 WHERE present = 0",
+                [],
+            )
+            .unwrap();
+        let keeper_id: i64 = connection
+            .query_row(
+                "SELECT id FROM files WHERE path LIKE '%keeper.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at) \
+                 VALUES(?1, 'x', 'y', 'z', 'trashed', 0)",
+                params![keeper_id],
+            )
+            .unwrap();
+        drop(connection);
+
+        let pruned = {
+            let connection = open_database(&database).unwrap();
+            let pruned = prune_absent_rows(&connection).unwrap();
+            drop(connection);
+            pruned
+        };
+        assert_eq!(1, pruned, "only the anchor-free absent row is pruned");
+        let connection = open_database(&database).unwrap();
+        let gone_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path LIKE '%gone.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let keeper_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path LIKE '%keeper.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(0, gone_rows, "anchor-free absent row is deleted");
+        assert_eq!(1, keeper_rows, "history anchor row survives");
         let _ = fs::remove_dir_all(directory);
     }
 

@@ -389,6 +389,12 @@ fn launch_scan(
                             summary.pruned
                         ));
                     }
+                    if summary.index_pruned > 0 {
+                        message.push_str(&format!(
+                            " 已清理 {} 条 90 天未更新的缺席索引记录。",
+                            summary.index_pruned
+                        ));
+                    }
                     if !summary.failed_roots.is_empty() {
                         message.push_str(&format!(
                             " 跳过 {} 个无效扫描目录。",
