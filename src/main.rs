@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// Latest schema version this build understands. Older databases are
 /// upgraded stepwise through MIGRATIONS on open; newer ones are rejected so a
 /// downgrade can never misread an unknown schema.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const COPY_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const QUICK_HASH_CHUNK: u64 = 64 * 1024;
 /// Files above this size get the two-stage hash: quick fingerprint first,
@@ -71,6 +71,12 @@ const MIGRATIONS: &[&str] = &[
        checked_at INTEGER NOT NULL,
        PRIMARY KEY (path_a, path_b)
      );",
+    // v6 -> v7: identity lookups for rename/move detection. A file that
+    // changed path since the last scan is matched back to its old row by
+    // NTFS file reference (Windows) or device/inode (POSIX), so moves do
+    // not pay a full re-hash.
+    "CREATE INDEX IF NOT EXISTS files_frn ON files(frn);
+     CREATE INDEX IF NOT EXISTS files_dev_ino ON files(dev, inode);",
 ];
 
 fn create_schema_sql() -> &'static str {
@@ -134,7 +140,9 @@ fn create_schema_sql() -> &'static str {
        identical INTEGER NOT NULL,
        checked_at INTEGER NOT NULL,
        PRIMARY KEY (path_a, path_b)
-     );"
+     );
+     CREATE INDEX IF NOT EXISTS files_frn ON files(frn);
+     CREATE INDEX IF NOT EXISTS files_dev_ino ON files(dev, inode);"
 }
 
 #[derive(Parser)]
@@ -676,6 +684,10 @@ enum WorkResult {
     Skipped,
     WalkError(String),
     Processed(Result<ProcessedEntry, (String, String)>),
+    /// A file that changed path since the last scan, already matched back to
+    /// its previous index row: the writer re-points the row in place instead
+    /// of re-hashing the content.
+    Moved { path: String, file_id: i64 },
 }
 
 /// Hash and fingerprint one file on a worker thread. Pure file I/O: the
@@ -710,6 +722,10 @@ fn process_file(path: PathBuf, hash_progress: Option<&HashProgress>) -> WorkResu
         let photo = perceptual_hash(&path);
         let document = document_simhash(&path);
         let (dev, inode) = device_inode(&metadata);
+        #[cfg(windows)]
+        let frn = i64::try_from(usn::file_reference_of(&path).unwrap_or(0)).unwrap_or(0);
+        #[cfg(not(windows))]
+        let frn = 0;
         Ok(ProcessedEntry {
             path_text: path_text.clone(),
             size,
@@ -718,7 +734,7 @@ fn process_file(path: PathBuf, hash_progress: Option<&HashProgress>) -> WorkResu
             quick_hash,
             dev,
             inode,
-            frn: 0,
+            frn,
             photo,
             document,
         })
@@ -857,10 +873,63 @@ fn dispatch_path(
         let _ = result_tx.send(WorkResult::Unchanged(
             path.to_string_lossy().into_owned(),
         ));
+    } else if let Some(file_id) = find_moved_row(connection, path) {
+        // The content was not re-hashed: the writer only re-points the old
+        // row (path and flags), keeping hash and fingerprints via file_id.
+        let _ = result_tx.send(WorkResult::Moved {
+            path: path.to_string_lossy().into_owned(),
+            file_id,
+        });
     } else if work_tx.send(path.to_path_buf()).is_err() {
         // Workers only exit early on cancellation; a send error surfaces as
         // a cancelled scan on the walker's own next check.
     }
+}
+
+/// The previous index row for a file whose path changed since the last scan:
+/// matched by NTFS file reference on Windows and by device/inode on POSIX,
+/// with size and mtime still equal (a pure rename preserves both). None when
+/// the platform cannot identify files this way or nothing matches.
+#[cfg(windows)]
+fn find_moved_row(connection: &Connection, path: &Path) -> Option<i64> {
+    let metadata = fs::metadata(path).ok()?;
+    let size = i64::try_from(metadata.len()).ok()?;
+    let modified = unix_seconds(metadata.modified().ok()?).ok()?;
+    let frn = i64::try_from(usn::file_reference_of(path).ok()?).ok()?;
+    if frn == 0 {
+        return None;
+    }
+    connection
+        .query_row(
+            "SELECT id FROM files WHERE present = 1 AND frn = ?1 AND size = ?2 \
+             AND modified = ?3 AND path <> ?4 LIMIT 1",
+            params![frn, size, modified, path.to_string_lossy()],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+}
+
+#[cfg(not(windows))]
+fn find_moved_row(connection: &Connection, path: &Path) -> Option<i64> {
+    let metadata = fs::metadata(path).ok()?;
+    let size = i64::try_from(metadata.len()).ok()?;
+    let modified = unix_seconds(metadata.modified().ok()?).ok()?;
+    let (dev, inode) = device_inode(&metadata);
+    if dev == 0 || inode == 0 {
+        return None;
+    }
+    connection
+        .query_row(
+            "SELECT id FROM files WHERE present = 1 AND dev = ?1 AND inode = ?2 \
+             AND size = ?3 AND modified = ?4 AND path <> ?5 LIMIT 1",
+            params![dev, inode, size, modified, path.to_string_lossy()],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
 }
 
 // --- Optional USN fast scan (Windows) ----------------------------------------
@@ -1104,7 +1173,7 @@ mod usn {
 
     /// NTFS file reference number of an existing directory (no access needed,
     /// backup-semantics open).
-    fn file_reference_of(path: &Path) -> Result<u64, String> {
+    pub(super) fn file_reference_of(path: &Path) -> Result<u64, String> {
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
         let handle = unsafe {
             CreateFileW(
@@ -1334,6 +1403,7 @@ fn run_parallel_scan(
                 WorkResult::WalkError(path) => Some(path.clone()),
                 WorkResult::Processed(Ok(entry)) => Some(entry.path_text.clone()),
                 WorkResult::Processed(Err((path, _))) => Some(path.clone()),
+                WorkResult::Moved { path, .. } => Some(path.clone()),
                 WorkResult::Skipped => None,
             };
             match result {
@@ -1344,6 +1414,23 @@ fn run_parallel_scan(
                     )
                     .map_err(|e| e.to_string())?;
                     counters.unchanged += 1;
+                }
+                WorkResult::Moved { path, file_id } => {
+                    // Renames and moves keep hash and fingerprints: only the
+                    // row's location and flags are refreshed. Protection is
+                    // re-evaluated for the new path so a file moved into a
+                    // protected subtree is covered immediately.
+                    connection.execute(
+                        "UPDATE files SET path=?1, present=1, approved=0, protected=?2, scanned_at=?3 WHERE id=?4",
+                        params![
+                            path,
+                            is_protected_path(&path, protect) as i64,
+                            now_seconds()?,
+                            file_id
+                        ],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    counters.updated += 1;
                 }
                 WorkResult::Skipped => counters.skipped += 1,
                 WorkResult::WalkError(path) => {
@@ -5341,6 +5428,83 @@ mod tests {
         let (_, noisy_phash) = perceptual_hash(&noisy).unwrap();
         let distance = (plain_phash ^ noisy_phash).count_ones();
         assert!(distance > 8, "unrelated images too close: {distance}/64");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn scan_inherits_renamed_file_without_rehash() {
+        let directory = test_directory("rename-detect");
+        let source = directory.join("source");
+        fs::create_dir_all(&source).unwrap();
+        image::RgbImage::from_fn(48, 48, |x, y| {
+            if x > y {
+                image::Rgb([220, 220, 40])
+            } else {
+                image::Rgb([30, 30, 90])
+            }
+        })
+        .save(source.join("pic.png"))
+        .unwrap();
+        fs::write(source.join("note.txt"), b"note").unwrap();
+        let database = directory.join("index.db");
+        init(&database, &directory.join("recycle")).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+
+        let connection = open_database(&database).unwrap();
+        let pic_id: i64 = connection
+            .query_row("SELECT id FROM files WHERE path LIKE '%pic.png'", [], |r| r.get(0))
+            .unwrap();
+        let note_id: i64 = connection
+            .query_row("SELECT id FROM files WHERE path LIKE '%note.txt'", [], |r| r.get(0))
+            .unwrap();
+        let fingerprint_id: i64 = connection
+            .query_row("SELECT file_id FROM photo_fingerprints", [], |r| r.get(0))
+            .unwrap();
+        let pic_hash: String = connection
+            .query_row("SELECT hash FROM files WHERE id=?1", params![pic_id], |r| r.get(0))
+            .unwrap();
+        drop(connection);
+
+        // Rename both files and rescan: the rows must keep their identity
+        // (same id, hash and fingerprint) under the new paths instead of
+        // appearing as a new row plus an absent one.
+        fs::rename(source.join("pic.png"), source.join("pic-moved.png")).unwrap();
+        fs::rename(source.join("note.txt"), source.join("note-moved.txt")).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+
+        let connection = open_database(&database).unwrap();
+        let rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(2, rows, "a rename must not duplicate or drop rows");
+        let new_pic_id: i64 = connection
+            .query_row(
+                "SELECT id FROM files WHERE path LIKE '%pic-moved.png'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let new_note_id: i64 = connection
+            .query_row(
+                "SELECT id FROM files WHERE path LIKE '%note-moved.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pic_id, new_pic_id, "image row keeps its file_id");
+        assert_eq!(note_id, new_note_id, "document row keeps its file_id");
+        let fingerprint_id_after: i64 = connection
+            .query_row("SELECT file_id FROM photo_fingerprints", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fingerprint_id, fingerprint_id_after, "no fingerprint rebuild");
+        let hash_after: String = connection
+            .query_row(
+                "SELECT hash FROM files WHERE id=?1",
+                params![new_pic_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pic_hash, hash_after, "content hash inherited, not recomputed");
         let _ = fs::remove_dir_all(directory);
     }
 
