@@ -1005,6 +1005,17 @@ pub fn set_usn_scan(database: &Path, enabled: bool) -> Result<(), String> {
     set_setting(&connection, "usn_scan", if enabled { "1" } else { "0" })
 }
 
+/// Similar-photo decision threshold: the maximum pHash distance for the
+/// "similar" view. Stored clamped so a stray value can neither flood the
+/// review queue nor silently hide everything; default 10.
+pub fn set_similar_threshold(database: &Path, max_distance: i64) -> Result<i64, String> {
+    let clamped = max_distance.clamp(4, 20);
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    set_setting(&connection, "similar_phash_max", &clamped.to_string())?;
+    Ok(clamped)
+}
+
 /// Persist the real-time watch preference; the desktop layer owns the actual
 /// watcher lifecycle.
 pub fn set_watch_scan(database: &Path, enabled: bool) -> Result<(), String> {
@@ -5556,6 +5567,30 @@ mod tests {
         let (_, noisy_phash) = perceptual_hash(&noisy).unwrap();
         let distance = (plain_phash ^ noisy_phash).count_ones();
         assert!(distance > 8, "unrelated images too close: {distance}/64");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn similar_threshold_setting_clamps_and_persists() {
+        let directory = test_directory("similar-threshold");
+        let database = directory.join("index.db");
+        init(&database, &directory.join("recycle")).unwrap();
+        assert_eq!(12, set_similar_threshold(&database, 12).unwrap());
+        assert_eq!(4, set_similar_threshold(&database, 0).unwrap());
+        assert_eq!(20, set_similar_threshold(&database, 999).unwrap());
+        let stored: i64 = {
+            let connection = open_database(&database).unwrap();
+            connection
+                .query_row(
+                    "SELECT value FROM settings WHERE key='similar_phash_max'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+        assert_eq!(20, stored);
         let _ = fs::remove_dir_all(directory);
     }
 

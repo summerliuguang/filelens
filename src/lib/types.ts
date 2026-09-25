@@ -113,6 +113,7 @@ export type ProjectState = ProjectConfig & {
   strict_verify: boolean;
   usn_scan: boolean;
   watch_scan: boolean;
+  similar_threshold: number;
 };
 
 export type ScanErrorSample = { path: string; error: string };

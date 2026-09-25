@@ -117,6 +117,7 @@ struct ProjectState {
     strict_verify: bool,
     usn_scan: bool,
     watch_scan: bool,
+    similar_threshold: i64,
 }
 
 #[derive(Clone, Serialize)]
@@ -248,6 +249,9 @@ fn open_project(app: tauri::AppHandle) -> Result<ProjectState, String> {
         strict_verify: setting_flag(&connection, "strict_verify", false),
         usn_scan: setting_flag(&connection, "usn_scan", false),
         watch_scan: setting_flag(&connection, "watch_scan", false),
+        similar_threshold: setting_value(&connection, "similar_phash_max")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(10),
     })
 }
 
@@ -1122,6 +1126,9 @@ fn similar_photos(
     kind: Option<String>,
 ) -> Result<SimilarPhotosPage, String> {
     let connection = open_database(&database)?;
+    let phash_max: u32 = setting_value(&connection, "similar_phash_max")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(10);
     let entries = load_fingerprints(&connection, "photo_fingerprints", "dhash", Some("phash"))?;
     let (min_distance, max_distance, extra_max_distance) = if kind.as_deref() == Some("duplicate")
     {
@@ -1134,7 +1141,7 @@ fn similar_photos(
         &PHOTO_CHUNKS,
         min_distance,
         max_distance,
-        extra_max_distance,
+        extra_max_distance.map(|_| phash_max),
     );
     Ok(SimilarPhotosPage {
         pairs: pairs
@@ -1645,6 +1652,13 @@ fn set_watch_scan(
     Ok(())
 }
 
+/// Similar-photo decision threshold (pHash distance cap for the "similar"
+/// view); returns the stored clamped value.
+#[tauri::command]
+fn set_similar_threshold(database: String, max_distance: i64) -> Result<i64, String> {
+    filelens::set_similar_threshold(Path::new(&database), max_distance)
+}
+
 #[tauri::command]
 fn set_usn_scan(database: String, enabled: bool) -> Result<String, String> {
     filelens::set_usn_scan(&PathBuf::from(&database), enabled)?;
@@ -1876,6 +1890,7 @@ fn main() {
             approve_filtered,
             hardlink_approved,
             set_strict_verify,
+            set_similar_threshold,
             set_usn_scan,
             set_watch_scan,
             start_bulk,

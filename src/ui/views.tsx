@@ -3055,6 +3055,8 @@ export function Settings({
   setUsnScan,
   watchScan,
   setWatchScan,
+  similarThreshold,
+  setSimilarThreshold,
   setDatabase,
   setTrash,
   setProtectRules,
@@ -3064,6 +3066,7 @@ export function Settings({
   setAutoScan,
   initialize,
   execute,
+  refresh,
   notify,
   busy,
   busyKeys,
@@ -3085,6 +3088,8 @@ export function Settings({
   setUsnScan: (value: boolean) => void;
   watchScan: boolean;
   setWatchScan: (value: boolean) => void;
+  similarThreshold: number;
+  setSimilarThreshold: (value: number) => void;
   setDatabase: (value: string) => void;
   setTrash: (value: string) => void;
   setProtectRules: (value: string[]) => void;
@@ -3094,6 +3099,7 @@ export function Settings({
   setAutoScan: (value: boolean) => void;
   initialize: () => Promise<void>;
   execute: (action: () => Promise<string>, key?: string) => Promise<void>;
+  refresh: () => Promise<void>;
   notify: (message: string) => void;
   busy: boolean;
   busyKeys: ReadonlySet<string>;
@@ -3108,6 +3114,32 @@ export function Settings({
   );
   const [retentionInput, setRetentionInput] = useState(String(retentionDays));
   const [cacheStats, setCacheStats] = useState<ThumbnailCacheStats | null>(null);
+  const [thresholdInput, setThresholdInput] = useState(String(similarThreshold));
+
+  useEffect(() => {
+    setThresholdInput(String(similarThreshold));
+  }, [similarThreshold]);
+
+  // The threshold reshapes the similar-photo queue immediately: persist,
+  // mirror to state, then refresh so the list reflects the new cutoff.
+  function saveSimilarThreshold() {
+    const value = Number.parseInt(thresholdInput.trim(), 10);
+    if (Number.isNaN(value) || value < 4 || value > 20) {
+      notify("相似判定阈值需为 4 到 20 之间的整数。");
+      setThresholdInput(String(similarThreshold));
+      return;
+    }
+    if (value === similarThreshold) return;
+    void execute(async () => {
+      const stored = await invoke<number>("set_similar_threshold", {
+        database,
+        maxDistance: value,
+      });
+      setSimilarThreshold(stored);
+      await refresh();
+      return `相似判定阈值已设为 ${stored}，相似照片列表已按新阈值刷新。`;
+    }, "similar-threshold");
+  }
 
   // The cache panel loads lazily (one directory walk) and refreshes after a
   // clear; failures leave the panel blank instead of disturbing the user.
@@ -3480,6 +3512,20 @@ export function Settings({
             以管理员身份运行时从 NTFS 变更日志读取文件列表，加速大目录扫描；权限不足时自动回退普通扫描，不影响结果。
           </small>
         </span>
+      </label>
+      <label>
+        相似判定阈值（pHash 距离上限，4–20）
+        <input
+          value={thresholdInput}
+          onChange={(event) => setThresholdInput(event.target.value)}
+          onBlur={saveSimilarThreshold}
+          onKeyDown={(event) => event.key === "Enter" && saveSimilarThreshold()}
+          inputMode="numeric"
+          placeholder="10"
+        />
+        <small className="field-hint">
+          越小越严格（相似候选更少更准），越大越宽松；修改后相似照片列表立即按新阈值刷新。
+        </small>
       </label>
       <label className="toggle-row">
         <input

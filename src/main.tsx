@@ -78,6 +78,7 @@ function App() {
   const [strictVerify, setStrictVerify] = useState(false);
   const [usnScan, setUsnScan] = useState(false);
   const [watchScan, setWatchScan] = useState(false);
+  const [similarThreshold, setSimilarThreshold] = useState(10);
   const [rootInput, setRootInput] = useState("");
   const [status, setStatus] = useState<Status | null>(null);
   const [theme, setTheme] = useState<ThemeSetting>(loadThemeSetting);
@@ -184,6 +185,7 @@ function App() {
         setStrictVerify(project.strict_verify);
         setUsnScan(project.usn_scan);
         setWatchScan(project.watch_scan);
+        setSimilarThreshold(project.similar_threshold);
         // The watcher lives in the backend layer; after an app restart it
         // needs one start call, which is a no-op when already watching.
         if (project.watch_scan) {
@@ -704,6 +706,9 @@ function App() {
                 setUsnScan={setUsnScan}
                 watchScan={watchScan}
                 setWatchScan={setWatchScan}
+                similarThreshold={similarThreshold}
+                setSimilarThreshold={setSimilarThreshold}
+                refresh={refresh}
                 setDatabase={setDatabase}
                 setTrash={setTrash}
                 setProtectRules={setProtectRules}
