@@ -9,6 +9,7 @@ description = "Local-first personal file duplicate finder"
 blake3 = "1.8"
 clap = { version = "4.5", features = ["derive"] }
 dunce = "1.0"
+kamadak-exif = "0.6"
 image = "0.25"
 rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }

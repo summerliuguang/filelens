@@ -44,6 +44,9 @@ struct SimilarPhoto {
     first_modified: i64,
     second_size: i64,
     second_modified: i64,
+    /// EXIF capture time of each side (unix seconds; 0 = unknown).
+    first_taken: i64,
+    second_taken: i64,
 }
 #[derive(Serialize)]
 struct SimilarPhotosPage {
@@ -942,6 +945,8 @@ struct FingerprintEntry {
     extra: u64,
     size: i64,
     modified: i64,
+    /// EXIF capture time (unix seconds; 0 = unknown).
+    exif_taken: i64,
 }
 
 /// Disjoint 64-bit chunks used for candidate bucketing. Pigeonhole: with N
@@ -981,7 +986,7 @@ fn load_fingerprints(
         .unwrap_or_else(|| "0".to_string());
     let mut statement = connection
         .prepare(&format!(
-            "SELECT a.path, a.hash, f.{column}, {extra_expression}, a.size, a.modified \
+            "SELECT a.path, a.hash, f.{column}, {extra_expression}, a.size, a.modified, a.exif_taken \
              FROM {table} f JOIN files a ON a.id = f.file_id WHERE a.present = 1"
         ))
         .map_err(|e| e.to_string())?;
@@ -994,6 +999,7 @@ fn load_fingerprints(
                 extra: row.get::<_, i64>(3)? as u64,
                 size: row.get(4)?,
                 modified: row.get(5)?,
+                exif_taken: row.get(6)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -1101,6 +1107,8 @@ fn similar_photos(
                 first_modified: entries[a].modified,
                 second_size: entries[b].size,
                 second_modified: entries[b].modified,
+                first_taken: entries[a].exif_taken,
+                second_taken: entries[b].exif_taken,
             })
             .collect(),
         total,

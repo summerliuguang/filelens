@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// Latest schema version this build understands. Older databases are
 /// upgraded stepwise through MIGRATIONS on open; newer ones are rejected so a
 /// downgrade can never misread an unknown schema.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const COPY_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const QUICK_HASH_CHUNK: u64 = 64 * 1024;
 /// Files above this size get the two-stage hash: quick fingerprint first,
@@ -77,6 +77,10 @@ const MIGRATIONS: &[&str] = &[
     // not pay a full re-hash.
     "CREATE INDEX IF NOT EXISTS files_frn ON files(frn);
      CREATE INDEX IF NOT EXISTS files_dev_ino ON files(dev, inode);",
+    // v7 -> v8: EXIF capture time for images (unix seconds, 0 = unknown),
+    // parsed during the scan for containers that carry EXIF. Kept sticky on
+    // rescan (a failed parse does not erase a previously read value).
+    "ALTER TABLE files ADD COLUMN exif_taken INTEGER NOT NULL DEFAULT 0;",
 ];
 
 fn create_schema_sql() -> &'static str {
@@ -94,7 +98,8 @@ fn create_schema_sql() -> &'static str {
        quick_hash TEXT,
        dev INTEGER NOT NULL DEFAULT 0,
        inode INTEGER NOT NULL DEFAULT 0,
-       frn INTEGER NOT NULL DEFAULT 0
+       frn INTEGER NOT NULL DEFAULT 0,
+       exif_taken INTEGER NOT NULL DEFAULT 0
      );
      CREATE INDEX IF NOT EXISTS files_hash_size_present ON files(hash, size, present);
      CREATE INDEX IF NOT EXISTS files_size_quick_hash ON files(size, quick_hash);
@@ -656,9 +661,11 @@ struct ProcessedEntry {
     /// the platform has no such metadata.
     dev: i64,
     inode: i64,
-    /// NTFS file reference number, populated only by the USN fast scan;
-    /// 0 elsewhere.
+    /// NTFS file reference number, populated by the scan workers on
+    /// Windows; 0 elsewhere.
     frn: i64,
+    /// EXIF capture time (unix seconds; 0 = unknown or non-image).
+    exif_taken: i64,
     photo: Option<(u64, u64)>,
     document: Option<(u64, i64)>,
 }
@@ -726,6 +733,11 @@ fn process_file(path: PathBuf, hash_progress: Option<&HashProgress>) -> WorkResu
         let frn = i64::try_from(usn::file_reference_of(&path).unwrap_or(0)).unwrap_or(0);
         #[cfg(not(windows))]
         let frn = 0;
+        let exif_taken = if is_image_path(&path) {
+            exif_taken_seconds(&path)
+        } else {
+            0
+        };
         Ok(ProcessedEntry {
             path_text: path_text.clone(),
             size,
@@ -735,6 +747,7 @@ fn process_file(path: PathBuf, hash_progress: Option<&HashProgress>) -> WorkResu
             dev,
             inode,
             frn,
+            exif_taken,
             photo,
             document,
         })
@@ -1279,9 +1292,9 @@ fn write_entry(
         IndexOutcome::New
     };
     connection.execute(
-        "INSERT INTO files(path,size,modified,hash,protected,approved,present,scanned_at,quick_hash,dev,inode,frn) VALUES(?1,?2,?3,?4,?5,0,1,?6,?7,?8,?9,?10)
-         ON CONFLICT(path) DO UPDATE SET size=excluded.size,modified=excluded.modified,hash=excluded.hash,protected=excluded.protected,approved=0,present=1,scanned_at=excluded.scanned_at,quick_hash=excluded.quick_hash,dev=excluded.dev,inode=excluded.inode,frn=CASE WHEN excluded.frn<>0 THEN excluded.frn ELSE files.frn END",
-        params![entry.path_text, entry.size, entry.modified, entry.hash, is_protected as i64, now, entry.quick_hash, entry.dev, entry.inode, entry.frn],
+        "INSERT INTO files(path,size,modified,hash,protected,approved,present,scanned_at,quick_hash,dev,inode,frn,exif_taken) VALUES(?1,?2,?3,?4,?5,0,1,?6,?7,?8,?9,?10,?11)
+         ON CONFLICT(path) DO UPDATE SET size=excluded.size,modified=excluded.modified,hash=excluded.hash,protected=excluded.protected,approved=0,present=1,scanned_at=excluded.scanned_at,quick_hash=excluded.quick_hash,dev=excluded.dev,inode=excluded.inode,frn=CASE WHEN excluded.frn<>0 THEN excluded.frn ELSE files.frn END,exif_taken=CASE WHEN excluded.exif_taken<>0 THEN excluded.exif_taken ELSE files.exif_taken END",
+        params![entry.path_text, entry.size, entry.modified, entry.hash, is_protected as i64, now, entry.quick_hash, entry.dev, entry.inode, entry.frn, entry.exif_taken],
     )
     .map_err(|e| e.to_string())?;
     connection.execute(
@@ -1629,6 +1642,68 @@ fn quick_hash_file(path: &Path) -> Result<String, String> {
         remaining -= count as u64;
     }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// EXIF capture time (DateTimeOriginal) as unix seconds, 0 when the file
+/// carries no readable EXIF. Only JPEG/TIFF-style containers are tried; the
+/// timestamp is recorded without timezone conversion, which keeps comparisons
+/// between copies of the same photo stable.
+fn exif_taken_seconds(path: &Path) -> i64 {
+    let try_read = || -> Option<i64> {
+        let file = File::open(path).ok()?;
+        let exif = exif::Reader::new()
+            .read_from_container(&mut std::io::BufReader::new(file))
+            .ok()?;
+        let field = exif.get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY)?;
+        match &field.value {
+            exif::Value::Ascii(parts) => {
+                let raw = parts.first()?;
+                Some(parse_exif_datetime(&String::from_utf8_lossy(raw)))
+            }
+            _ => None,
+        }
+    };
+    try_read().unwrap_or(0)
+}
+
+/// "YYYY:MM:DD HH:MM:SS" (EXIF ASCII date) to unix seconds; 0 on anything
+/// unexpected.
+fn parse_exif_datetime(text: &str) -> i64 {
+    fn digits(text: &str, range: std::ops::Range<usize>) -> Option<i64> {
+        text.get(range)?.parse::<i64>().ok()
+    }
+    let text = text.trim_end_matches('\0').trim();
+    if text.len() < 19 {
+        return 0;
+    }
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        digits(text, 0..4),
+        digits(text, 5..7),
+        digits(text, 8..10),
+        digits(text, 11..13),
+        digits(text, 14..16),
+        digits(text, 17..19),
+    ) else {
+        return 0;
+    };
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return 0;
+    }
+    days_from_civil(year, month, day) * 86_400
+        + hour * 3_600
+        + minute * 60
+        + second
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date (Hinnant's
+/// days_from_civil), so date math needs no timezone or calendar library.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 fn perceptual_hash(path: &Path) -> Option<(u64, u64)> {
@@ -5429,6 +5504,66 @@ mod tests {
         let distance = (plain_phash ^ noisy_phash).count_ones();
         assert!(distance > 8, "unrelated images too close: {distance}/64");
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn exif_capture_time_is_parsed_and_stored() {
+        let directory = test_directory("exif-taken");
+        let source = directory.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let photo = source.join("shot.jpg");
+        craft_exif_jpeg(
+            &photo,
+            "2023:07:01 12:00:00",
+        );
+        let expected = days_from_civil(2023, 7, 1) * 86_400 + 12 * 3_600;
+        assert_eq!(expected, exif_taken_seconds(&photo));
+        let database = directory.join("index.db");
+        init(&database, &directory.join("recycle")).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        let connection = open_database(&database).unwrap();
+        let stored: i64 = connection
+            .query_row(
+                "SELECT exif_taken FROM files WHERE path LIKE '%shot.jpg'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(expected, stored);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    /// A minimal JPEG (SOI + APP1 + EOI) whose EXIF payload carries
+    /// DateTimeOriginal for the given timestamp.
+    fn craft_exif_jpeg(path: &Path, datetime: &str) {
+        let mut tiff: Vec<u8> = Vec::new();
+        tiff.extend(b"II");
+        tiff.extend(42_u16.to_le_bytes());
+        tiff.extend(8_u32.to_le_bytes());
+        // IFD0: a single pointer to the Exif sub-IFD at offset 26.
+        tiff.extend(1_u16.to_le_bytes());
+        tiff.extend(0x8769_u16.to_le_bytes());
+        tiff.extend(4_u16.to_le_bytes());
+        tiff.extend(1_u32.to_le_bytes());
+        tiff.extend(26_u32.to_le_bytes());
+        tiff.extend(0_u32.to_le_bytes());
+        // Exif sub-IFD at 26: DateTimeOriginal ASCII, value at offset 44.
+        tiff.extend(1_u16.to_le_bytes());
+        tiff.extend(0x9003_u16.to_le_bytes());
+        tiff.extend(2_u16.to_le_bytes());
+        tiff.extend((datetime.len() as u32 + 1).to_le_bytes());
+        tiff.extend(44_u32.to_le_bytes());
+        tiff.extend(0_u32.to_le_bytes());
+        tiff.extend(datetime.as_bytes());
+        tiff.push(0);
+
+        let mut jpeg: Vec<u8> = vec![0xFF, 0xD8];
+        jpeg.extend(0xFF_E1_u16.to_be_bytes());
+        jpeg.extend(((6 + tiff.len() + 2) as u16).to_be_bytes());
+        jpeg.extend(b"Exif\0\0");
+        jpeg.extend(&tiff);
+        jpeg.extend([0xFF, 0xD9]);
+        fs::write(path, jpeg).unwrap();
     }
 
     #[test]

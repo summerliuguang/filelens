@@ -142,6 +142,9 @@ export type SimilarPhoto = {
   first_modified: number;
   second_size: number;
   second_modified: number;
+  /** EXIF capture time of each side (unix seconds; 0 = unknown). */
+  first_taken: number;
+  second_taken: number;
 };
 
 /** Background pixel verification of the duplicate-photo candidates. */

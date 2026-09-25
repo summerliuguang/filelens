@@ -1404,6 +1404,7 @@ export function SimilarPhotos({
               checked: MERGE_DEFAULT_PREFIXES.has(key),
             })),
         },
+        { kind: "exif", enabled: true },
         { kind: "time", enabled: true },
         { kind: "prefer", enabled: false, side: null },
       ],
@@ -2187,9 +2188,11 @@ export function SimilarPhotos({
                           <b>
                             {condition.kind === "prefix"
                               ? "前缀匹配（保留文件名开头匹配的照片）"
-                              : condition.kind === "time"
-                                ? "时间较新（保留修改时间较晚的照片）"
-                                : "优先指定目录"}
+                              : condition.kind === "exif"
+                                ? "EXIF 拍摄时间（有拍摄信息的优先，更早的原图优先）"
+                                : condition.kind === "time"
+                                  ? "时间较新（保留修改时间较晚的照片）"
+                                  : "优先指定目录"}
                           </b>
                           {condition.kind === "prefix" && condition.enabled && (
                             <>
@@ -2406,6 +2409,7 @@ type MergeCondition =
       enabled: boolean;
       prefixes: { key: string; label: string; count: number; checked: boolean }[];
     }
+  | { kind: "exif"; enabled: boolean }
   | { kind: "time"; enabled: boolean }
   | { kind: "prefer"; enabled: boolean; side: "first" | "second" | null };
 
@@ -2444,6 +2448,16 @@ function decideMergeWinner(
       if (firstHit !== secondHit) {
         return firstHit ? photo.first_path : photo.second_path;
       }
+    } else if (condition.kind === "exif") {
+      // The side carrying capture metadata beats a re-save that lost it;
+      // when both carry it, the earlier capture is the original.
+      const first = photo.first_taken;
+      const second = photo.second_taken;
+      if (first > 0 && second > 0 && first !== second) {
+        return first < second ? photo.first_path : photo.second_path;
+      }
+      if (first > 0 && second <= 0) return photo.first_path;
+      if (second > 0 && first <= 0) return photo.second_path;
     } else if (condition.kind === "time") {
       if (photo.first_modified !== photo.second_modified) {
         return photo.first_modified > photo.second_modified
