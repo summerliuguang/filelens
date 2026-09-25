@@ -258,6 +258,8 @@ fn open_project(app: tauri::AppHandle) -> Result<ProjectState, String> {
 #[tauri::command]
 fn save_project_config(
     app: tauri::AppHandle,
+    scan_slot: tauri::State<'_, Arc<Mutex<Option<ScanTask>>>>,
+    watch_slot: tauri::State<'_, Arc<Mutex<Option<WatchTask>>>>,
     database: String,
     trash: String,
     roots: Vec<String>,
@@ -266,31 +268,47 @@ fn save_project_config(
     min_file_size: i64,
 ) -> Result<String, String> {
     filelens::init(&PathBuf::from(&database), &PathBuf::from(&trash))?;
-    let connection = open_database(&database)?;
-    save_setting_list(&connection, "roots", &roots)?;
-    save_setting_list(&connection, "protect_rules", &protect_rules)?;
-    save_setting_list(&connection, "exclude_rules", &exclude_rules)?;
     let min_size = min_file_size.max(0).to_string();
-    connection
-        .execute(
-            "INSERT INTO settings(key,value) VALUES('min_file_size',?1) \
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![min_size],
-        )
-        .map_err(|error| error.to_string())?;
+    {
+        let connection = open_database(&database)?;
+        save_setting_list(&connection, "roots", &roots)?;
+        save_setting_list(&connection, "protect_rules", &protect_rules)?;
+        save_setting_list(&connection, "exclude_rules", &exclude_rules)?;
+        connection
+            .execute(
+                "INSERT INTO settings(key,value) VALUES('min_file_size',?1) \
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![min_size],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    // Keep the real-time watcher in step with the saved roots (a no-op when
+    // the feature is off).
+    if setting_flag(&open_database(&database)?, "watch_scan", false) {
+        start_watcher(&scan_slot, &watch_slot, &database)?;
+    }
     write_project_pointer(&app, &database)?;
     Ok("项目设置已保存。".into())
 }
 
 #[tauri::command]
 fn save_roots(
+    scan_slot: tauri::State<'_, Arc<Mutex<Option<ScanTask>>>>,
+    watch_slot: tauri::State<'_, Arc<Mutex<Option<WatchTask>>>>,
     database: String,
     roots: Vec<String>,
     protect_rules: Vec<String>,
 ) -> Result<String, String> {
-    let connection = open_database(&database)?;
-    save_setting_list(&connection, "roots", &roots)?;
-    save_setting_list(&connection, "protect_rules", &protect_rules)?;
+    {
+        let connection = open_database(&database)?;
+        save_setting_list(&connection, "roots", &roots)?;
+        save_setting_list(&connection, "protect_rules", &protect_rules)?;
+    }
+    // Keep the real-time watcher in step with the saved roots (a no-op when
+    // the feature is off).
+    if setting_flag(&open_database(&database)?, "watch_scan", false) {
+        start_watcher(&scan_slot, &watch_slot, &database)?;
+    }
     Ok("扫描目录已保存。".into())
 }
 
@@ -1582,6 +1600,26 @@ fn set_watch_scan(
     enabled: bool,
 ) -> Result<(), String> {
     filelens::set_watch_scan(Path::new(&database), enabled)?;
+    if enabled {
+        start_watcher(&scan_slot, &watch_slot, &database)?;
+    } else if let Some(task) = watch_slot
+        .lock()
+        .map_err(|_| "watch lock failed")?
+        .as_ref()
+    {
+        task.cancel.store(true, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// (Re)start the directory watcher with the currently saved roots and
+/// rules. Called on enable and whenever the roots change, so a newly added
+/// scan root is picked up without touching the toggle.
+fn start_watcher(
+    scan_slot: &Arc<Mutex<Option<ScanTask>>>,
+    watch_slot: &Arc<Mutex<Option<WatchTask>>>,
+    database: &str,
+) -> Result<(), String> {
     // A previous watcher is cancelled before anything else: a re-enable
     // restarts it with the current roots and rules.
     if let Some(task) = watch_slot
@@ -1591,11 +1629,8 @@ fn set_watch_scan(
     {
         task.cancel.store(true, Ordering::Relaxed);
     }
-    if !enabled {
-        return Ok(());
-    }
     let (roots, protect_rules, exclude_rules, min_file_size) = {
-        let connection = open_database(&database)?;
+        let connection = open_database(database)?;
         (
             setting_list(&connection, "roots")?,
             setting_list(&connection, "protect_rules")?,
@@ -1608,9 +1643,10 @@ fn set_watch_scan(
     if roots.is_empty() {
         return Ok(());
     }
+    let database: String = database.to_string();
     let cancel = Arc::new(AtomicBool::new(false));
     let watcher_cancel = cancel.clone();
-    let scan_slot = scan_slot.inner().clone();
+    let scan_slot = Arc::clone(scan_slot);
     std::thread::spawn(move || {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut watcher = match notify::recommended_watcher(tx) {
