@@ -4003,14 +4003,27 @@ fn ensure_initialized(connection: &Connection) -> Result<(), String> {
                 .map_err(|e| format!("schema migration to v{target} failed: {e}"))?;
         }
     }
-    // Cover the trash/history orderings. `IF NOT EXISTS` keeps this idempotent
-    // so databases created before the indexes existed pick them up on open.
+    // Cover trash/history orderings plus tables and indexes that were added
+    // to `create_schema_sql` without a migration step (document similarity
+    // predates the versioned upgrade path): `IF NOT EXISTS` keeps this
+    // idempotent, so databases created before they existed pick them up on
+    // open instead of failing on their first scan.
     connection
         .execute_batch(
             "CREATE INDEX IF NOT EXISTS operations_state_created
                  ON operations(state, created_at);
              CREATE INDEX IF NOT EXISTS operations_created
-                 ON operations(created_at);",
+                 ON operations(created_at);
+             CREATE TABLE IF NOT EXISTS document_fingerprints (
+               file_id INTEGER PRIMARY KEY,
+               simhash INTEGER NOT NULL,
+               token_count INTEGER NOT NULL,
+               FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS document_fingerprints_hash
+                 ON document_fingerprints(simhash);
+             CREATE INDEX IF NOT EXISTS files_hash_size_present
+                 ON files(hash, size, present);",
         )
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -4809,6 +4822,24 @@ mod tests {
             .unwrap();
         assert_eq!(rows, 1);
         assert_eq!(hashed, "deadbeef");
+        drop(connection);
+
+        // A migrated database must survive a real scan: write_entry touches
+        // the document-fingerprint table for every non-document file, and
+        // that table shipped in create_schema_sql without a migration step.
+        let root = directory.join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("migrated.txt"), "migrated content\n").unwrap();
+        scan(&database, &[root], &[]).unwrap();
+        let connection = open_database(&database).unwrap();
+        let indexed: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path LIKE '%migrated.txt' AND present=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1);
         drop(connection);
         let _ = fs::remove_dir_all(directory);
     }
