@@ -1489,6 +1489,17 @@ fn run_parallel_scan(
                     // row's location and flags are refreshed. Protection is
                     // re-evaluated for the new path so a file moved into a
                     // protected subtree is covered immediately.
+                    // The target path can still be held by a stale row (its
+                    // file was deleted externally before this scan could
+                    // mark it absent; the UNIQUE index covers absent rows
+                    // too). Rename it aside and retire it first or the
+                    // re-point below hits the path UNIQUE constraint and
+                    // aborts every future scan at the same file.
+                    connection.execute(
+                        "UPDATE files SET path = path || '#replaced#' || id, present=0, approved=0 WHERE path=?1 AND id<>?2",
+                        params![path, file_id],
+                    )
+                    .map_err(|e| e.to_string())?;
                     connection.execute(
                         "UPDATE files SET path=?1, present=1, approved=0, protected=?2, scanned_at=?3 WHERE id=?4",
                         params![
@@ -1539,20 +1550,48 @@ fn run_parallel_scan(
                                 bucket.push(sibling);
                             }
                             for mut promoted in bucket {
-                                promoted.hash = hash_file_progress(
+                                // The file can vanish between its quick hash
+                                // and this full hash; record the failure and
+                                // keep scanning instead of aborting the pass.
+                                match hash_file_progress(
                                     Path::new(&promoted.path_text),
                                     hash_progress,
-                                )?;
-                                match write_entry(connection, &promoted, protect)? {
-                                    IndexOutcome::New => counters.new += 1,
-                                    IndexOutcome::Updated => counters.updated += 1,
-                                    IndexOutcome::Unchanged => counters.unchanged += 1,
+                                ) {
+                                    Ok(hash) => {
+                                        promoted.hash = hash;
+                                        match write_entry(connection, &promoted, protect)? {
+                                            IndexOutcome::New => counters.new += 1,
+                                            IndexOutcome::Updated => counters.updated += 1,
+                                            IndexOutcome::Unchanged => counters.unchanged += 1,
+                                        }
+                                    }
+                                    Err(error) => {
+                                        eprintln!("warning: {}: {error}", promoted.path_text);
+                                        counters.errors += 1;
+                                        if let Some(log) = errors {
+                                            log.record(&promoted.path_text, &error);
+                                        }
+                                    }
                                 }
                             }
                             // Indexed rows promoted in an earlier scan still
                             // carry their quick marker; refresh them so a
                             // newly found twin groups under the real hash.
-                            refresh_quick_hash_rows(connection, key.0, &quick, hash_progress)?;
+                            let refresh_errors = std::cell::Cell::new(0u64);
+                            refresh_quick_hash_rows(
+                                connection,
+                                key.0,
+                                &quick,
+                                hash_progress,
+                                &|path, error| {
+                                    eprintln!("warning: {path}: {error}");
+                                    refresh_errors.set(refresh_errors.get() + 1);
+                                    if let Some(log) = errors {
+                                        log.record(path, error);
+                                    }
+                                },
+                            )?;
+                            counters.errors += refresh_errors.get();
                         } else {
                             pending.insert(key, entry);
                         }
@@ -1599,12 +1638,15 @@ fn run_parallel_scan(
 
 // Rows promoted in an earlier scan still carry the "q:<quick>" marker until a
 // same-bucket twin shows up; re-hash them with real BLAKE3 so the marker
-// never splits what is actually one duplicate group.
+// never splits what is actually one duplicate group. A row whose file has
+// vanished since is reported through `on_error` and skipped — one stale row
+// must not abort the whole scan.
 fn refresh_quick_hash_rows(
     connection: &Connection,
     size: i64,
     quick: &str,
     hash_progress: Option<&HashProgress>,
+    on_error: &dyn Fn(&str, &str),
 ) -> Result<(), String> {
     let mut statement = connection
         .prepare(
@@ -1618,13 +1660,17 @@ fn refresh_quick_hash_rows(
         .map_err(|e| e.to_string())?;
     drop(statement);
     for path in paths {
-        let hash = hash_file_progress(Path::new(&path), hash_progress)?;
-        connection
-            .execute(
-                "UPDATE files SET hash=?1 WHERE path=?2",
-                params![hash, path],
-            )
-            .map_err(|e| e.to_string())?;
+        match hash_file_progress(Path::new(&path), hash_progress) {
+            Ok(hash) => {
+                connection
+                    .execute(
+                        "UPDATE files SET hash=?1 WHERE path=?2",
+                        params![hash, path],
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
+            Err(error) => on_error(&path, &error),
+        }
     }
     Ok(())
 }
@@ -2724,6 +2770,13 @@ fn hardlink_one(
     let (dev, inode) = fs::metadata(&source)
         .map(|metadata| device_inode(&metadata))
         .unwrap_or((0, 0));
+    // On Windows the linked name now resolves to the keeper's file
+    // reference; keeping the old one would make rename detection re-point
+    // the keeper's own row when this path is renamed later.
+    #[cfg(windows)]
+    let frn = i64::try_from(usn::file_reference_of(&source).unwrap_or(0)).unwrap_or(0);
+    #[cfg(not(windows))]
+    let frn = 0;
     connection
         .execute(
             "INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at,batch_id) VALUES(?1,?2,?3,?4,'hardlinked',?5,?6)",
@@ -2732,8 +2785,8 @@ fn hardlink_one(
         .map_err(|e| e.to_string())?;
     connection
         .execute(
-            "UPDATE files SET approved=0, dev=?2, inode=?3 WHERE id=?1",
-            params![file.id, dev, inode],
+            "UPDATE files SET approved=0, dev=?2, inode=?3, frn=?4 WHERE id=?1",
+            params![file.id, dev, inode, frn],
         )
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -6215,6 +6268,126 @@ mod tests {
         {
             hardlink(&database, b).unwrap();
         }
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn moved_onto_a_stale_path_does_not_wedge_the_scan() {
+        let directory = test_directory("moved-onto-stale");
+        let source = directory.join("source");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&source).unwrap();
+        let database = directory.join("index.db");
+        init(&database, &recycle).unwrap();
+
+        fs::write(source.join("a.txt"), b"content alpha").unwrap();
+        fs::write(source.join("b.txt"), b"content beta with more bytes").unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+
+        // Delete b externally, then rename a onto b's old name. The index
+        // still holds b as present=1 when the scan meets the renamed file;
+        // retiring that stale row must precede the re-point or the path
+        // UNIQUE constraint aborts this and every future scan.
+        fs::remove_file(source.join("b.txt")).unwrap();
+        fs::rename(source.join("a.txt"), source.join("b.txt")).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+
+        let connection = open_database(&database).unwrap();
+        let total: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path LIKE '%b.txt%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 2, "stale row renamed aside, moved row re-pointed");
+        let size: i64 = connection
+            .query_row(
+                "SELECT size FROM files WHERE path LIKE '%b.txt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(size, 13, "the live row carries a's content, not b's");
+        drop(connection);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn quick_hash_promotion_survives_a_vanished_sibling() {
+        let directory = test_directory("promotion-vanished");
+        let source = directory.join("source");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&source).unwrap();
+        let database = directory.join("index.db");
+        init(&database, &recycle).unwrap();
+
+        let block = vec![0xCD_u8; (LARGE_FILE_QUICK_THRESHOLD + 1024) as usize];
+        fs::write(source.join("gone.bin"), &block).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+
+        // The lone file vanishes and a same-size, same-head twin arrives:
+        // the promotion path re-hashes the stale row, hits the missing file
+        // and must record a per-file error instead of aborting the scan.
+        fs::remove_file(source.join("gone.bin")).unwrap();
+        let mut twin = block.clone();
+        twin[(LARGE_FILE_QUICK_THRESHOLD + 512) as usize] ^= 0xFF;
+        fs::write(source.join("twin.bin"), &twin).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+
+        let connection = open_database(&database).unwrap();
+        let hash: String = connection
+            .query_row(
+                "SELECT hash FROM files WHERE path LIKE '%twin.bin'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!hash.starts_with("q:"), "the twin must end up fully hashed");
+        drop(connection);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hardlink_refreshes_the_windows_file_reference() {
+        let directory = test_directory("hardlink-frn");
+        let source = directory.join("source");
+        let recycle = directory.join("recycle");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("a.txt"), b"same content").unwrap();
+        fs::write(source.join("b.txt"), b"same content").unwrap();
+        let database = directory.join("index.db");
+        init(&database, &recycle).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        let connection = open_database(&database).unwrap();
+        let b: i64 = connection
+            .query_row(
+                "SELECT id FROM files WHERE path LIKE ?1",
+                ["%b.txt"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(connection);
+        set_approval(&database, b, true).unwrap();
+        hardlink(&database, b).unwrap();
+
+        // The linked name now resolves to the keeper's file reference; a
+        // stale one would make rename detection re-point the keeper's own
+        // row when the linked name is renamed later.
+        let connection = open_database(&database).unwrap();
+        let row_frn: i64 = connection
+            .query_row(
+                "SELECT frn FROM files WHERE path LIKE ?1",
+                ["%b.txt"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(connection);
+        let real_frn =
+            i64::try_from(usn::file_reference_of(&source.join("b.txt")).unwrap()).unwrap();
+        assert_ne!(real_frn, 0);
+        assert_eq!(row_frn, real_frn, "row must carry the keeper's file reference");
         let _ = fs::remove_dir_all(directory);
     }
 
