@@ -198,7 +198,15 @@ function App() {
         // in the background instead of leaving the queue empty meanwhile.
         void refresh(project.database, { silent: true });
         if (project.auto_scan && project.roots.length > 0) {
-          void startScan(project.database, project.roots, project.protect_rules);
+          // Explicit values from the loaded project: the closures captured by
+          // this render still hold the initial (empty) state.
+          void startScan(
+            project.database,
+            project.roots,
+            project.protect_rules,
+            project.exclude_rules,
+            project.min_file_size,
+          );
         }
       })
       .catch((error) =>
@@ -452,14 +460,16 @@ function App() {
     targetDatabase: string,
     targetRoots: string[],
     targetRules: string[],
+    targetExcludeRules: string[],
+    targetMinFileSize: number,
   ) {
     await execute(async () => {
       const result = await invoke<string>("start_scan", {
         database: targetDatabase,
         roots: targetRoots,
         protectRules: targetRules,
-        excludeRules,
-        minFileSize,
+        excludeRules: targetExcludeRules,
+        minFileSize: targetMinFileSize,
       });
       setScanState({
         state: "running",
@@ -626,7 +636,7 @@ function App() {
                 setRootInput={setRootInput}
                 addRoot={addRootPath}
                 removeRoot={removeRootPath}
-                scan={() => startScan(database, roots, protectRules)}
+                scan={() => startScan(database, roots, protectRules, excludeRules, minFileSize)}
                 disabled={busy || !database || scanState.state === "running"}
                 onOpenHelp={openHelp}
               />
