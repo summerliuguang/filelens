@@ -1212,11 +1212,13 @@ mod usn {
             return Err("USN enumeration returned nothing".into());
         }
 
-        // Anchor: the scan root's own file reference number.
+        // Anchor: the scan root's own file reference number. `children` is
+        // built by consuming `entries` — cloning the whole MFT view a second
+        // time would double peak memory on multi-million-file volumes.
         let root_frn = file_reference_of(root)?;
         let mut children: HashMap<u64, Vec<(u64, String, u32)>> = HashMap::new();
-        for (frn, (parent, name, attributes)) in &entries {
-            children.entry(*parent).or_default().push((*frn, name.clone(), *attributes));
+        for (frn, (parent, name, attributes)) in entries {
+            children.entry(parent).or_default().push((frn, name, attributes));
         }
         for list in children.values_mut() {
             list.sort_by(|a, b| a.1.cmp(&b.1));
@@ -2252,17 +2254,17 @@ pub fn protect_preview(database: &Path, rules: &[String]) -> Result<ProtectPrevi
     let mut statement = connection
         .prepare("SELECT path FROM files WHERE present=1")
         .map_err(|e| e.to_string())?;
-    let paths = statement
+    // Stream the rows instead of collecting every present path first: the
+    // matched count and a capped example list are all that is needed.
+    let rows = statement
         .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
-    drop(statement);
     let mut preview = ProtectPreview {
         matched: 0,
         examples: Vec::new(),
     };
-    for path in paths {
+    for path in rows {
+        let path = path.map_err(|e| e.to_string())?;
         if is_protected_path(&path, rules) {
             preview.matched += 1;
             if preview.examples.len() < PROTECT_PREVIEW_EXAMPLES {
@@ -2336,13 +2338,19 @@ fn trash_one(connection: &Connection, file_id: i64, batch_id: Option<i64>) -> Re
     }
     let destination = recycle_destination(connection, file.id, &source)?;
     move_verified(&source, &destination, &file.hash)?;
-    connection.execute("INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at,batch_id) VALUES(?1,?2,?3,?4,'trashed',?5,?6)", params![file.id, file.path, destination.to_string_lossy(), file.hash, now_seconds()?, batch_id]).map_err(|e| e.to_string())?;
-    connection
-        .execute(
-            "UPDATE files SET present=0, approved=0 WHERE id=?1",
-            params![file.id],
-        )
+    // The audit row and the index update commit together: a crash between
+    // the two statements must not leave a verified copy in the bin with no
+    // operations record (invisible in the UI, never pruned, unrestorable).
+    let tx = connection
+        .unchecked_transaction()
         .map_err(|e| e.to_string())?;
+    tx.execute("INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at,batch_id) VALUES(?1,?2,?3,?4,'trashed',?5,?6)", params![file.id, file.path, destination.to_string_lossy(), file.hash, now_seconds()?, batch_id]).map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE files SET present=0, approved=0 WHERE id=?1",
+        params![file.id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
     println!("Moved to recycle bin: {}", destination.display());
     Ok(())
 }
@@ -2463,18 +2471,20 @@ fn restore_with(
         fs::create_dir_all(parent).map_err(|e| format!("create restore directory: {e}"))?;
     }
     move_verified(&trashed, &destination, &hash)?;
-    connection
-        .execute(
-            "UPDATE operations SET state='restored',restored_at=?1 WHERE id=?2",
-            params![now_seconds()?, operation_id],
-        )
+    let tx = connection
+        .unchecked_transaction()
         .map_err(|e| e.to_string())?;
-    connection
-        .execute(
-            "UPDATE files SET present=1,approved=0 WHERE id=?1",
-            params![file_id],
-        )
-        .map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE operations SET state='restored',restored_at=?1 WHERE id=?2",
+        params![now_seconds()?, operation_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE files SET present=1,approved=0 WHERE id=?1",
+        params![file_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
     println!("Restored: {}", destination.display());
     Ok(())
 }
@@ -2543,18 +2553,20 @@ fn delete_one(
         strict_verify_against_keeper(connection, &file)?;
     }
     fs::remove_file(&source).map_err(|e| format!("delete file: {e}"))?;
-    connection
-        .execute(
-            "INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at,batch_id) VALUES(?1,?2,'',?3,'deleted',?4,?5)",
-            params![file.id, file.path, file.hash, now_seconds()?, batch_id],
-        )
+    let tx = connection
+        .unchecked_transaction()
         .map_err(|e| e.to_string())?;
-    connection
-        .execute(
-            "UPDATE files SET present=0, approved=0 WHERE id=?1",
-            params![file.id],
-        )
-        .map_err(|e| e.to_string())?;
+    tx.execute(
+        "INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at,batch_id) VALUES(?1,?2,'',?3,'deleted',?4,?5)",
+        params![file.id, file.path, file.hash, now_seconds()?, batch_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE files SET present=0, approved=0 WHERE id=?1",
+        params![file.id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
     println!("Deleted permanently: {}", source.display());
     Ok(())
 }
@@ -2777,18 +2789,20 @@ fn hardlink_one(
     let frn = i64::try_from(usn::file_reference_of(&source).unwrap_or(0)).unwrap_or(0);
     #[cfg(not(windows))]
     let frn = 0;
-    connection
-        .execute(
-            "INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at,batch_id) VALUES(?1,?2,?3,?4,'hardlinked',?5,?6)",
-            params![file.id, file.path, keeper.to_string_lossy(), file.hash, now_seconds()?, batch_id],
-        )
+    let tx = connection
+        .unchecked_transaction()
         .map_err(|e| e.to_string())?;
-    connection
-        .execute(
-            "UPDATE files SET approved=0, dev=?2, inode=?3, frn=?4 WHERE id=?1",
-            params![file.id, dev, inode, frn],
-        )
-        .map_err(|e| e.to_string())?;
+    tx.execute(
+        "INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at,batch_id) VALUES(?1,?2,?3,?4,'hardlinked',?5,?6)",
+        params![file.id, file.path, keeper.to_string_lossy(), file.hash, now_seconds()?, batch_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE files SET approved=0, dev=?2, inode=?3, frn=?4 WHERE id=?1",
+        params![file.id, dev, inode, frn],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -2908,7 +2922,7 @@ pub fn recycle_dir_keep_one(
     let windows_pattern = format!("%{}%", like_escape(&format!("{dir_text}\\")));
     let mut statement = connection
         .prepare(
-            "SELECT f.id,f.path,f.hash,f.protected FROM files f \
+            "SELECT f.id,f.path,f.hash,f.size,f.protected FROM files f \
              WHERE f.present=1 AND (f.path LIKE ?1 ESCAPE '\\' OR f.path LIKE ?2 ESCAPE '\\') \
              AND EXISTS (SELECT 1 FROM files g WHERE g.present=1 \
                AND g.hash=f.hash AND g.size=f.size AND g.id<>f.id)",
@@ -2920,7 +2934,8 @@ pub fn recycle_dir_keep_one(
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)? != 0,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)? != 0,
             ))
         })
         .map_err(|e| e.to_string())?
@@ -2928,21 +2943,23 @@ pub fn recycle_dir_keep_one(
         .map_err(|e| e.to_string())?;
     drop(statement);
 
-    // Group the in-directory candidates by content hash.
-    let mut groups: HashMap<String, Vec<(i64, String, bool)>> = HashMap::new();
-    for (id, path, hash, protected) in rows {
-        groups.entry(hash).or_default().push((id, path, protected));
+    // Group by (hash, size): a `q:` quick marker only promises uniqueness
+    // within one size, so two different large files sharing the first 64 KiB
+    // must not merge into one group here.
+    let mut groups: HashMap<(String, i64), Vec<(i64, String, bool)>> = HashMap::new();
+    for (id, path, hash, size, protected) in rows {
+        groups.entry((hash, size)).or_default().push((id, path, protected));
     }
 
     let mut outcome = DirKeepOutcome::default();
     let batch_id = new_batch_id();
     let mut recycle_list: Vec<String> = Vec::new();
-    for (hash, members) in groups {
+    for ((hash, size), members) in groups {
         // Live copies everywhere and how many of them are protected.
         let total: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM files WHERE present=1 AND hash=?1",
-                params![hash],
+                "SELECT COUNT(*) FROM files WHERE present=1 AND hash=?1 AND size=?2",
+                params![hash, size],
                 |row| row.get(0),
             )
             .map_err(|e| e.to_string())?;
@@ -3269,28 +3286,30 @@ fn move_indexed_file_to(
         suffix += 1;
     }
     move_verified(source, &candidate, hash)?;
-    // A recycled copy leaves a dead index row (present=0) still holding this
-    // path, and files.path is UNIQUE: rename the dead row aside so the moved
-    // file can take the path over while the row itself survives for the
-    // restore chain, which looks files up by id.
-    connection
-        .execute(
-            "UPDATE files SET path = path || '#replaced#' || id              WHERE path = ?2 AND present = 0 AND id <> ?1",
-            params![file_id, candidate.to_string_lossy()],
-        )
+    // The path handover and the audit row commit together: a recycled copy
+    // leaves a dead index row (present=0) still holding this path, and
+    // files.path is UNIQUE — rename the dead row aside so the moved file can
+    // take the path over while the row itself survives for the restore
+    // chain, which looks files up by id.
+    let tx = connection
+        .unchecked_transaction()
         .map_err(|e| e.to_string())?;
-    connection
-        .execute(
-            "UPDATE files SET path=?2 WHERE id=?1",
-            params![file_id, candidate.to_string_lossy()],
-        )
-        .map_err(|e| e.to_string())?;
-    connection
-        .execute(
-            "INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at,batch_id) VALUES(?1,?2,'',?3,'moved',?4,NULL)",
-            params![file_id, source.to_string_lossy(), hash, now_seconds()?],
-        )
-        .map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE files SET path = path || '#replaced#' || id              WHERE path = ?2 AND present = 0 AND id <> ?1",
+        params![file_id, candidate.to_string_lossy()],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE files SET path=?2 WHERE id=?1",
+        params![file_id, candidate.to_string_lossy()],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at,batch_id) VALUES(?1,?2,'',?3,'moved',?4,NULL)",
+        params![file_id, source.to_string_lossy(), hash, now_seconds()?],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -3337,22 +3356,33 @@ fn remove_indexed_path(
     if to_trash {
         let destination = recycle_destination(connection, file_id, &source)?;
         move_verified(&source, &destination, &hash)?;
-        connection.execute("INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at,batch_id) VALUES(?1,?2,?3,?4,'trashed',?5,?6)", params![file_id, path, destination.to_string_lossy(), hash, now_seconds()?, batch_id]).map_err(|e| e.to_string())?;
-    } else {
-        fs::remove_file(&source).map_err(|e| format!("删除文件失败：{e}"))?;
-        connection
-            .execute(
-                "INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at,batch_id) VALUES(?1,?2,'',?3,'deleted',?4,?5)",
-                params![file_id, path, hash, now_seconds()?, batch_id],
-            )
+        let tx = connection
+            .unchecked_transaction()
             .map_err(|e| e.to_string())?;
-    }
-    connection
-        .execute(
+        tx.execute("INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at,batch_id) VALUES(?1,?2,?3,?4,'trashed',?5,?6)", params![file_id, path, destination.to_string_lossy(), hash, now_seconds()?, batch_id]).map_err(|e| e.to_string())?;
+        tx.execute(
             "UPDATE files SET present=0, approved=0 WHERE id=?1",
             params![file_id],
         )
         .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+    } else {
+        fs::remove_file(&source).map_err(|e| format!("删除文件失败：{e}"))?;
+        let tx = connection
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO operations(file_id,source_path,trash_path,hash,state,created_at,batch_id) VALUES(?1,?2,'',?3,'deleted',?4,?5)",
+            params![file_id, path, hash, now_seconds()?, batch_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE files SET present=0, approved=0 WHERE id=?1",
+            params![file_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -3787,7 +3817,6 @@ fn move_verified(source: &Path, destination: &Path, expected_hash: &str) -> Resu
         Ok(()) => Ok(()),
         Err(_) => {
             copy_file(source, destination)?;
-            copy_file(source, destination)?;
             if hash_file(destination)? != expected_hash {
                 let _ = fs::remove_file(destination);
                 return Err("copied file failed integrity check".to_string());
@@ -3799,12 +3828,27 @@ fn move_verified(source: &Path, destination: &Path, expected_hash: &str) -> Resu
 }
 
 fn copy_file(source: &Path, destination: &Path) -> Result<(), String> {
-    let temporary = destination.with_extension("filelens-partial");
-    let mut input = File::open(source).map_err(|e| e.to_string())?;
-    let mut output = File::create(&temporary).map_err(|e| e.to_string())?;
-    io::copy(&mut input, &mut output).map_err(|e| e.to_string())?;
-    output.sync_all().map_err(|e| e.to_string())?;
-    fs::rename(temporary, destination).map_err(|e| e.to_string())
+    // Append to the full name instead of `with_extension`, which would
+    // replace the last extension ("photo.jpg" -> "photo.filelens-partial").
+    let mut temp_name = destination
+        .file_name()
+        .ok_or_else(|| "destination has no file name".to_string())?
+        .to_os_string();
+    temp_name.push(".filelens-partial");
+    let temporary = destination.with_file_name(temp_name);
+    let result = (|| -> Result<(), String> {
+        let mut input = File::open(source).map_err(|e| e.to_string())?;
+        let mut output = File::create(&temporary).map_err(|e| e.to_string())?;
+        io::copy(&mut input, &mut output).map_err(|e| e.to_string())?;
+        output.sync_all().map_err(|e| e.to_string())?;
+        fs::rename(&temporary, destination).map_err(|e| e.to_string())
+    })();
+    // Never leave partial debris behind on a failed copy: it would sit in
+    // the trash or keep directory where nothing cleans it up.
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn status(database: &Path) -> Result<(), String> {
@@ -3870,14 +3914,13 @@ pub fn group_dirs(database: &Path) -> Result<Vec<DirCount>, String> {
                AND g.hash=f.hash AND g.size=f.size AND g.id<>f.id)",
         )
         .map_err(|e| e.to_string())?;
-    let paths = statement
+    // Aggregate while streaming; nothing needs the full member list.
+    let rows = statement
         .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
-    drop(statement);
     let mut counts: HashMap<String, i64> = HashMap::new();
-    for path in paths {
+    for path in rows {
+        let path = path.map_err(|e| e.to_string())?;
         let dir = match path.rsplit_once(['/', '\\']) {
             Some((parent, _)) => parent.to_string(),
             None => continue,
@@ -5931,6 +5974,125 @@ mod tests {
         );
         let verdicts = cached_pair_verdicts(&database, &[(path_a, path_b)]).unwrap();
         assert_eq!(vec![Some(false)], verdicts);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn stale_pair_verdicts_are_pruned_on_store() {
+        let directory = test_directory("pair-verdict-prune");
+        let left = directory.join("left");
+        fs::create_dir_all(&left).unwrap();
+        fs::write(left.join("a.txt"), b"same").unwrap();
+        fs::write(left.join("b.txt"), b"same").unwrap();
+        let database = directory.join("index.db");
+        init(&database, &directory.join("recycle")).unwrap();
+        scan(&database, std::slice::from_ref(&left), &[]).unwrap();
+
+        // Age a verdict row beyond the 90-day window by hand; a fresh store
+        // must drop it as housekeeping instead of letting the cache grow
+        // without bound.
+        let connection = open_database(&database).unwrap();
+        connection
+            .execute(
+                "INSERT INTO photo_pair_verdicts \
+                   (path_a,size_a,mtime_a,path_b,size_b,mtime_b,identical,checked_at) \
+                 SELECT path,size,modified,path,size,modified,1,0 FROM files \
+                   WHERE path LIKE '%a.txt'",
+                [],
+            )
+            .unwrap();
+        let stale: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM photo_pair_verdicts WHERE checked_at=0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(1, stale);
+        drop(connection);
+
+        let path_a = left.join("a.txt").to_string_lossy().into_owned();
+        let path_b = left.join("b.txt").to_string_lossy().into_owned();
+        store_pair_verdicts(&database, &[(path_a, path_b, true)]).unwrap();
+        let connection = open_database(&database).unwrap();
+        let (total, aged): (i64, i64) = connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(checked_at=0),0) FROM photo_pair_verdicts",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((1, 0), (total, aged), "aged row pruned, fresh row stored");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn watch_setting_roundtrips() {
+        let directory = test_directory("watch-setting");
+        let database = directory.join("index.db");
+        init(&database, &directory.join("recycle")).unwrap();
+        set_watch_scan(&database, true).unwrap();
+        let connection = open_database(&database).unwrap();
+        let value: String = connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='watch_scan'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!("1", value);
+        drop(connection);
+        set_watch_scan(&database, false).unwrap();
+        let connection = open_database(&database).unwrap();
+        let value: String = connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='watch_scan'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!("0", value);
+        drop(connection);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn exif_taken_clears_when_content_changes_to_exif_less() {
+        let directory = test_directory("exif-sticky");
+        let source = directory.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let photo = source.join("shot.jpg");
+        craft_exif_jpeg(&photo, "2023:07:01 12:00:00");
+        let database = directory.join("index.db");
+        init(&database, &directory.join("recycle")).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        let connection = open_database(&database).unwrap();
+        let stored: i64 = connection
+            .query_row(
+                "SELECT exif_taken FROM files WHERE path LIKE '%shot.jpg'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(0, stored, "the crafted EXIF date must be stored first");
+        drop(connection);
+
+        // Replace with EXIF-free content: the hash changes, so the stale
+        // capture time must reset instead of surviving the content change.
+        image::RgbImage::from_fn(24, 24, |_, _| image::Rgb([10, 20, 30]))
+            .save(&photo)
+            .unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        let connection = open_database(&database).unwrap();
+        let stored: i64 = connection
+            .query_row(
+                "SELECT exif_taken FROM files WHERE path LIKE '%shot.jpg'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(0, stored);
+        drop(connection);
         let _ = fs::remove_dir_all(directory);
     }
 
