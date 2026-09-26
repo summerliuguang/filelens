@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import { ScanProgress } from "./ui/components";
 import {
+  Cleanup,
   Detectors,
   History,
   Overview,
@@ -58,6 +59,7 @@ const nav: { id: Page; icon: string; label: string; caption: string }[] = [
   { id: "similar", icon: "◒", label: "相似照片", caption: "SIMILAR PHOTOS" },
   { id: "documents", icon: "≡", label: "相似文档", caption: "SIMILAR DOCUMENTS" },
   { id: "detectors", icon: "◉", label: "检测能力", caption: "DETECTORS" },
+  { id: "cleanup", icon: "⌫", label: "清理工具", caption: "CLEANUP" },
   { id: "trash", icon: "↶", label: "应用回收站", caption: "RECOVERY" },
   { id: "history", icon: "⧗", label: "操作历史", caption: "OPERATION LOG" },
   { id: "settings", icon: "⚙", label: "项目设置", caption: "PROJECT SETTINGS" },
@@ -74,6 +76,7 @@ function App() {
   const [excludeRules, setExcludeRules] = useState<string[]>([]);
   const [minFileSize, setMinFileSize] = useState(0);
   const [retentionDays, setRetentionDays] = useState(30);
+  const [trashMaxBytes, setTrashMaxBytes] = useState(0);
   const [autoScan, setAutoScan] = useState(true);
   const [strictVerify, setStrictVerify] = useState(false);
   const [usnScan, setUsnScan] = useState(false);
@@ -180,6 +183,7 @@ function App() {
         setExcludeRules(project.exclude_rules);
         setMinFileSize(project.min_file_size);
         setRetentionDays(project.trash_retention_days);
+        setTrashMaxBytes(project.trash_max_bytes);
         setAutoScan(project.auto_scan);
         setStrictVerify(project.strict_verify);
         setUsnScan(project.usn_scan);
@@ -468,6 +472,7 @@ function App() {
         protectRules,
         excludeRules,
         minFileSize,
+        trashMaxBytes,
       });
       await refresh(database);
       return result;
@@ -702,6 +707,15 @@ function App() {
             <div className={page === "detectors" ? "page-layer page-active" : "page-layer"}>
               <Detectors detectors={detectors} />
             </div>
+            <div className={page === "cleanup" ? "page-layer page-active" : "page-layer"}>
+              <Cleanup
+                database={database}
+                active={page === "cleanup"}
+                busy={busy}
+                execute={execute}
+                refresh={refresh}
+              />
+            </div>
             <div className={page === "trash" ? "page-layer page-active" : "page-layer"}>
               <Trash
                 database={database}
@@ -710,6 +724,7 @@ function App() {
                 busyKeys={busyKeys}
                 execute={execute}
                 refresh={refresh}
+                trashMaxBytes={trashMaxBytes}
               />
             </div>
             <div className={page === "history" ? "page-layer page-active" : "page-layer"}>
@@ -727,6 +742,7 @@ function App() {
                 excludeRules={excludeRules}
                 minFileSize={minFileSize}
                 retentionDays={retentionDays}
+                trashMaxBytes={trashMaxBytes}
                 autoScan={autoScan}
                 strictVerify={strictVerify}
                 setStrictVerify={setStrictVerify}
@@ -743,6 +759,7 @@ function App() {
                 setExcludeRules={setExcludeRules}
                 setMinFileSize={setMinFileSize}
                 setRetentionDays={setRetentionDays}
+                setTrashMaxBytes={setTrashMaxBytes}
                 setAutoScan={setAutoScan}
                 initialize={initialize}
                 execute={execute}

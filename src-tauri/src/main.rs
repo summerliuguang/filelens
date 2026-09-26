@@ -64,6 +64,8 @@ struct ProjectState {
     exclude_rules: Vec<String>,
     min_file_size: i64,
     trash_retention_days: i64,
+    /// Recycle-bin usage reminder threshold in bytes; 0 disables it.
+    trash_max_bytes: i64,
     auto_scan: bool,
     strict_verify: bool,
     usn_scan: bool,
@@ -196,6 +198,9 @@ fn open_project(app: tauri::AppHandle) -> Result<ProjectState, String> {
             .and_then(|value| value.parse().ok())
             .unwrap_or(0),
         trash_retention_days: filelens::trash_retention_days(&connection),
+        trash_max_bytes: setting_value(&connection, "trash_max_bytes")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
         auto_scan: setting_flag(&connection, "auto_scan_on_start", true),
         strict_verify: setting_flag(&connection, "strict_verify", false),
         usn_scan: setting_flag(&connection, "usn_scan", false),
@@ -217,9 +222,11 @@ fn save_project_config(
     protect_rules: Vec<String>,
     exclude_rules: Vec<String>,
     min_file_size: i64,
+    trash_max_bytes: i64,
 ) -> Result<String, String> {
     filelens::init(&PathBuf::from(&database), &PathBuf::from(&trash))?;
     let min_size = min_file_size.max(0).to_string();
+    let max_bytes = trash_max_bytes.max(0).to_string();
     {
         let connection = open_database(&database)?;
         save_setting_list(&connection, "roots", &roots)?;
@@ -230,6 +237,13 @@ fn save_project_config(
                 "INSERT INTO settings(key,value) VALUES('min_file_size',?1) \
                  ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 params![min_size],
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute(
+                "INSERT INTO settings(key,value) VALUES('trash_max_bytes',?1) \
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![max_bytes],
             )
             .map_err(|error| error.to_string())?;
     }
@@ -751,6 +765,86 @@ async fn restore_batch(database: String, batch_id: i64) -> Result<String, String
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn delete_trash_batch(database: String, batch_id: i64) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let outcome = filelens::delete_trash_batch(&PathBuf::from(&database), batch_id);
+        if outcome.failures.is_empty() {
+            Ok(format!("已永久删除整批 {} 个文件。", outcome.succeeded))
+        } else {
+            Ok(format!(
+                "已永久删除 {} 个，{} 个失败：{}",
+                outcome.succeeded,
+                outcome.failures.len(),
+                outcome.failures.join("；")
+            ))
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn trash_usage(database: String) -> Result<filelens::TrashUsage, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        filelens::trash_usage(&PathBuf::from(&database))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn empty_dirs(database: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || filelens::empty_dirs(&PathBuf::from(&database)))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn zero_byte_files(database: String) -> Result<Vec<filelens::ZeroByteFile>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        filelens::zero_byte_files(&PathBuf::from(&database))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Roots and protection rules come from the saved project settings, never
+/// from the frontend — the safeguards must not depend on caller-supplied
+/// data.
+#[tauri::command]
+async fn remove_empty_dirs(database: String, dirs: Vec<String>) -> Result<String, String> {
+    let (roots, protect_rules) = {
+        let connection = open_database(&database)?;
+        (
+            setting_list(&connection, "roots")?,
+            setting_list(&connection, "protect_rules")?,
+        )
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let outcome =
+            filelens::remove_empty_dirs(&PathBuf::from(&database), &dirs, &roots, &protect_rules)?;
+        let mut message = format!("已删除 {} 个空文件夹。", outcome.removed);
+        if !outcome.failures.is_empty() {
+            message.push_str(&format!(
+                " 失败 {} 个：{}",
+                outcome.failures.len(),
+                outcome.failures.join("；")
+            ));
+        }
+        Ok(message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn image_dimensions(path: String) -> Result<Option<(u32, u32)>, String> {
+    tauri::async_runtime::spawn_blocking(move || filelens::image_dimensions(&path))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 /// Settings-page preview: how many indexed files the unsaved rule set would
@@ -1778,6 +1872,12 @@ fn main() {
             reveal_in_manager,
             restore,
             restore_batch,
+            delete_trash_batch,
+            trash_usage,
+            empty_dirs,
+            zero_byte_files,
+            remove_empty_dirs,
+            image_dimensions,
             protect_preview,
             approve_filtered,
             hardlink_approved,

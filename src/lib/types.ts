@@ -9,6 +9,7 @@ export type Page =
   | "similar"
   | "documents"
   | "detectors"
+  | "cleanup"
   | "trash"
   | "history"
   | "settings";
@@ -109,12 +110,18 @@ export type ProjectState = ProjectConfig & {
   exclude_rules: string[];
   min_file_size: number;
   trash_retention_days: number;
+  /** Recycle-bin usage reminder threshold in bytes; 0 disables it. */
+  trash_max_bytes: number;
   auto_scan: boolean;
   strict_verify: boolean;
   usn_scan: boolean;
   watch_scan: boolean;
   similar_threshold: number;
 };
+
+export type TrashUsage = { files: number; bytes: number };
+
+export type ZeroByteFile = { path: string; modified: number };
 
 export type ScanErrorSample = { path: string; error: string };
 

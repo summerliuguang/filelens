@@ -27,6 +27,8 @@ import type {
   ThemeSetting,
   ThumbnailCacheStats,
   TrashItem,
+  TrashUsage,
+  ZeroByteFile,
 } from "../lib/types";
 import { HELP_FAQ, HELP_SECTIONS } from "../lib/help-content";
 
@@ -1203,6 +1205,9 @@ export function SimilarPhotos({
     conditions: MergeCondition[];
   } | null>(null);
   const [mergePrefixInput, setMergePrefixInput] = useState("");
+  // Natural pixel sizes per path for the merge wizard's resolution
+  // condition, probed once per dialog open.
+  const [mergeDims, setMergeDims] = useState<Record<string, [number, number]>>({});
   const [showConsistentOnly, setShowConsistentOnly] = useState(false);
   const [pairSort, setPairSort] = useState<"distance" | "size" | "time">(
     "distance",
@@ -1376,8 +1381,10 @@ export function SimilarPhotos({
     // Detect naming prefixes across BOTH sides, busiest first; known
     // camera/screenshot styles start checked.
     const counts = new Map<string, { label: string; count: number }>();
+    const dimensionPaths = new Set<string>();
     for (const photo of group.pairs) {
       for (const path of [photo.first_path, photo.second_path]) {
+        dimensionPaths.add(path);
         const prefix = fileNamePrefix(fileName(path));
         if (!prefix) continue;
         const key = prefix.toLowerCase();
@@ -1385,6 +1392,18 @@ export function SimilarPhotos({
         if (entry) entry.count += 1;
         else counts.set(key, { label: prefix, count: 1 });
       }
+    }
+    // The resolution condition needs natural pixel sizes: probe the headers
+    // once per dialog in the background and fill the cache as results land.
+    setMergeDims({});
+    for (const path of dimensionPaths) {
+      invoke<[number, number] | null>("image_dimensions", { path })
+        .then((dims) => {
+          if (dims) {
+            setMergeDims((current) => ({ ...current, [path]: dims }));
+          }
+        })
+        .catch(() => {});
     }
     setPendingMerge({
       dirA: group.dirA,
@@ -1405,6 +1424,7 @@ export function SimilarPhotos({
             })),
         },
         { kind: "exif", enabled: true },
+        { kind: "resolution", enabled: false },
         { kind: "time", enabled: true },
         { kind: "prefer", enabled: false, side: null },
       ],
@@ -2041,6 +2061,7 @@ export function SimilarPhotos({
               photo,
               pendingMerge.conditions,
               targetDir,
+              mergeDims,
             ),
           }));
           const backendPairs: [string, string][] = decisions.map(
@@ -2200,9 +2221,11 @@ export function SimilarPhotos({
                               ? "前缀匹配（保留文件名开头匹配的照片）"
                               : condition.kind === "exif"
                                 ? "EXIF 拍摄时间（有拍摄信息的优先，更早的原图优先）"
-                                : condition.kind === "time"
-                                  ? "时间较新（保留修改时间较晚的照片）"
-                                  : "优先指定目录"}
+                                : condition.kind === "resolution"
+                                  ? "分辨率较高（保留像素尺寸更大的一张）"
+                                  : condition.kind === "time"
+                                    ? "时间较新（保留修改时间较晚的照片）"
+                                    : "优先指定目录"}
                           </b>
                           {condition.kind === "prefix" && condition.enabled && (
                             <>
@@ -2421,6 +2444,7 @@ type MergeCondition =
       prefixes: { key: string; label: string; count: number; checked: boolean }[];
     }
   | { kind: "exif"; enabled: boolean }
+  | { kind: "resolution"; enabled: boolean }
   | { kind: "time"; enabled: boolean }
   | { kind: "prefer"; enabled: boolean; side: "first" | "second" | null };
 
@@ -2454,6 +2478,7 @@ function decideMergeWinner(
   photo: SimilarPhoto,
   conditions: MergeCondition[],
   targetDir: string,
+  dims: Record<string, [number, number]>,
 ): string {
   for (const condition of conditions) {
     if (!condition.enabled) continue;
@@ -2481,6 +2506,20 @@ function decideMergeWinner(
       }
       if (first > 0 && second <= 0) return photo.first_path;
       if (second > 0 && first <= 0) return photo.second_path;
+    } else if (condition.kind === "resolution") {
+      // Higher natural pixel count wins; pairs missing a header probe fall
+      // through to the next condition.
+      const first = dims[photo.first_path];
+      const second = dims[photo.second_path];
+      if (first && second) {
+        const firstPixels = first[0] * first[1];
+        const secondPixels = second[0] * second[1];
+        if (firstPixels !== secondPixels) {
+          return firstPixels > secondPixels
+            ? photo.first_path
+            : photo.second_path;
+        }
+      }
     } else if (condition.kind === "time") {
       if (photo.first_modified !== photo.second_modified) {
         return photo.first_modified > photo.second_modified
@@ -2651,6 +2690,7 @@ export function Trash({
   busyKeys,
   execute,
   refresh,
+  trashMaxBytes,
 }: {
   database: string;
   items: TrashItem[];
@@ -2658,6 +2698,7 @@ export function Trash({
   busyKeys: ReadonlySet<string>;
   execute: (action: () => Promise<string>, key?: string) => Promise<void>;
   refresh: () => Promise<void>;
+  trashMaxBytes: number;
 }) {
   const [pendingEmpty, setPendingEmpty] = useState(false);
   const [pendingPrune, setPendingPrune] = useState(false);
@@ -2666,7 +2707,25 @@ export function Trash({
     id: number;
     count: number;
   } | null>(null);
+  const [pendingBatchDelete, setPendingBatchDelete] = useState<{
+    id: number;
+    count: number;
+  } | null>(null);
+  // Real disk usage of the recycle bin, walked when the page loads.
+  const [usage, setUsage] = useState<TrashUsage | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    invoke<TrashUsage>("trash_usage", { database })
+      .then((next) => {
+        if (!cancelled) setUsage(next);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [database, items.length]);
   const expiredCount = items.filter((item) => item.expired).length;
+  const overLimit = trashMaxBytes > 0 && (usage?.bytes ?? 0) > trashMaxBytes;
   return (
     <section className="panel trash-page">
       <div className="section-head">
@@ -2675,7 +2734,15 @@ export function Trash({
           <p>恢复时不会覆盖原路径已有文件，并会再次进行内容完整性检查。</p>
         </div>
         <div className="head-actions">
-          <span className="pill">{items.length} 个文件</span>
+          <span className="pill">
+            {items.length} 个文件
+            {usage && ` · 占用 ${formatBytes(usage.bytes)}`}
+          </span>
+          {overLimit && (
+            <span className="pill warn">
+              已超过设置的容量提醒上限（{formatBytes(trashMaxBytes)}），建议恢复或清理。
+            </span>
+          )}
           {expiredCount > 0 && (
             <button
               className="secondary"
@@ -2724,6 +2791,18 @@ export function Trash({
                     }
                   >
                     恢复整批
+                  </button>
+                  <button
+                    className="danger"
+                    disabled={busyKeys.has("delete-batch")}
+                    onClick={() =>
+                      setPendingBatchDelete({
+                        id: segment.batch!.id,
+                        count: segment.items.length,
+                      })
+                    }
+                  >
+                    永久删除整批
                   </button>
                 </div>
               )}
@@ -2868,6 +2947,33 @@ export function Trash({
           ]}
         />
       )}
+      {pendingBatchDelete && (
+        <ConfirmDialog
+          title={`永久删除整批 ${pendingBatchDelete.count} 个文件`}
+          detail="这批文件将从应用回收站中直接永久删除。"
+          note="删除后将无法再恢复，请确认这批副本不再需要。"
+          busy={busy}
+          onClose={() => setPendingBatchDelete(null)}
+          options={[
+            {
+              label: "永久删除整批",
+              kind: "danger",
+              action: () => {
+                const batchId = pendingBatchDelete.id;
+                setPendingBatchDelete(null);
+                void execute(async () => {
+                  const result = await invoke<string>("delete_trash_batch", {
+                    database,
+                    batchId,
+                  });
+                  await refresh();
+                  return result;
+                }, "delete-batch");
+              },
+            },
+          ]}
+        />
+      )}
       {pendingItem && (
         <ConfirmDialog
           title="永久删除该文件"
@@ -2932,6 +3038,257 @@ const HISTORY_FILTERS: { value: string; label: string }[] = [
   { value: "deleted", label: "已永久删除" },
   { value: "hardlinked", label: "已转硬链接" },
 ];
+// One-shot cleanup helpers: empty directories found by the last scan and
+// zero-byte files (which share one hash and would otherwise form a single
+// noisy duplicate group).
+export function Cleanup({
+  database,
+  active,
+  busy,
+  execute,
+  refresh,
+}: {
+  database: string;
+  active: boolean;
+  busy: boolean;
+  execute: (action: () => Promise<string>, key?: string) => Promise<void>;
+  refresh: () => Promise<void>;
+}) {
+  const [emptyDirs, setEmptyDirs] = useState<string[]>([]);
+  const [emptyLoaded, setEmptyLoaded] = useState(false);
+  const [emptySelected, setEmptySelected] = useState<ReadonlySet<string>>(
+    new Set(),
+  );
+  const [zeroFiles, setZeroFiles] = useState<ZeroByteFile[]>([]);
+  const [zeroLoaded, setZeroLoaded] = useState(false);
+  const [zeroSelected, setZeroSelected] = useState<ReadonlySet<string>>(
+    new Set(),
+  );
+  const [pendingDirs, setPendingDirs] = useState<number | null>(null);
+  const [pendingZeroTrash, setPendingZeroTrash] = useState<number | null>(null);
+
+  function loadEmptyDirs() {
+    invoke<string[]>("empty_dirs", { database })
+      .then((next) => {
+        setEmptyDirs(next);
+        setEmptySelected(new Set(next));
+        setEmptyLoaded(true);
+      })
+      .catch(() => setEmptyLoaded(true));
+  }
+  function loadZeroFiles() {
+    invoke<ZeroByteFile[]>("zero_byte_files", { database })
+      .then((next) => {
+        setZeroFiles(next);
+        setZeroSelected(new Set(next.map((file) => file.path)));
+        setZeroLoaded(true);
+      })
+      .catch(() => setZeroLoaded(true));
+  }
+
+  // Load when the page becomes visible; the component stays mounted so
+  // selections survive switching away and back, like the history page.
+  useEffect(() => {
+    if (!active || !database) return;
+    loadEmptyDirs();
+    loadZeroFiles();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, database]);
+
+  function toggle(
+    set: (next: ReadonlySet<string>) => void,
+    current: ReadonlySet<string>,
+    path: string,
+  ) {
+    const next = new Set(current);
+    if (next.has(path)) next.delete(path);
+    else next.add(path);
+    set(next);
+  }
+
+  function removeSelectedEmptyDirs() {
+    const paths = emptyDirs.filter((path) => emptySelected.has(path));
+    setPendingDirs(null);
+    void execute(async () => {
+      const result = await invoke<string>("remove_empty_dirs", {
+        database,
+        dirs: paths,
+      });
+      loadEmptyDirs();
+      await refresh();
+      return result;
+    }, "cleanup");
+  }
+
+  function trashSelectedZeroFiles() {
+    const paths = zeroFiles
+      .filter((file) => zeroSelected.has(file.path))
+      .map((file) => file.path);
+    setPendingZeroTrash(null);
+    void execute(async () => {
+      const result = await invoke<string>("trash_paths", {
+        database,
+        paths,
+      });
+      loadZeroFiles();
+      await refresh();
+      return result;
+    }, "cleanup");
+  }
+
+  return (
+    <section className="panel cleanup-page">
+      <div className="section-head">
+        <div>
+          <h2>清理工具</h2>
+          <p>
+            两类占着位置却没有内容的候选：空文件夹与零字节文件。删除前都会重新核实当前状态。
+          </p>
+        </div>
+        <div className="head-actions">
+          <button
+            className="secondary"
+            disabled={busy}
+            onClick={() => {
+              loadEmptyDirs();
+              loadZeroFiles();
+            }}
+          >
+            重新检查
+          </button>
+        </div>
+      </div>
+
+      <div className="cleanup-section">
+        <div className="section-head">
+          <div>
+            <h3>空文件夹（{emptyDirs.length}）</h3>
+            <p>
+              来自上一次扫描的结果；删除时会逐个重新确认仍然为空，且不会触碰扫描根目录与受保护目录。文件夹本身不可恢复（但本来就是空的）。
+            </p>
+          </div>
+          {emptyDirs.length > 0 && (
+            <div className="head-actions">
+              <button
+                className="secondary"
+                disabled={busy || emptySelected.size === 0}
+                onClick={() => setPendingDirs(emptySelected.size)}
+              >
+                删除选中的空文件夹（{emptySelected.size}）
+              </button>
+            </div>
+          )}
+        </div>
+        {emptyDirs.length === 0 ? (
+          <Empty
+            icon="▢"
+            text={emptyLoaded ? "没有发现空文件夹" : "正在读取上一次扫描的结果…"}
+            detail="扫描完成后，完全为空的目录会出现在这里。"
+          />
+        ) : (
+          <div className="cleanup-list">
+            {emptyDirs.map((path) => (
+              <label className="cleanup-row" key={path}>
+                <input
+                  type="checkbox"
+                  checked={emptySelected.has(path)}
+                  onChange={() =>
+                    toggle(setEmptySelected, emptySelected, path)
+                  }
+                />
+                <div>
+                  <b>{fileName(path)}</b>
+                  <small>{path}</small>
+                </div>
+              </label>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="cleanup-section">
+        <div className="section-head">
+          <div>
+            <h3>零字节文件（{zeroFiles.length}）</h3>
+            <p>
+              完全没有内容的文件，不会占用空间，但会污染重复列表。移入应用回收站（可恢复），走完整的保护规则与内容校验。
+            </p>
+          </div>
+          {zeroFiles.length > 0 && (
+            <div className="head-actions">
+              <button
+                className="secondary"
+                disabled={busy || zeroSelected.size === 0}
+                onClick={() => setPendingZeroTrash(zeroSelected.size)}
+              >
+                移入回收站（{zeroSelected.size}）
+              </button>
+            </div>
+          )}
+        </div>
+        {zeroFiles.length === 0 ? (
+          <Empty
+            icon="▢"
+            text={zeroLoaded ? "没有零字节文件" : "正在读取…"}
+            detail="0 字节的文件会出现在这里，可一键移入回收站。"
+          />
+        ) : (
+          <div className="cleanup-list">
+            {zeroFiles.map((file) => (
+              <label className="cleanup-row" key={file.path}>
+                <input
+                  type="checkbox"
+                  checked={zeroSelected.has(file.path)}
+                  onChange={() =>
+                    toggle(setZeroSelected, zeroSelected, file.path)
+                  }
+                />
+                <div>
+                  <b>{fileName(file.path)}</b>
+                  <small>
+                    {file.path} · 修改于 {formatFileTime(file.modified)}
+                  </small>
+                </div>
+              </label>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {pendingDirs !== null && (
+        <ConfirmDialog
+          title={`删除 ${pendingDirs} 个空文件夹`}
+          detail="删除时会逐个重新确认仍然为空；任何不再为空、已被删除、属于扫描根目录或受保护的文件夹都会被跳过并在结果中提示。"
+          note="文件夹本身删除后不可恢复（它们当前都是空的）。"
+          busy={busy}
+          onClose={() => setPendingDirs(null)}
+          options={[
+            {
+              label: "删除空文件夹",
+              kind: "danger",
+              action: removeSelectedEmptyDirs,
+            },
+          ]}
+        />
+      )}
+      {pendingZeroTrash !== null && (
+        <ConfirmDialog
+          title={`移入回收站 ${pendingZeroTrash} 个零字节文件`}
+          detail="这些文件会按标准安全链移入应用回收站，随时可以恢复。"
+          busy={busy}
+          onClose={() => setPendingZeroTrash(null)}
+          options={[
+            {
+              label: "移入回收站",
+              action: trashSelectedZeroFiles,
+            },
+          ]}
+        />
+      )}
+    </section>
+  );
+}
+
 export function History({ database, active }: { database: string; active: boolean }) {
   const [items, setItems] = useState<HistoryItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -3074,6 +3431,7 @@ export function Settings({
   excludeRules,
   minFileSize,
   retentionDays,
+  trashMaxBytes,
   autoScan,
   strictVerify,
   setStrictVerify,
@@ -3089,6 +3447,7 @@ export function Settings({
   setExcludeRules,
   setMinFileSize,
   setRetentionDays,
+  setTrashMaxBytes,
   setAutoScan,
   initialize,
   execute,
@@ -3107,6 +3466,7 @@ export function Settings({
   excludeRules: string[];
   minFileSize: number;
   retentionDays: number;
+  trashMaxBytes: number;
   autoScan: boolean;
   strictVerify: boolean;
   setStrictVerify: (value: boolean) => void;
@@ -3122,6 +3482,7 @@ export function Settings({
   setExcludeRules: (value: string[]) => void;
   setMinFileSize: (value: number) => void;
   setRetentionDays: (value: number) => void;
+  setTrashMaxBytes: (value: number) => void;
   setAutoScan: (value: boolean) => void;
   initialize: () => Promise<void>;
   execute: (action: () => Promise<string>, key?: string) => Promise<void>;
@@ -3139,6 +3500,10 @@ export function Settings({
     minFileSize ? String(Math.round(minFileSize / (1024 * 1024))) : "",
   );
   const [retentionInput, setRetentionInput] = useState(String(retentionDays));
+  // The capacity reminder is entered in MB; the setting stores bytes.
+  const [maxBytesInput, setMaxBytesInput] = useState(
+    trashMaxBytes ? String(Math.round(trashMaxBytes / (1024 * 1024))) : "",
+  );
   const [cacheStats, setCacheStats] = useState<ThumbnailCacheStats | null>(null);
   const [thresholdInput, setThresholdInput] = useState(String(similarThreshold));
 
@@ -3266,6 +3631,16 @@ export function Settings({
       return;
     }
     setMinFileSize(megabytes * 1024 * 1024);
+  }
+  function saveTrashMaxBytes() {
+    const trimmed = maxBytesInput.trim();
+    const megabytes = trimmed === "" ? 0 : Number.parseInt(trimmed, 10);
+    if (Number.isNaN(megabytes) || megabytes < 0 || megabytes > 1024 * 1024) {
+      notify("容量提醒上限需为 0 到 1048576 之间的整数（MB）。");
+      setMaxBytesInput(trashMaxBytes ? String(Math.round(trashMaxBytes / (1024 * 1024))) : "");
+      return;
+    }
+    setTrashMaxBytes(megabytes * 1024 * 1024);
   }
   async function pickTrash() {
     const selected = await open({
@@ -3498,6 +3873,21 @@ export function Settings({
         <small className="field-hint">
           超过该天数仍未恢复的回收站文件，会在下一次扫描结束时自动永久清理；填
           0 表示不自动清理。
+        </small>
+      </label>
+      <label>
+        回收站容量提醒上限（MB）
+        <input
+          value={maxBytesInput}
+          onChange={(event) => setMaxBytesInput(event.target.value)}
+          onBlur={saveTrashMaxBytes}
+          onKeyDown={(event) => event.key === "Enter" && saveTrashMaxBytes()}
+          inputMode="numeric"
+          placeholder="0"
+        />
+        <small className="field-hint">
+          回收站实际占用超过该值时，回收站页会显示提醒横幅；仅提醒，不会自动删除任何文件；填
+          0 表示不提醒。
         </small>
       </label>
       <label className="toggle-row">

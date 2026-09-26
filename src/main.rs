@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// Latest schema version this build understands. Older databases are
 /// upgraded stepwise through MIGRATIONS on open; newer ones are rejected so a
 /// downgrade can never misread an unknown schema.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const COPY_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const QUICK_HASH_CHUNK: u64 = 64 * 1024;
 /// Files above this size get the two-stage hash: quick fingerprint first,
@@ -81,6 +81,19 @@ const MIGRATIONS: &[&str] = &[
     // parsed during the scan for containers that carry EXIF. A failed
     // re-parse keeps the previous value while the content stays identical.
     "ALTER TABLE files ADD COLUMN exif_taken INTEGER NOT NULL DEFAULT 0;",
+    // v8 -> v9: empty-directory tracking for the cleanup page, refreshed
+    // wholesale per scanned root on every scan, plus an audit trail for
+    // empty-directory removals (no files table row exists for a directory,
+    // so the operations table cannot record them).
+    "CREATE TABLE IF NOT EXISTS empty_dirs (
+       path TEXT PRIMARY KEY,
+       scanned_at INTEGER NOT NULL
+     );
+     CREATE TABLE IF NOT EXISTS empty_dir_removals (
+       id INTEGER PRIMARY KEY,
+       path TEXT NOT NULL,
+       removed_at INTEGER NOT NULL
+     );",
 ];
 
 fn create_schema_sql() -> &'static str {
@@ -147,7 +160,16 @@ fn create_schema_sql() -> &'static str {
        PRIMARY KEY (path_a, path_b)
      );
      CREATE INDEX IF NOT EXISTS files_frn ON files(frn);
-     CREATE INDEX IF NOT EXISTS files_dev_ino ON files(dev, inode);"
+     CREATE INDEX IF NOT EXISTS files_dev_ino ON files(dev, inode);
+     CREATE TABLE IF NOT EXISTS empty_dirs (
+       path TEXT PRIMARY KEY,
+       scanned_at INTEGER NOT NULL
+     );
+     CREATE TABLE IF NOT EXISTS empty_dir_removals (
+       id INTEGER PRIMARY KEY,
+       path TEXT NOT NULL,
+       removed_at INTEGER NOT NULL
+     );"
 }
 
 #[derive(Parser)]
@@ -666,6 +688,11 @@ fn prune_absent_rows(connection: &Connection) -> Result<u64, String> {
             params![cutoff],
         )
         .map_err(|e| e.to_string())?;
+    // Empty-directory tracking rows for roots no longer scanned: silent
+    // housekeeping, they are not reportable index rows.
+    connection
+        .execute("DELETE FROM empty_dirs WHERE scanned_at < ?1", params![cutoff])
+        .map_err(|e| e.to_string())?;
     Ok(changed as u64)
 }
 
@@ -811,9 +838,10 @@ fn walk_root(
     cancelled: &dyn Fn() -> bool,
 ) -> Result<(), String> {
     let connection = open_database(database)?;
+    let mut empty_dirs: Vec<String> = Vec::new();
     if usn_scan_enabled(&connection) {
         match usn_root_paths(root) {
-            Some(Ok(paths)) => {
+            Some(Ok((paths, usn_empty_dirs))) => {
                 for path in paths {
                     if cancelled() {
                         return Err("scan cancelled".to_string());
@@ -828,6 +856,11 @@ fn walk_root(
                         result_tx,
                     );
                 }
+                empty_dirs = usn_empty_dirs
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect();
+                refresh_empty_dirs(&connection, root, &empty_dirs)?;
                 return Ok(());
             }
             Some(Err(error)) => {
@@ -853,7 +886,9 @@ fn walk_root(
                 continue;
             }
         };
+        let mut seen_entries = 0_usize;
         for entry in entries.flatten() {
+            seen_entries += 1;
             if cancelled() {
                 return Err("scan cancelled".to_string());
             }
@@ -888,8 +923,45 @@ fn walk_root(
                 result_tx,
             );
         }
+        if seen_entries == 0 {
+            empty_dirs.push(directory.to_string_lossy().into_owned());
+        }
     }
+    refresh_empty_dirs(&connection, root, &empty_dirs)?;
     Ok(())
+}
+
+/// Replace the empty-directory rows recorded under one scanned root with
+/// the fresh list from this walk. Directories fill up and empty again with
+/// every rescan, so a wholesale per-root refresh stays exact — an aborted
+/// scan never reaches this and keeps the previous scan's rows.
+fn refresh_empty_dirs(
+    connection: &Connection,
+    root: &Path,
+    empty: &[String],
+) -> Result<(), String> {
+    let root_text = root.to_string_lossy();
+    let posix_pattern = format!("{}%", like_escape(&format!("{root_text}/")));
+    let windows_pattern = format!("{}%", like_escape(&format!("{root_text}\\")));
+    let tx = connection
+        .unchecked_transaction()
+        .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM empty_dirs WHERE path = ?1 \
+         OR path LIKE ?2 ESCAPE '\\' OR path LIKE ?3 ESCAPE '\\'",
+        params![root_text, posix_pattern, windows_pattern],
+    )
+    .map_err(|e| e.to_string())?;
+    let scanned_at = now_seconds()?;
+    for path in empty {
+        tx.execute(
+            "INSERT INTO empty_dirs(path,scanned_at) VALUES(?1,?2) \
+             ON CONFLICT(path) DO UPDATE SET scanned_at=excluded.scanned_at",
+            params![path, scanned_at],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())
 }
 
 /// Shared per-file decision for both walkers: exclusion, minimum size,
@@ -1028,12 +1100,12 @@ pub fn set_watch_scan(database: &Path, enabled: bool) -> Result<(), String> {
 /// `Some(Err(..))` whenever the journal cannot be read (permissions, non-NTFS
 /// volume) so the caller can walk the directory tree instead.
 #[cfg(windows)]
-fn usn_root_paths(root: &Path) -> Option<Result<Vec<PathBuf>, String>> {
+fn usn_root_paths(root: &Path) -> Option<Result<(Vec<PathBuf>, Vec<PathBuf>), String>> {
     Some(usn::root_paths(root))
 }
 
 #[cfg(not(windows))]
-fn usn_root_paths(root: &Path) -> Option<Result<Vec<PathBuf>, String>> {
+fn usn_root_paths(root: &Path) -> Option<Result<(Vec<PathBuf>, Vec<PathBuf>), String>> {
     let _ = root;
     None
 }
@@ -1135,10 +1207,11 @@ mod usn {
         allocation_delta: u64,
     }
 
-    /// Every file (and directory) below `root`, in MFT order. Directory
-    /// recursion is replaced by a parent-reference walk over the journal's
-    /// records; reparse points are pruned exactly like the plain walker.
-    pub fn root_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
+    /// Every file below `root`, in MFT order, plus the directories that
+    /// hold no entries at all. Directory recursion is replaced by a
+    /// parent-reference walk over the journal's records; reparse points are
+    /// pruned exactly like the plain walker.
+    pub fn root_paths(root: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
         let root_text = root.to_string_lossy().into_owned();
         let bytes = root_text.as_bytes();
         if bytes.len() < 2 || bytes[1] != b':' {
@@ -1225,9 +1298,18 @@ mod usn {
         }
 
         let mut files = Vec::new();
+        let mut empty = Vec::new();
         let mut stack = vec![(root_frn, PathBuf::from(&root_text))];
         while let Some((frn, base)) = stack.pop() {
-            for (child_frn, name, attributes) in children.get(&frn).into_iter().flatten() {
+            // A directory with no children at all — the scan root itself
+            // included — is empty. Removal of the root is refused later;
+            // recording it here is just the truthful scan result.
+            let members = children.remove(&frn).unwrap_or_default();
+            if members.is_empty() {
+                empty.push(base);
+                continue;
+            }
+            for (child_frn, name, attributes) in &members {
                 let path = base.join(name);
                 if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                     continue; // junctions/symlinks: the plain walker skips them too
@@ -1239,7 +1321,7 @@ mod usn {
                 }
             }
         }
-        Ok(files)
+        Ok((files, empty))
     }
 
     /// NTFS file reference number of an existing directory (no access needed,
@@ -1870,6 +1952,17 @@ fn dct_phash(gray: &image::GrayImage) -> u64 {
         }
     }
     hash
+}
+
+/// Natural pixel dimensions of an image, read from the container header
+/// only (no full decode) — cheap enough for the merge wizard's resolution
+/// condition to probe both sides of every pair. `None` for non-images and
+/// unreadable files.
+pub fn image_dimensions(path: &str) -> Result<Option<(u32, u32)>, String> {
+    let Ok(reader) = image::ImageReader::open(path) else {
+        return Ok(None);
+    };
+    Ok(reader.into_dimensions().ok())
 }
 
 fn dct_cos(k: usize, n: usize) -> f32 {
@@ -3819,6 +3912,42 @@ fn delete_trash_with(connection: &Connection, operation_id: i64) -> Result<(), S
     Ok(())
 }
 
+/// Permanently delete every still-recycled file from one bulk user action,
+/// sharing a single connection. Per-file failures are collected; the batch
+/// never aborts midway. Each file goes through `delete_trash_with` — the
+/// same audited chain as the single-file permanent delete.
+pub fn delete_trash_batch(database: &Path, batch_id: i64) -> BatchOutcome {
+    let mut outcome = BatchOutcome::default();
+    let Ok(connection) = open_database(database).map_err(|e| outcome.failures.push(e)) else {
+        return outcome;
+    };
+    if let Err(error) = ensure_initialized(&connection) {
+        outcome.failures.push(error);
+        return outcome;
+    }
+    let ids = match connection
+        .prepare("SELECT id FROM operations WHERE batch_id=?1 AND state='trashed' ORDER BY id")
+    {
+        Ok(mut statement) => statement
+            .query_map(params![batch_id], |row| row.get::<_, i64>(0))
+            .map_err(|e| e.to_string())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())),
+        Err(e) => Err(e.to_string()),
+    };
+    match ids {
+        Ok(ids) => {
+            for id in ids {
+                match delete_trash_with(&connection, id) {
+                    Ok(()) => outcome.succeeded += 1,
+                    Err(error) => outcome.failures.push(format!("记录 #{id}：{error}")),
+                }
+            }
+        }
+        Err(error) => outcome.failures.push(error),
+    }
+    outcome
+}
+
 /// Recycle-bin retention in days from settings; 0 disables auto-pruning.
 pub fn trash_retention_days(connection: &Connection) -> i64 {
     connection
@@ -3831,6 +3960,161 @@ pub fn trash_retention_days(connection: &Connection) -> i64 {
         .and_then(|value| value.parse::<i64>().ok())
         .filter(|days| *days >= 0)
         .unwrap_or(30)
+}
+
+/// Recycle-bin disk usage as the retention eviction sees it: a real walk of
+/// the trash directory, so stranded files count too.
+#[derive(serde::Serialize)]
+pub struct TrashUsage {
+    pub files: i64,
+    pub bytes: i64,
+}
+
+pub fn trash_usage(database: &Path) -> Result<TrashUsage, String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    let trash_root = PathBuf::from(required_setting(&connection, "trash_path")?);
+    let (mut files, mut bytes) = (0_i64, 0_i64);
+    let mut stack = vec![trash_root];
+    while let Some(directory) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if let Ok(metadata) = entry.metadata() {
+                files += 1;
+                bytes += metadata.len() as i64;
+            }
+        }
+    }
+    Ok(TrashUsage { files, bytes })
+}
+
+/// Empty directories recorded by the last scan, path-sorted — the cleanup
+/// page's removal candidates.
+pub fn empty_dirs(database: &Path) -> Result<Vec<String>, String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    let mut statement = connection
+        .prepare("SELECT path FROM empty_dirs ORDER BY path")
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+#[derive(serde::Serialize)]
+pub struct ZeroByteFile {
+    pub path: String,
+    pub modified: i64,
+}
+
+/// Present zero-byte files, path-sorted. Empty content cannot lose data,
+/// but the files clutter listings and share one hash, forming one noisy
+/// duplicate group — listed here for one-shot cleanup through the normal
+/// safety-chained removal commands.
+pub fn zero_byte_files(database: &Path) -> Result<Vec<ZeroByteFile>, String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    let mut statement = connection
+        .prepare("SELECT path, modified FROM files WHERE present=1 AND size=0 ORDER BY path")
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ZeroByteFile {
+                path: row.get(0)?,
+                modified: row.get(1)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+#[derive(Default, serde::Serialize)]
+pub struct EmptyDirOutcome {
+    pub removed: usize,
+    pub failures: Vec<String>,
+}
+
+#[cfg(windows)]
+fn same_path_text(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+#[cfg(not(windows))]
+fn same_path_text(a: &str, b: &str) -> bool {
+    a == b
+}
+
+/// Remove empty directories recorded by the scan, re-verifying each one is
+/// still empty at removal time. A directory is refused when it vanished, is
+/// no longer empty, is a scan root, or is covered by a protection rule.
+/// Removals are audited in `empty_dir_removals` — directories have no
+/// files-table row, so the operations table cannot record them. Roots and
+/// protection rules come from the caller (the command layer reads them from
+/// the project settings).
+pub fn remove_empty_dirs(
+    database: &Path,
+    dirs: &[String],
+    roots: &[String],
+    protect_rules: &[String],
+) -> Result<EmptyDirOutcome, String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    let mut outcome = EmptyDirOutcome::default();
+    let removed_at = now_seconds()?;
+    for dir in dirs {
+        if roots.iter().any(|root| same_path_text(root, dir)) {
+            outcome
+                .failures
+                .push(format!("{dir}: 是扫描根目录，不能删除"));
+            continue;
+        }
+        if is_protected_path(dir, protect_rules) {
+            outcome
+                .failures
+                .push(format!("{dir}: 受保护规则覆盖，已拒绝删除"));
+            continue;
+        }
+        if !Path::new(dir).is_dir() {
+            outcome.failures.push(format!("{dir}: 目录不存在"));
+            continue;
+        }
+        let still_empty = fs::read_dir(dir)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false);
+        if !still_empty {
+            outcome.failures.push(format!("{dir}: 目录已不再为空"));
+            continue;
+        }
+        if let Err(error) = fs::remove_dir(dir) {
+            outcome.failures.push(format!("{dir}: {error}"));
+            continue;
+        }
+        let tx = connection
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM empty_dirs WHERE path=?1", params![dir])
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO empty_dir_removals(path,removed_at) VALUES(?1,?2)",
+            params![dir, removed_at],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        outcome.removed += 1;
+    }
+    Ok(outcome)
 }
 
 /// Permanently delete recycled files older than the configured retention.
@@ -6924,6 +7208,139 @@ mod tests {
             i64::try_from(usn::file_reference_of(&source.join("b.txt")).unwrap()).unwrap();
         assert_ne!(real_frn, 0);
         assert_eq!(row_frn, real_frn, "row must carry the keeper's file reference");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn empty_dirs_are_tracked_and_removed_with_safeguards() {
+        let directory = test_directory("empty-dirs");
+        let source = directory.join("source");
+        let child = source.join("group");
+        let empty_child = child.join("nothing-here");
+        fs::create_dir_all(&empty_child).unwrap();
+        fs::write(source.join("keep.txt"), b"content").unwrap();
+        let database = directory.join("index.db");
+        init(&database, &directory.join("recycle")).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        let found = empty_dirs(&database).unwrap();
+        assert_eq!(found, vec![empty_child.to_string_lossy().into_owned()]);
+
+        let roots = vec![source.to_string_lossy().into_owned()];
+        // The scan root itself is always refused, even when mistakenly offered.
+        let outcome = remove_empty_dirs(&database, &roots, &roots, &[]).unwrap();
+        assert_eq!(0, outcome.removed);
+        assert!(outcome.failures[0].contains("扫描根目录"));
+        // Protection rules refuse their matches.
+        let outcome = remove_empty_dirs(
+            &database,
+            &found,
+            &roots,
+            &["nothing-here".to_string()],
+        )
+        .unwrap();
+        assert_eq!(0, outcome.removed);
+        assert!(outcome.failures[0].contains("受保护规则覆盖"));
+        // A vanished directory is skipped without failing the whole call.
+        let ghost = child.join("ghost");
+        let outcome = remove_empty_dirs(
+            &database,
+            &[ghost.to_string_lossy().into_owned()],
+            &roots,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(0, outcome.removed);
+
+        // The real removal goes through and is audited.
+        let outcome = remove_empty_dirs(&database, &found, &roots, &[]).unwrap();
+        assert_eq!(1, outcome.removed);
+        assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+        assert!(!empty_child.exists());
+        assert!(empty_dirs(&database).unwrap().is_empty());
+        let connection = open_database(&database).unwrap();
+        let audited: i64 = connection
+            .query_row("SELECT COUNT(*) FROM empty_dir_removals", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(1, audited);
+        drop(connection);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn trash_batch_permanent_delete_empties_the_batch() {
+        let directory = test_directory("trash-batch-delete");
+        let source = directory.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("a.txt"), b"same").unwrap();
+        fs::write(source.join("b.txt"), b"same").unwrap();
+        let database = directory.join("index.db");
+        init(&database, &directory.join("recycle")).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        let connection = open_database(&database).unwrap();
+        let mut statement = connection
+            .prepare("SELECT id FROM files WHERE present=1 ORDER BY id")
+            .unwrap();
+        let ids = statement
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        drop(statement);
+        drop(connection);
+        for id in &ids {
+            set_approval(&database, *id, true).unwrap();
+        }
+        // Only one of the two copies can be recycled: once its twin leaves
+        // the index, the remaining file is no longer an exact duplicate and
+        // the safety chain refuses it. One approved copy is the realistic
+        // batch.
+        assert_eq!(1, trash_batch(&database, &ids[..1]).succeeded);
+        let connection = open_database(&database).unwrap();
+        let batch_id: i64 = connection
+            .query_row(
+                "SELECT batch_id FROM operations WHERE state='trashed' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(connection);
+        let outcome = delete_trash_batch(&database, batch_id);
+        assert_eq!(1, outcome.succeeded);
+        assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+        let connection = open_database(&database).unwrap();
+        let (trashed, deleted): (i64, i64) = connection
+            .query_row(
+                "SELECT COALESCE(SUM(state='trashed'),0), COALESCE(SUM(state='deleted'),0) \
+                 FROM operations",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((0, 1), (trashed, deleted));
+        drop(connection);
+        // A second pass is a no-op: the batch has nothing left to delete.
+        assert_eq!(0, delete_trash_batch(&database, batch_id).succeeded);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn zero_byte_files_are_listed_and_removed_through_the_chain() {
+        let directory = test_directory("zero-byte");
+        let source = directory.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("empty.dat"), b"").unwrap();
+        fs::write(source.join("real.txt"), b"data").unwrap();
+        let database = directory.join("index.db");
+        init(&database, &directory.join("recycle")).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        let files = zero_byte_files(&database).unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].path.ends_with("empty.dat"));
+        // The regular safety chain accepts zero-byte paths (the hash of the
+        // empty content matches what the index stored).
+        let outcome = trash_paths(&database, &[files[0].path.clone()]).unwrap();
+        assert_eq!(1, outcome.succeeded);
+        assert!(zero_byte_files(&database).unwrap().is_empty());
         let _ = fs::remove_dir_all(directory);
     }
 

@@ -1038,6 +1038,49 @@ h3 {
   flex-basis: 100%;
   color: var(--color-danger, #c0392b);
 }
+.cleanup-page .cleanup-section {
+  margin-top: 18px;
+}
+.cleanup-page .cleanup-section h3 {
+  margin: 0 0 4px;
+  font-size: 0.95rem;
+}
+.cleanup-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid var(--color-line);
+  border-radius: 9px;
+  padding: 8px;
+  background: var(--color-bg-inset);
+}
+.cleanup-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.cleanup-row:hover {
+  background: var(--color-bg, rgba(127, 127, 127, 0.08));
+}
+.cleanup-row > div {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.cleanup-row small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pill.warn {
+  color: var(--color-warn-text, #b8860b);
+  border-color: currentColor;
+}
 .merge-target-path {
   flex: 1;
   min-width: 0;
