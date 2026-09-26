@@ -30,6 +30,7 @@ FileLens 是一个**本地优先**的重复文件整理桌面应用：多目录�
 | **重复页仅显示确认重复**（2026-09-24） | 用户要求「重复的时候就只显示重复的」：**① 候选收紧**——重复照片候选从 pHash ≤10 收紧到 dHash=0 且 pHash=0 双指纹全同；**② 后台逐像素校验**——新增核心库 `verify_photo_pairs`（多线程、逐对解码比对、可协作取消、verdict 实时回调）与命令 `start_duplicate_verify`/`duplicate_verify_state`/`cancel_duplicate_verify`，候选列表变化时前端自动启动/重启校验；**③ 列表只保留确认一致的对**——重复/重复目录两视图均只显示像素校验通过的对，页头显示「逐像素校验中 done/total」进度与「已排除 N 对相似候选」汇总，空态区分无候选/校验中/校验完排除三种情况；对比弹窗保留二次校验结论横幅 |
 | **收尾增强批次**（2026-09-25/26） | 六项收尾：版本号升至 0.4.0；`.gitattributes` 行尾归一；**缺席行自动清理**（90 天未回归且从未参与操作的索引行扫描后清理，完成消息报告数量）；**相似阈值可调**（设置页 4–20，立即刷新）；**扫描让核**（扫描运行时后台像素校验自动暂停、结束后续传）；**watcher 自动接管**（新增扫描目录保存后自动重启监听，缺失根目录跳过） |
 | **审查修复批次**（2026-09-26，`0ef6097` → 修复批次） | 全项目四路并行审查（核心库/命令层/前端/配置文档）后的 P0/P1 修复：**① cancel_scan 状态类型错误**（Mutex vs Arc<Mutex>，取消按钮完全失效）修复；**② 已完成扫描可被新扫描覆盖**（watcher 触发的扫描无 UI 轮询，任务槽永久卡死后续扫描与后台校验——现在以内部运行状态判断）；**③ 重复视图 pHash 门与校验管线对齐**（原误用可调阈值导致候选集超出校验集、前端无限重启校验）；**④ 校验批次快照化**（原 drain 后中途暂停会丢失在途对）；**⑤ 开机自动扫描显式传参**（原闭包读首屏空状态，把已保存的排除规则覆写为空）；**⑥ 迁移补建 document_fingerprints**（该表无迁移步骤，老库升级后首个文件即扫描失败；v1 迁移测试补跑真实扫描）；**⑦ 改名检测死行让位**（目标路径被未及标记缺席的行占用时 UNIQUE 冲突并永久卡死扫描）；**⑧ 晋级失败隔离**（写线程二次哈希遇文件消失不再中止整轮扫描）；**⑨ hardlink 后刷新 Windows FRN**（原保留被删副本的文件引用号，改名后误指 keeper 行）。Windows 44/44、Linux（WSL）44/44 测试通过 |
+| **P2 修复批次**（2026-09-26，`9337859` → 收尾） | 审查遗留 P2 全部落地，分五笔提交：**核心库**——跨卷移动 fallback 去掉双重复制且失败路径清理 `.filelens-partial` 临时文件；`recycle_dir_keep_one` 按 (hash, size) 分组（原仅按 hash，两个同前 64KB 的不同大文件会被误并成一组全部回收）；全部破坏性链（回收/删除/恢复/移动/硬链接）的 operations 留痕与 present 更新包进单事务（消除崩溃孤儿窗口）；USN 快扫消费式构建目录树（MFT 不再双份物化），`protect_preview`/`group_dirs` 流式聚合；补三个测试（verdict 90 天清理、watch 设置往返、EXIF 内容变化清零）。**命令层**——相似检测机制（指纹分块/配对/候选汇总/概览聚合）整体下沉核心库并 re-export（含修复：文档 SimHash 分块 8→9，鸽笼保证 ≤8/64 距离真正可检，原来距离恰为 8 的对会漏检）；12 个重命令 async 化（status/groups/相似列表/历史/回收站/导出/单对像素复核等，均 spawn_blocking，`start_duplicate_verify` 预计算挪后台且 await 期间不持槽锁）；watcher 重启全程持槽锁、任务先注册后 spawn、线程退出自查槽位（Arc 身份比对），消除竞态与「僵尸 watcher」；缩略图解码限流 3 并发（RAII permit，缓存命中不占额）。**前端**——扫描轮询容忍瞬时失败（连续 5 次才判死，防任务槽卡死）；`execute()` 失败感知（批量部分失败不再显示绿色成功 toast）；批量完成提示按「运行→结束」转折判定（相同文案的两次批量不再互相吞掉刷新）；历史页错误加载成功后清除；合并向导目标路径强制绝对路径并提示（防后端按进程 CWD 解析）、insideDir 对 Windows 盘符路径大小写不敏感（预览计数与后端一致）；合并默认前缀补「微信图片」。**配置**——dialog capability 收窄为 allow-open/allow-save。Windows 47/47、Linux（WSL）47/47 测试通过 |
 
 v0.3.0 的 5 个提交：
 
@@ -109,18 +110,18 @@ v0.3.0 的 5 个提交：
 
 **原生 Windows 构建**（2026-09-23，Windows 11 x64 + MSVC BuildTools 14.42 + Windows SDK 10.0.26100）：`cargo test --lib` 25/25 绿；`npm run tauri build -- --bundles nsis` 产出 `FileLens_0.3.0_x64-setup.exe`（约 4.5 MB），exe 内嵌前端资产（`assets/index-*.js`）验证通过。构建走标准 vcvars64 环境（rc.exe 随 SDK 提供），仅需注意 Rust 需 ≥1.85（edition 2024）。机器缺系统级 Windows SDK 时，SDK 头/库可用 xwin 下载布局后经 `INCLUDE`/`LIB` 接通、资源编译可用 llvm-rc 替代 `rc.exe`（本机验证过该替代路径后再装 SDK 回归标准方案）。
 
-**代码规模**：前端 6 文件约 5200 行（main.tsx 780 + views.tsx 3629 + components.tsx 475 + lib 393，styles.css 1855 行另计），Rust 核心库 6496 行、命令层 2003 行。v0.2 时代 main.tsx 曾膨胀至 2091 行单文件，现已拆分为 shell / views / components / lib 四层。
+**代码规模**：前端 6 文件约 5300 行（main.tsx 798 + views.tsx 3655 + components.tsx 475 + lib 393，styles.css 1860 行另计），Rust 核心库 7032 行、命令层 1798 行。v0.2 时代 main.tsx 曾膨胀至 2091 行单文件，现已拆分为 shell / views / components / lib 四层。
 
 ## 五、架构说明
 
 ```
-src/main.rs            核心库（6496 行）：扫描管线、BLAKE3/快速哈希、dHash+pHash 相似检测、
-                       逐像素校验、回收站、硬链接去重、目录合并、严格模式、安全链、Schema 迁移、
-                       Windows USN 快扫、CLI、全部单元测试。不依赖 tauri。
+src/main.rs            核心库（7032 行）：扫描管线、BLAKE3/快速哈希、dHash+pHash 相似检测、
+                       逐像素校验、候选配对与概览聚合、回收站、硬链接去重、目录合并、严格模式、
+                       安全链、Schema 迁移、Windows USN 快扫、CLI、全部单元测试。不依赖 tauri。
 src/lib.rs             核心库导出清单
-src-tauri/src/main.rs  薄命令层（2003 行）：#[tauri::command]、serde 结构体、
-                       pHash 配对过滤、缩略图渲染与缓存、后台扫描/校验/监控任务槽
-src/main.tsx           App 状态与外壳（780 行）
+src-tauri/src/main.rs  薄命令层（1798 行）：#[tauri::command]（重命令 async + spawn_blocking）、
+                       serde 结构体、缩略图渲染/缓存/解码限流、后台扫描/校验/监控任务槽
+src/main.tsx           App 状态与外壳（798 行）
 src/ui/views.tsx       九个页面视图
 src/ui/components.tsx  ConfirmDialog / PreviewModal / SimilarCompareModal / Empty / ScanProgress
 src/lib/{types,format} 跨层类型镜像（snake_case 对齐）与格式化/错误翻译
