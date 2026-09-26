@@ -596,6 +596,37 @@ fn thumbnail_cache_key(path: &Path) -> String {
         .to_string()
 }
 
+/// Caps concurrent image decodes: `DynamicImage::from_decoder` holds the
+/// full decoded raster in memory (a 60 MP photo is ~240 MB of RGBA), so a
+/// photo grid firing dozens of tile requests must not decode all of them
+/// at once. Disk cache hits return before acquiring a slot.
+const MAX_CONCURRENT_DECODES: usize = 3;
+static DECODE_SLOTS: std::sync::Mutex<usize> = std::sync::Mutex::new(MAX_CONCURRENT_DECODES);
+static DECODE_SLOTS_COND: std::sync::Condvar = std::sync::Condvar::new();
+
+/// RAII permit: releasing happens automatically on scope exit, covering
+/// every early return in `render_image`.
+struct DecodePermit(std::sync::MutexGuard<'static, usize>);
+impl Drop for DecodePermit {
+    fn drop(&mut self) {
+        *self.0 += 1;
+        DECODE_SLOTS_COND.notify_one();
+    }
+}
+
+fn acquire_decode_permit() -> DecodePermit {
+    let mut slots = DECODE_SLOTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    while *slots == 0 {
+        slots = DECODE_SLOTS_COND
+            .wait(slots)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+    *slots -= 1;
+    DecodePermit(slots)
+}
+
 /// Decode an image, apply EXIF orientation, downscale and return base64 PNG.
 /// Results are cached on disk keyed by path/mtime/size; a full or read-only
 /// cache disk must not break previews, so cache errors are ignored.
@@ -620,6 +651,8 @@ fn render_image(
             STANDARD.encode(bytes)
         )));
     }
+    // Only actual decodes take a slot; cache hits above return without one.
+    let _decode_permit = acquire_decode_permit();
     let reader = match image::ImageReader::open(source) {
         Ok(reader) => reader,
         Err(_) => return Ok(None),
@@ -1387,13 +1420,14 @@ fn start_watcher(
     watch_slot: &Arc<Mutex<Option<WatchTask>>>,
     database: &str,
 ) -> Result<(), String> {
+    // Hold the slot lock across the whole restart: two overlapping calls
+    // (settings save racing the toggle) must not interleave, or the first
+    // task's cancel flag would be set after the second task replaced it,
+    // orphaning a watcher thread that keeps launching scans forever.
+    let mut slot = watch_slot.lock().map_err(|_| "watch lock failed")?;
     // A previous watcher is cancelled before anything else: a re-enable
     // restarts it with the current roots and rules.
-    if let Some(task) = watch_slot
-        .lock()
-        .map_err(|_| "watch lock failed")?
-        .as_ref()
-    {
+    if let Some(task) = slot.as_ref() {
         task.cancel.store(true, Ordering::Relaxed);
     }
     let (roots, protect_rules, exclude_rules, min_file_size) = {
@@ -1408,17 +1442,26 @@ fn start_watcher(
         )
     };
     if roots.is_empty() {
+        *slot = None;
         return Ok(());
     }
     let database: String = database.to_string();
     let cancel = Arc::new(AtomicBool::new(false));
+    // Register the task before spawning: the thread clears the slot itself
+    // whenever it exits (early failure or shutdown), so the slot never
+    // claims a live watcher that is actually dead.
+    *slot = Some(WatchTask { cancel: cancel.clone() });
+    let slot_for_thread = Arc::clone(watch_slot);
     let watcher_cancel = cancel.clone();
     let scan_slot = Arc::clone(scan_slot);
     std::thread::spawn(move || {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut watcher = match notify::recommended_watcher(tx) {
             Ok(watcher) => watcher,
-            Err(_) => return,
+            Err(_) => {
+                clear_watch_task(&slot_for_thread, &watcher_cancel);
+                return;
+            }
         };
         let mut watched_any = false;
         for root in &roots {
@@ -1434,6 +1477,7 @@ fn start_watcher(
             }
         }
         if !watched_any {
+            clear_watch_task(&slot_for_thread, &watcher_cancel);
             return;
         }
         let relevant = |kind: &EventKind| !matches!(kind, EventKind::Access(_));
@@ -1482,11 +1526,22 @@ fn start_watcher(
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+        clear_watch_task(&slot_for_thread, &watcher_cancel);
     });
-    if let Ok(mut slot) = watch_slot.lock() {
-        *slot = Some(WatchTask { cancel });
-    }
     Ok(())
+}
+
+/// Remove the watch task from the slot only when it still holds *this*
+/// task — a restart may already have replaced it with a newer watcher.
+fn clear_watch_task(slot: &Mutex<Option<WatchTask>>, cancel: &Arc<AtomicBool>) {
+    if let Ok(mut guard) = slot.lock() {
+        let still_current = guard
+            .as_ref()
+            .is_some_and(|task| Arc::ptr_eq(&task.cancel, cancel));
+        if still_current {
+            *guard = None;
+        }
+    }
 }
 
 /// Similar-photo decision threshold (pHash distance cap for the "similar"
