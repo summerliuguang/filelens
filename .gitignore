@@ -4,8 +4,11 @@
 /node_modules/
 /dist/
 /src-tauri/target/
+/src-tauri/gen/schemas/
 *.db
 *.db-shm
 *.db-wal
 *:Zone.Identifier
+*.lnk
+IMPROVEMENT.md
 /.zcode/

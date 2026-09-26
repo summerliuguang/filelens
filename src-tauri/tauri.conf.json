@@ -9,7 +9,10 @@
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build"
   },
-  "app": { "windows": [{ "title": "FileLens", "width": 1180, "height": 820, "minWidth": 820, "minHeight": 620 }] },
+  "app": {
+    "windows": [{ "title": "FileLens", "width": 1180, "height": 820, "minWidth": 820, "minHeight": 620 }],
+    "security": { "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'" }
+  },
   "bundle": {
     "active": true,
     "targets": "all",
