@@ -728,7 +728,13 @@ function App() {
               />
             </div>
             <div className={page === "history" ? "page-layer page-active" : "page-layer"}>
-              <History database={database} active={page === "history"} />
+              <History
+                database={database}
+                active={page === "history"}
+                busyKeys={busyKeys}
+                execute={execute}
+                refresh={refresh}
+              />
             </div>
             <div className={page === "settings" ? "page-layer page-active" : "page-layer"}>
               <Settings

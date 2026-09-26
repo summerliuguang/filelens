@@ -2946,6 +2946,24 @@ fn restore_with(
         params![now_seconds()?, operation_id],
     )
     .map_err(|e| e.to_string())?;
+    // Restoring somewhere other than the recorded original path must re-point
+    // the index row too, or the duplicate list keeps showing the file at its
+    // old location until the next scan. A dead row (present=0) may still hold
+    // the destination path and files.path is UNIQUE — rename it aside, same
+    // convention as the scan writer.
+    if destination != source {
+        tx.execute(
+            "UPDATE files SET path = path || '#replaced#' || id, present=0, approved=0 \
+             WHERE path = ?2 AND id <> ?1",
+            params![file_id, destination.to_string_lossy()],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE files SET path=?2 WHERE id=?1",
+            params![file_id, destination.to_string_lossy()],
+        )
+        .map_err(|e| e.to_string())?;
+    }
     tx.execute(
         "UPDATE files SET present=1,approved=0 WHERE id=?1",
         params![file_id],
@@ -2953,6 +2971,93 @@ fn restore_with(
     .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
     println!("Restored: {}", destination.display());
+    Ok(())
+}
+
+/// Undo a recorded move (operations state='moved', written by the directory
+/// keep-one and merge flows): bring the file back to its original path. The
+/// current location comes from the index, the content is re-hashed against
+/// the recorded hash before anything moves, and an occupied or protected
+/// original path refuses the move instead of overwriting. The moved row is
+/// marked restored afterwards, so the history action does not repeat.
+/// Protection rules come from the caller (the command layer reads them from
+/// the project settings).
+pub fn move_back(
+    database: &Path,
+    operation_id: i64,
+    protect_rules: &[String],
+) -> Result<(), String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    let record: Option<(i64, String, String, String)> = connection
+        .query_row(
+            "SELECT file_id,source_path,hash,state FROM operations WHERE id=?1",
+            params![operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some((file_id, source, hash, state)) = record else {
+        return Err(format!("unknown operation id {operation_id}"));
+    };
+    if state != "moved" {
+        return Err("该记录不是移动操作，无法移回".to_string());
+    }
+    let current: Option<String> = connection
+        .query_row(
+            "SELECT path FROM files WHERE id=?1 AND present=1",
+            params![file_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some(current_text) = current else {
+        return Err("文件不在索引中或已被删除，无法移回".to_string());
+    };
+    let current_path = PathBuf::from(&current_text);
+    let original = PathBuf::from(&source);
+    if current_path == original {
+        return Err("文件已在原位置".to_string());
+    }
+    if !current_path.is_file() {
+        return Err("文件当前已不存在，请扫描后再试".to_string());
+    }
+    if hash_file(&current_path)? != hash {
+        return Err("文件内容与索引记录不一致，请扫描后再试".to_string());
+    }
+    if original.exists() {
+        return Err(format!("原位置已被占用，已拒绝移动：{source}"));
+    }
+    if is_protected_path(&source, protect_rules) {
+        return Err("受保护规则覆盖，已拒绝移动".to_string());
+    }
+    if let Some(parent) = original.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create directory: {e}"))?;
+    }
+    move_verified(&current_path, &original, &hash)?;
+    let tx = connection
+        .unchecked_transaction()
+        .map_err(|e| e.to_string())?;
+    // The original path can be held by a stale index row; retire it aside
+    // like the scan writer does before re-pointing this row back.
+    tx.execute(
+        "UPDATE files SET path = path || '#replaced#' || id, present=0, approved=0 \
+         WHERE path = ?2 AND id <> ?1",
+        params![file_id, source],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE files SET path=?2 WHERE id=?1",
+        params![file_id, source],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE operations SET state='restored',restored_at=?1 WHERE id=?2",
+        params![now_seconds()?, operation_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    println!("Moved back: {source}");
     Ok(())
 }
 
@@ -7341,6 +7446,134 @@ mod tests {
         let outcome = trash_paths(&database, &[files[0].path.clone()]).unwrap();
         assert_eq!(1, outcome.succeeded);
         assert!(zero_byte_files(&database).unwrap().is_empty());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn restore_to_repoints_the_index_row() {
+        let directory = test_directory("restore-to-repoint");
+        let source = directory.join("source");
+        let other = directory.join("elsewhere");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::write(source.join("a.txt"), b"same").unwrap();
+        fs::write(source.join("b.txt"), b"same").unwrap();
+        let database = directory.join("index.db");
+        init(&database, &directory.join("recycle")).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        let connection = open_database(&database).unwrap();
+        let file_id: i64 = connection
+            .query_row(
+                "SELECT id FROM files WHERE path LIKE '%a.txt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(connection);
+        set_approval(&database, file_id, true).unwrap();
+        trash(&database, file_id).unwrap();
+        let operation_id: i64 = {
+            let connection = open_database(&database).unwrap();
+            connection
+                .query_row(
+                    "SELECT id FROM operations WHERE state='trashed' AND file_id=?1",
+                    params![file_id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+
+        // Restoring to a different directory must re-point the index row to
+        // where the file actually is now, so the duplicate list and the next
+        // scan agree without a re-hash.
+        restore_to(&database, operation_id, &other).unwrap();
+        let restored_path = other.join("a.txt");
+        assert!(restored_path.is_file());
+        let connection = open_database(&database).unwrap();
+        let (path, present): (String, i64) = connection
+            .query_row(
+                "SELECT path, present FROM files WHERE id=?1",
+                params![file_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(path, restored_path.to_string_lossy());
+        assert_eq!(present, 1);
+        drop(connection);
+        // A scan of the new root keeps the row in place (unchanged, not
+        // re-hashed as a fresh file).
+        scan(&database, std::slice::from_ref(&other), &[]).unwrap();
+        let connection = open_database(&database).unwrap();
+        let present: i64 = connection
+            .query_row(
+                "SELECT present FROM files WHERE path=?1",
+                params![restored_path.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 1);
+        drop(connection);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn moved_files_can_be_moved_back() {
+        let directory = test_directory("move-back");
+        let source = directory.join("source");
+        let keep = directory.join("keep");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("pair-a.txt"), b"twin content").unwrap();
+        fs::write(source.join("pair-b.txt"), b"twin content").unwrap();
+        let database = directory.join("index.db");
+        init(&database, &directory.join("recycle")).unwrap();
+        scan(&database, std::slice::from_ref(&source), &[]).unwrap();
+        let outcome = recycle_dir_keep_one(
+            &database,
+            &source.to_string_lossy(),
+            &keep,
+        )
+        .unwrap();
+        assert_eq!(1, outcome.moved, "one keeper moves into the keep dir");
+
+        let connection = open_database(&database).unwrap();
+        let (operation_id, moved_from): (i64, String) = connection
+            .query_row(
+                "SELECT id,source_path FROM operations WHERE state='moved'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        drop(connection);
+        let original = PathBuf::from(&moved_from);
+        // The keeper left this path empty (the recycled twin is in the bin),
+        // so the move-back has somewhere to return to.
+        assert!(!original.exists(), "the moved keeper left its old path");
+
+        // An occupied original path refuses instead of overwriting.
+        fs::write(&original, b"someone else now").unwrap();
+        let error = move_back(&database, operation_id, &[]).unwrap_err();
+        assert!(error.contains("原位置已被占用"), "{error}");
+        fs::remove_file(&original).unwrap();
+
+        // The real move-back restores content, index path and marks the
+        // history row restored.
+        move_back(&database, operation_id, &[]).unwrap();
+        assert_eq!(fs::read(&original).unwrap(), b"twin content");
+        let connection = open_database(&database).unwrap();
+        let (path, state): (String, String) = connection
+            .query_row(
+                "SELECT f.path, o.state FROM files f \
+                 JOIN operations o ON o.file_id=f.id WHERE o.id=?1",
+                params![operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(path, moved_from, "index row follows the file back");
+        assert_eq!(state, "restored");
+        drop(connection);
+        // A second move-back is refused: nothing left to undo.
+        let error = move_back(&database, operation_id, &[]).unwrap_err();
+        assert!(error.contains("不是移动操作"), "{error}");
         let _ = fs::remove_dir_all(directory);
     }
 

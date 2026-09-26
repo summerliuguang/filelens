@@ -3289,7 +3289,19 @@ export function Cleanup({
   );
 }
 
-export function History({ database, active }: { database: string; active: boolean }) {
+export function History({
+  database,
+  active,
+  busyKeys,
+  execute,
+  refresh,
+}: {
+  database: string;
+  active: boolean;
+  busyKeys: ReadonlySet<string>;
+  execute: (action: () => Promise<string>, key?: string) => Promise<void>;
+  refresh: () => Promise<void>;
+}) {
   const [items, setItems] = useState<HistoryItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -3399,6 +3411,26 @@ export function History({ database, active }: { database: string; active: boolea
                       : ""}
                   </small>
                 </div>
+                {item.state === "moved" && (
+                  <div className="trash-actions">
+                    <button
+                      disabled={busyKeys.has("move-back")}
+                      title="把这张照片从保留目录移回它原来的位置（原位置被占用时会拒绝，不会覆盖）"
+                      onClick={() =>
+                        execute(async () => {
+                          const result = await invoke<string>("move_back", {
+                            database,
+                            operationId: item.id,
+                          });
+                          await refresh();
+                          return result;
+                        }, "move-back")
+                      }
+                    >
+                      移回原位
+                    </button>
+                  </div>
+                )}
                 <span className={badge.className}>{badge.label}</span>
               </article>
             );

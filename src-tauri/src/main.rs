@@ -847,6 +847,22 @@ async fn image_dimensions(path: String) -> Result<Option<(u32, u32)>, String> {
         .map_err(|error| error.to_string())?
 }
 
+/// Undo a recorded move from the history page. Protection rules come from
+/// the saved settings, never from the frontend.
+#[tauri::command]
+async fn move_back(database: String, operation_id: i64) -> Result<String, String> {
+    let protect_rules = {
+        let connection = open_database(&database)?;
+        setting_list(&connection, "protect_rules")?
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        filelens::move_back(&PathBuf::from(&database), operation_id, &protect_rules)?;
+        Ok("已将文件移回原位置。".into())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 /// Settings-page preview: how many indexed files the unsaved rule set would
 /// shield, with sample paths.
 #[tauri::command]
@@ -1878,6 +1894,7 @@ fn main() {
             zero_byte_files,
             remove_empty_dirs,
             image_dimensions,
+            move_back,
             protect_preview,
             approve_filtered,
             hardlink_approved,
