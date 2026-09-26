@@ -1029,9 +1029,14 @@ h3 {
 }
 .merge-target-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   min-width: 0;
+}
+.merge-target-warning {
+  flex-basis: 100%;
+  color: var(--color-danger, #c0392b);
 }
 .merge-target-path {
   flex: 1;

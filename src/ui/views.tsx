@@ -2068,7 +2068,12 @@ export function SimilarPhotos({
               : pendingMerge.target.kind === "b"
                 ? [pendingMerge.dirA]
                 : [pendingMerge.dirA, pendingMerge.dirB];
-          const invalidTarget = targetDir === "";
+          const invalidTarget =
+            targetDir.trim() === "" || !looksAbsolutePath(targetDir.trim());
+          const relativeTargetHint =
+            pendingMerge.target.kind === "custom" &&
+            targetDir.trim() !== "" &&
+            !looksAbsolutePath(targetDir.trim());
           return (
             <ConfirmDialog
               title={`合并到一侧（共 ${pendingMerge.pairs.length} 对重复照片）`}
@@ -2146,6 +2151,11 @@ export function SimilarPhotos({
                         <button className="secondary" onClick={pickMergeTarget}>
                           选择目录…
                         </button>
+                        {relativeTargetHint && (
+                          <small className="merge-target-warning">
+                            请输入绝对路径（如 D:\Photos 或 /home/user/Photos），相对路径无法定位。
+                          </small>
+                        )}
                       </span>
                     )}
                   </span>
@@ -2399,6 +2409,7 @@ const MERGE_DEFAULT_PREFIXES = new Set([
   "photo",
   "wechat",
   "mmexport",
+  "微信图片",
 ]);
 
 // Retention rules for merging a directory pair, evaluated top-down: the
@@ -2416,12 +2427,24 @@ type MergeCondition =
 function insideDir(path: string, dir: string): boolean {
   // Folder strings come from fileFolder (forward slashes) while photo paths
   // keep the raw separators from the index, so normalize both sides.
-  const normalize = (value: string) =>
-    value.split("\\").join("/").replace(/\/+$/, "");
+  const normalize = (value: string) => {
+    const unified = value.split("\\").join("/").replace(/\/+$/, "");
+    // Windows paths are case-insensitive: a root registered as "D:\Photos"
+    // must still match the picker's "d:/photos". POSIX paths stay
+    // case-sensitive.
+    return /^[a-z]:\//i.test(unified) ? unified.toLowerCase() : unified;
+  };
   const base = normalize(dir);
   if (!base) return false;
   const candidate = normalize(path);
   return candidate.startsWith(base) && candidate[base.length] === "/";
+}
+
+// The backend resolves the merge target with the process CWD as fallback,
+// so a relative input would silently move files somewhere unexpected.
+// Require an absolute path (Windows drive or POSIX root) up front.
+function looksAbsolutePath(value: string): boolean {
+  return /^(?:[A-Za-z]:[\\/]|\/)/.test(value);
 }
 
 // Walk the enabled conditions in priority order. Without a verdict the copy
@@ -2922,6 +2945,7 @@ export function History({ database, active }: { database: string; active: boolea
   useEffect(() => {
     if (!active || !database) return;
     setLoading(true);
+    setError("");
     invoke<HistoryItem[]>("history", {
       database,
       offset: 0,
@@ -2931,6 +2955,7 @@ export function History({ database, active }: { database: string; active: boolea
       .then((next) => {
         setItems(next);
         setExhausted(next.length < HISTORY_PAGE);
+        setError("");
       })
       .catch((err) => setError(String(err)))
       .finally(() => setLoading(false));
@@ -2948,6 +2973,7 @@ export function History({ database, active }: { database: string; active: boolea
       .then((next) => {
         setItems((current) => [...current, ...next]);
         setExhausted(next.length < HISTORY_PAGE);
+        setError("");
       })
       .catch((err) => setError(String(err)))
       .finally(() => setLoadingMore(false));

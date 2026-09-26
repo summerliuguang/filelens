@@ -124,7 +124,6 @@ function App() {
   const [similarDocuments, setSimilarDocuments] = useState<SimilarDocument[]>([]);
   const [detectors, setDetectors] = useState<DetectorStatus[]>([]);
   const [bulkProgress, setBulkProgress] = useState<BulkState | null>(null);
-  const consumedBulk = useRef("");
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [booting, setBooting] = useState(true);
   const [busyKeys, setBusyKeys] = useState<ReadonlySet<string>>(new Set());
@@ -218,19 +217,22 @@ function App() {
 
   // Bulk sweep (recycle/hardlink/delete of many files) runs on a background
   // thread; poll its progress, surface it as a busy toast and refresh when
-  // the sweep completes. `message` doubles as the consumed-marker because it
-  // stays readable after completion.
+  // the sweep completes. The toast and refresh key on the running→finished
+  // transition, not the message: two sweeps can legitimately produce the
+  // same summary text and must not swallow each other.
+  const bulkWasRunning = useRef(false);
   useEffect(() => {
     const timer = window.setInterval(() => {
       invoke<BulkState>("bulk_state")
         .then((bulk) => {
           if (bulk.running) {
+            bulkWasRunning.current = true;
             setBulkProgress(bulk);
             return;
           }
           setBulkProgress(null);
-          if (bulk.message && consumedBulk.current !== bulk.message) {
-            consumedBulk.current = bulk.message;
+          if (bulkWasRunning.current && bulk.message) {
+            bulkWasRunning.current = false;
             notify(
               bulk.message.includes("失败 0 个") ? "ok" : "error",
               bulk.message,
@@ -299,9 +301,14 @@ function App() {
   useEffect(() => {
     if (scanState.state !== "running") return;
     progressHistory.current = [];
+    // A transient poll rejection (busy backend) must not kill polling: the
+    // scan keeps running unwatched and would wedge the task slot. Only
+    // consecutive failures past a grace window declare the poll dead.
+    let pollFailures = 0;
     const timer = window.setInterval(() => {
       invoke<ScanState>("scan_state")
         .then((next) => {
+          pollFailures = 0;
           const now = Date.now();
           const history = progressHistory.current;
           history.push({ t: now, processed: next.processed });
@@ -312,7 +319,9 @@ function App() {
             void refresh();
           }
         })
-        .catch((error) =>
+        .catch((error) => {
+          pollFailures += 1;
+          if (pollFailures < 5) return;
           setScanState({
             state: "failed",
             processed: 0,
@@ -323,8 +332,8 @@ function App() {
             hashing_bytes: 0,
             errors_total: 0,
             recent_errors: [],
-          }),
-        );
+          });
+        });
     }, 500);
     return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -355,7 +364,16 @@ function App() {
   ) {
     setKeyBusy(key, true);
     try {
-      notify("ok", await action(), toastAction);
+      const message = await action();
+      // Batch commands report partial failures inside an Ok result, e.g.
+      // "已恢复 3 个，2 个失败：…" — surface those as errors, not green
+      // success toasts that vanish after a few seconds.
+      const failures = message.match(/(\d+) 个失败/) ?? message.match(/失败 (\d+) 个/);
+      if (failures && failures[1] !== "0") {
+        notify("error", message);
+      } else {
+        notify("ok", message, toastAction);
+      }
     } catch (error) {
       notify("error", friendlyError(error));
     } finally {
