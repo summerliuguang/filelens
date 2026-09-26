@@ -332,6 +332,20 @@ fn start_scan(
     Ok("扫描任务已在后台启动。".into())
 }
 
+/// True while a registered scan task is still running. A finished scan left
+/// in the slot by a watcher-triggered run (which the UI never polls) must
+/// not block new scans or the background verification forever.
+fn scan_task_running(task: &Mutex<Option<ScanTask>>) -> bool {
+    task.lock()
+        .ok()
+        .and_then(|slot| {
+            slot.as_ref()
+                .and_then(|current| current.state.lock().ok())
+                .map(|state| state.state == "running")
+        })
+        .unwrap_or(false)
+}
+
 /// Spawn the background scan. Shared by the manual command and the
 /// real-time watcher (which skips quietly when a scan is already running).
 fn launch_scan(
@@ -343,8 +357,18 @@ fn launch_scan(
     min_file_size: i64,
 ) -> Result<(), String> {
     let mut task = task.lock().map_err(|_| "scan task lock failed")?;
-    if task.is_some() {
-        return Err("已有扫描任务正在运行".into());
+    if let Some(existing) = task.as_ref() {
+        // A completed/cancelled/failed task may linger in the slot when no
+        // UI polled its final state; replacing it is safe, a running one is
+        // not.
+        let running = existing
+            .state
+            .lock()
+            .map(|state| state.state == "running")
+            .unwrap_or(true);
+        if running {
+            return Err("已有扫描任务正在运行".into());
+        }
     }
     {
         let connection = open_database(database)?;
@@ -490,7 +514,7 @@ fn scan_state(
 }
 
 #[tauri::command]
-fn cancel_scan(task: tauri::State<'_, Mutex<Option<ScanTask>>>) -> Result<String, String> {
+fn cancel_scan(task: tauri::State<'_, Arc<Mutex<Option<ScanTask>>>>) -> Result<String, String> {
     let task = task.lock().map_err(|_| "scan task lock failed")?;
     let Some(current) = task.as_ref() else {
         return Err("没有正在运行的扫描任务".into());
@@ -1150,16 +1174,24 @@ fn similar_photos(
     let entries = load_fingerprints(&connection, "photo_fingerprints", "dhash", Some("phash"))?;
     let (min_distance, max_distance, extra_max_distance) = if kind.as_deref() == Some("duplicate")
     {
+        // Exact-fingerprint gate: keep Some(0) verbatim so the candidate set
+        // matches the background verification (a tunable gate here would list
+        // pairs the verifier never checks and loop the frontend forever).
         (0, 0, Some(0))
     } else {
         (1, 4, Some(PHASH_MAX_DISTANCE))
+    };
+    let extra_max_distance = if kind.as_deref() == Some("duplicate") {
+        extra_max_distance
+    } else {
+        extra_max_distance.map(|_| phash_max)
     };
     let (pairs, total) = similar_pairs(
         &entries,
         &PHOTO_CHUNKS,
         min_distance,
         max_distance,
-        extra_max_distance.map(|_| phash_max),
+        extra_max_distance,
     );
     Ok(SimilarPhotosPage {
         pairs: pairs
@@ -1337,25 +1369,20 @@ fn start_duplicate_verify(
             }
         };
         let should_stop = || {
-            cancel.load(Ordering::Relaxed)
-                || scan_slot_for_thread
-                    .lock()
-                    .map(|task| task.is_some())
-                    .unwrap_or(false)
+            cancel.load(Ordering::Relaxed) || scan_task_running(&scan_slot_for_thread)
         };
         while !cancel.load(Ordering::Relaxed) {
             // A running scan keeps every core busy with hashing: yield until
             // it finishes, then continue with the remaining pairs.
-            let scan_running = scan_slot_for_thread
-                .lock()
-                .map(|task| task.is_some())
-                .unwrap_or(false);
-            if scan_running {
+            if scan_task_running(&scan_slot_for_thread) {
                 std::thread::sleep(std::time::Duration::from_millis(1500));
                 continue;
             }
+            // Snapshot instead of drain: pairs stay in `remaining` until
+            // their verdict is published, so an interrupted pass (a scan
+            // starting mid-batch) resumes with exactly what is left.
             let slice: Vec<(String, String)> = match remaining.lock() {
-                Ok(mut left) => left.drain().collect(),
+                Ok(left) => left.iter().cloned().collect(),
                 Err(_) => break,
             };
             if slice.is_empty() {
