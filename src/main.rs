@@ -1998,6 +1998,380 @@ fn fingerprint_parts(hash: u64) -> [i64; 5] {
     ]
 }
 
+// --- Similarity candidate listing -------------------------------------------
+//
+// The desktop command layer holds no detection math: everything below reads
+// the fingerprint tables, buckets candidates, and returns serde-ready
+// structs. `PHOTO_CHUNKS` mirrors `fingerprint_parts` (the part_a..part_e
+// columns were written from it). Both chunk tables follow one pigeonhole
+// rule: with N chunks, any pair within Hamming distance N-1 must share at
+// least one chunk value, so the bucket join is exact for the thresholds
+// applied afterwards.
+
+/// Similar-photo candidate row as delivered to the UI.
+#[derive(serde::Serialize)]
+pub struct SimilarPhoto {
+    pub first_path: String,
+    pub second_path: String,
+    pub distance: u32,
+    pub phash_distance: u32,
+    pub first_size: i64,
+    pub first_modified: i64,
+    pub second_size: i64,
+    pub second_modified: i64,
+    /// EXIF capture time of each side (unix seconds; 0 = unknown).
+    pub first_taken: i64,
+    pub second_taken: i64,
+}
+
+#[derive(serde::Serialize)]
+pub struct SimilarPhotosPage {
+    pub pairs: Vec<SimilarPhoto>,
+    /// Pairs kept after the hard cap; when truncated the true total is only
+    /// known to be larger.
+    pub total: usize,
+    pub truncated: bool,
+}
+
+#[derive(serde::Serialize)]
+pub struct SimilarDocument {
+    pub first_path: String,
+    pub second_path: String,
+    pub distance: u32,
+    pub first_size: i64,
+    pub first_modified: i64,
+    pub second_size: i64,
+    pub second_modified: i64,
+}
+
+/// Overview-page aggregate: index health plus per-detector candidate totals.
+#[derive(serde::Serialize)]
+pub struct StatusSnapshot {
+    pub files: i64,
+    pub duplicates: i64,
+    pub approved: i64,
+    pub in_trash: i64,
+    pub last_scan_at: Option<i64>,
+    pub groups: i64,
+    pub recoverable_bytes: i64,
+    pub photo_candidates: i64,
+    pub photo_candidate_bytes: i64,
+    pub document_candidates: i64,
+    pub document_candidate_bytes: i64,
+}
+
+const PHOTO_CHUNKS: [(u32, u64); 5] = [
+    (51, 0x1fff),
+    (38, 0x1fff),
+    (25, 0x1fff),
+    (12, 0x1fff),
+    (0, 0x0fff),
+];
+// Nine chunks over 64 bits (eight 7-bit windows plus the low byte) so the
+// 8/64 SimHash threshold is exactly covered — eight chunks would let a
+// distance-8 pair with one flipped bit per chunk slip through ungucketed.
+const DOCUMENT_CHUNKS: [(u32, u64); 9] = [
+    (57, 0x7f),
+    (50, 0x7f),
+    (43, 0x7f),
+    (36, 0x7f),
+    (29, 0x7f),
+    (22, 0x7f),
+    (15, 0x7f),
+    (8, 0x7f),
+    (0, 0xff),
+];
+const SIMILAR_MAX_BUCKET: usize = 256;
+const SIMILAR_RESULT_LIMIT: usize = 5000;
+/// Default pHash (DCT) secondary threshold: common practice for "same photo,
+/// recompressed/resized" is well inside 10/64. The stored setting
+/// (`similar_phash_max`) wins when present.
+const PHASH_MAX_DISTANCE: u32 = 10;
+
+struct FingerprintEntry {
+    path: String,
+    hash: String,
+    value: u64,
+    /// Secondary fingerprint (pHash for photos, absent for documents).
+    extra: u64,
+    size: i64,
+    modified: i64,
+    /// EXIF capture time (unix seconds; 0 = unknown).
+    exif_taken: i64,
+}
+
+fn setting_scalar(connection: &Connection, key: &str) -> Option<String> {
+    connection
+        .query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .ok()
+}
+
+fn load_fingerprints(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    extra_column: Option<&str>,
+) -> Result<Vec<FingerprintEntry>, String> {
+    let extra_expression = extra_column
+        .map(|column| format!("f.{column}"))
+        .unwrap_or_else(|| "0".to_string());
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT a.path, a.hash, f.{column}, {extra_expression}, a.size, a.modified, a.exif_taken \
+             FROM {table} f JOIN files a ON a.id = f.file_id WHERE a.present = 1"
+        ))
+        .map_err(|e| e.to_string())?;
+    statement
+        .query_map([], |row| {
+            Ok(FingerprintEntry {
+                path: row.get(0)?,
+                hash: row.get(1)?,
+                value: row.get::<_, i64>(2)? as u64,
+                extra: row.get::<_, i64>(3)? as u64,
+                size: row.get(4)?,
+                modified: row.get(5)?,
+                exif_taken: row.get(6)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+fn similar_pairs(
+    entries: &[FingerprintEntry],
+    chunks: &[(u32, u64)],
+    min_distance: u32,
+    max_distance: u32,
+    extra_max_distance: Option<u32>,
+) -> (Vec<(usize, usize, u32)>, usize) {
+    let mut seen: std::collections::HashSet<(usize, usize)> = Default::default();
+    let mut result: Vec<(usize, usize, u32)> = Vec::new();
+    for &(shift, mask) in chunks {
+        let mut buckets: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (index, entry) in entries.iter().enumerate() {
+            buckets
+                .entry((entry.value >> shift) & mask)
+                .or_default()
+                .push(index);
+        }
+        for members in buckets.into_values() {
+            // Oversized buckets (e.g. thousands of near-black thumbnails)
+            // would pair quadratically; these clusters are skipped.
+            if members.len() < 2 || members.len() > SIMILAR_MAX_BUCKET {
+                continue;
+            }
+            for i in 0..members.len() {
+                for j in (i + 1)..members.len() {
+                    let key = (members[i].min(members[j]), members[i].max(members[j]));
+                    if seen.contains(&key) {
+                        continue;
+                    }
+                    let (first, second) = (&entries[key.0], &entries[key.1]);
+                    // Byte-identical duplicates belong to the exact-duplicate
+                    // review, never to the photo detectors.
+                    if first.hash == second.hash {
+                        seen.insert(key);
+                        continue;
+                    }
+                    let distance = (first.value ^ second.value).count_ones();
+                    if distance < min_distance || distance > max_distance {
+                        continue;
+                    }
+                    if let Some(max) = extra_max_distance {
+                        // Secondary fingerprint must agree too: cuts the
+                        // gradient-hash false positives substantially.
+                        if (first.extra ^ second.extra).count_ones() > max {
+                            seen.insert(key);
+                            continue;
+                        }
+                    }
+                    seen.insert(key);
+                    result.push((key.0, key.1, distance));
+                }
+            }
+        }
+    }
+    result.sort_by(|a, b| {
+        a.2.cmp(&b.2)
+            .then_with(|| entries[a.0].path.cmp(&entries[b.0].path))
+    });
+    let total = result.len();
+    result.truncate(SIMILAR_RESULT_LIMIT);
+    (result, total)
+}
+
+/// Distinct files across accepted pairs and their combined size.
+fn candidate_totals(entries: &[FingerprintEntry], pairs: &[(usize, usize, u32)]) -> (i64, i64) {
+    let mut seen: std::collections::HashSet<usize> = Default::default();
+    let (mut count, mut bytes) = (0_i64, 0_i64);
+    for &(a, b, _) in pairs {
+        for index in [a, b] {
+            if seen.insert(index) {
+                count += 1;
+                bytes += entries[index].size.max(0);
+            }
+        }
+    }
+    (count, bytes)
+}
+
+/// Recompute the duplicate-view candidate list: both fingerprints exactly
+/// equal. Shared by the query command and the background verification task
+/// so the verified set always matches what the UI fetched.
+pub fn duplicate_photo_candidates(database: &Path) -> Result<Vec<(String, String)>, String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    let entries = load_fingerprints(&connection, "photo_fingerprints", "dhash", Some("phash"))?;
+    let (pairs, _) = similar_pairs(&entries, &PHOTO_CHUNKS, 0, 0, Some(0));
+    Ok(pairs
+        .into_iter()
+        .map(|(a, b, _)| (entries[a].path.clone(), entries[b].path.clone()))
+        .collect())
+}
+
+/// Photo candidates for the duplicate/similar views. kind = "duplicate":
+/// both fingerprints exactly equal (dHash 0 + pHash 0) — a near-certain
+/// pixel copy, still subject to the background per-pair pixel verification
+/// (`start_duplicate_verify`) before the UI shows it, and gated at exactly
+/// zero so the candidate set matches what the verifier covers. kind =
+/// "similar": near-identical pixels (dHash distance 1-4) with the stored
+/// pHash gate. Both exclude byte-identical exact duplicates.
+pub fn similar_photo_pairs(database: &Path, kind: Option<&str>) -> Result<SimilarPhotosPage, String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    let phash_max: u32 = setting_scalar(&connection, "similar_phash_max")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(PHASH_MAX_DISTANCE);
+    let duplicate = kind == Some("duplicate");
+    let entries = load_fingerprints(&connection, "photo_fingerprints", "dhash", Some("phash"))?;
+    let (min_distance, max_distance, extra_max_distance) = if duplicate {
+        (0, 0, Some(0))
+    } else {
+        (1, 4, Some(phash_max))
+    };
+    let (pairs, total) = similar_pairs(
+        &entries,
+        &PHOTO_CHUNKS,
+        min_distance,
+        max_distance,
+        extra_max_distance,
+    );
+    Ok(SimilarPhotosPage {
+        pairs: pairs
+            .into_iter()
+            .map(|(a, b, distance)| SimilarPhoto {
+                first_path: entries[a].path.clone(),
+                second_path: entries[b].path.clone(),
+                distance,
+                phash_distance: (entries[a].extra ^ entries[b].extra).count_ones(),
+                first_size: entries[a].size,
+                first_modified: entries[a].modified,
+                second_size: entries[b].size,
+                second_modified: entries[b].modified,
+                first_taken: entries[a].exif_taken,
+                second_taken: entries[b].exif_taken,
+            })
+            .collect(),
+        total,
+        truncated: total > SIMILAR_RESULT_LIMIT,
+    })
+}
+
+/// Text-document near-duplicate candidates (SimHash ≤ 8/64).
+pub fn similar_document_pairs(database: &Path) -> Result<Vec<SimilarDocument>, String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    let entries = load_fingerprints(&connection, "document_fingerprints", "simhash", None)?;
+    let (pairs, _) = similar_pairs(&entries, &DOCUMENT_CHUNKS, 0, 8, None);
+    Ok(pairs
+        .into_iter()
+        .map(|(a, b, distance)| SimilarDocument {
+            first_path: entries[a].path.clone(),
+            second_path: entries[b].path.clone(),
+            distance,
+            first_size: entries[a].size,
+            first_modified: entries[a].modified,
+            second_size: entries[b].size,
+            second_modified: entries[b].modified,
+        })
+        .collect())
+}
+
+/// Overview-page aggregation (hardlink-aware recoverable bytes, per-detector
+/// candidate counts and sizes).
+pub fn project_status(database: &Path) -> Result<StatusSnapshot, String> {
+    let connection = open_database(database)?;
+    ensure_initialized(&connection)?;
+    let files = connection
+        .query_row("SELECT COUNT(*) FROM files WHERE present=1", [], |row| {
+            row.get(0)
+        })
+        .map_err(|e| e.to_string())?;
+    let duplicates = connection.query_row("SELECT COALESCE(SUM(n - 1),0) FROM (SELECT COUNT(*) n FROM files WHERE present=1 GROUP BY hash,size HAVING n > 1)", [], |row| row.get(0)).map_err(|e| e.to_string())?;
+    let approved = connection
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE present=1 AND approved=1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    // Hardlink-aware recoverable size: names sharing one physical file count
+    // once, so hardlink-only groups do not inflate the estimate.
+    let recoverable_bytes = connection.query_row(
+        "SELECT COALESCE(SUM((physical - 1) * size),0) FROM (SELECT size, \
+         COUNT(DISTINCT CASE WHEN dev!=0 OR inode!=0 THEN printf('%d:%d',dev,inode) ELSE 'i'||id END) AS physical \
+         FROM files WHERE present=1 GROUP BY hash,size HAVING COUNT(*) > 1)",
+        [],
+        |row| row.get(0),
+    ).map_err(|e| e.to_string())?;
+    let in_trash = connection
+        .query_row(
+            "SELECT COUNT(*) FROM operations WHERE state='trashed'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let last_scan_at = setting_scalar(&connection, "last_scan_at")
+        .and_then(|value| value.parse::<i64>().ok());
+    let groups = connection
+        .query_row(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM files WHERE present=1 \
+             GROUP BY hash,size HAVING COUNT(*) > 1)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    // Photo / document candidates: distinct removable files across all
+    // accepted pairs, with their combined size (advisory — a human still
+    // confirms every removal).
+    let photo_entries = load_fingerprints(&connection, "photo_fingerprints", "dhash", Some("phash"))?;
+    let (photo_pairs, _) =
+        similar_pairs(&photo_entries, &PHOTO_CHUNKS, 0, 4, Some(PHASH_MAX_DISTANCE));
+    let (photo_candidates, photo_candidate_bytes) = candidate_totals(&photo_entries, &photo_pairs);
+    let document_entries = load_fingerprints(&connection, "document_fingerprints", "simhash", None)?;
+    let (document_pairs, _) = similar_pairs(&document_entries, &DOCUMENT_CHUNKS, 0, 8, None);
+    let (document_candidates, document_candidate_bytes) =
+        candidate_totals(&document_entries, &document_pairs);
+    Ok(StatusSnapshot {
+        files,
+        duplicates,
+        approved,
+        in_trash,
+        last_scan_at,
+        groups,
+        recoverable_bytes,
+        photo_candidates,
+        photo_candidate_bytes,
+        document_candidates,
+        document_candidate_bytes,
+    })
+}
+
 fn document_simhash(path: &Path) -> Option<(u64, i64)> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
     if !["txt", "md", "csv", "json", "xml", "html", "htm"].contains(&extension.as_str()) {
