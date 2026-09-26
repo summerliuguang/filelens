@@ -33,7 +33,7 @@ npm run tauri build -- --bundles nsis --runner cargo-xwin \
 核心库 CLI（可选）：
 
 ```bash
-cargo build --release    # 产物为 filelens 命令：init/scan/groups/approve/unapprove/trash/restore/status/trash-list/export
+cargo build --release    # 产物为 filelens 命令：init/scan/groups/approve/unapprove/trash/hardlink/strict-verify/restore/status/trash-list/export
 cargo test               # 单元测试覆盖扫描→删除→恢复全链路
 ```
 
@@ -44,4 +44,4 @@ cargo test               # 单元测试覆盖扫描→删除→恢复全链路
 | 数据库/回收站 | `~/.local/share/local.filelens.desktop/` | `%APPDATA%\local.filelens.desktop\` |
 | 缩略图缓存 | `~/.cache/local.filelens.desktop/thumbnails/` | `%LOCALAPPDATA%\local.filelens.desktop\thumbnails\` |
 
-数据库结构带自动迁移：老版本库在打开时按迁移框架逐步升级（当前 schema v5：两级哈希的 `quick_hash` 列、硬链接识别的 `dev`/`inode` 列、操作留痕的 `batch_id` 列、照片 pHash 列与 USN 快扫的 `frn` 列），无需人工干预即可沿用已有索引。schema v5 升级时会清空照片指纹，下次扫描自动重建（每张图片重算一次 dHash + pHash）。
+数据库结构带自动迁移：老版本库在打开时按迁移框架逐步升级（当前 schema v8：两级哈希的 `quick_hash` 列、硬链接识别的 `dev`/`inode` 列、操作留痕的 `batch_id` 列、照片 pHash 列与 USN 快扫的 `frn` 列、像素校验缓存表 `photo_pair_verdicts`、重命名识别的 `frn`/`dev`+`inode` 索引、EXIF 拍摄时间 `exif_taken` 列），无需人工干预即可沿用已有索引。schema v5 升级时会清空照片指纹，下次扫描自动重建（每张图片重算一次 dHash + pHash）。
